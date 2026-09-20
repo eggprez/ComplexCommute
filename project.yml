@@ -1,6 +1,6 @@
 name: ComplexCommute
 options:
-  bundleIdPrefix: com.complexcommute
+  bundleIdPrefix: scottai
   deploymentTarget:
     iOS: "26.0"
   createIntermediateGroups: true
@@ -22,9 +22,11 @@ targets:
         product: TransitRouting
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.complexcommute.app
-        MARKETING_VERSION: "0.1"
+        PRODUCT_BUNDLE_IDENTIFIER: scottai.commuter-app
+        MARKETING_VERSION: "1.0"
         CURRENT_PROJECT_VERSION: "1"
+        DEVELOPMENT_TEAM: 6S26L64S3C
+        CODE_SIGN_STYLE: Automatic
         SWIFT_VERSION: "6.0"
         SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
         SWIFT_APPROACHABLE_CONCURRENCY: YES
