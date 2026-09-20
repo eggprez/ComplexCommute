@@ -34,6 +34,16 @@ final class TransitDataStore {
 
     func load() async {
         installed = Dictionary(uniqueKeysWithValues: await library.installedFeeds().map { ($0.feedID, $0) })
+        refreshStaleFeeds()
+    }
+
+    /// Quietly replaces schedules that have aged out. Never on cellular, and a failure just leaves the old copy in use.
+    private func refreshStaleFeeds() {
+        for feed in FeedCatalog.feeds {
+            guard let info = installed[feed.id], Date.now.timeIntervalSince(info.importedAt) > feed.refreshInterval,
+                  !isMissingKey(for: feed) else { continue }
+            install(feed, isAutomatic: true)
+        }
     }
 
     // MARK: API keys
@@ -54,20 +64,20 @@ final class TransitDataStore {
 
     // MARK: Install / remove
 
-    func install(_ feed: FeedDescriptor) {
+    func install(_ feed: FeedDescriptor, isAutomatic: Bool = false) {
         guard tasks[feed.id] == nil else { return }
         activity[feed.id] = .downloading
         tasks[feed.id] = Task {
             defer { tasks[feed.id] = nil }
             do {
-                installed[feed.id] = try await downloadAndImport(feed)
+                installed[feed.id] = try await downloadAndImport(feed, allowsCellular: !isAutomatic)
                 activity[feed.id] = nil
             } catch is CancellationError {
                 activity[feed.id] = nil
             } catch let error as URLError where error.code == .cancelled {
                 activity[feed.id] = nil
             } catch {
-                activity[feed.id] = .failed(Self.message(for: error, feed: feed))
+                activity[feed.id] = isAutomatic ? nil : .failed(Self.message(for: error, feed: feed))
             }
         }
     }
@@ -82,8 +92,10 @@ final class TransitDataStore {
         activity[feed.id] = nil
     }
 
-    private func downloadAndImport(_ feed: FeedDescriptor) async throws -> FeedInfo {
-        let request = feed.request(apiKey: feed.requiredKey.flatMap(apiKey))
+    private func downloadAndImport(_ feed: FeedDescriptor, allowsCellular: Bool) async throws -> FeedInfo {
+        var request = feed.request(apiKey: feed.requiredKey.flatMap(apiKey))
+        request.allowsExpensiveNetworkAccess = allowsCellular
+        request.allowsConstrainedNetworkAccess = allowsCellular
         let (zipURL, response) = try await URLSession.shared.download(for: request)
         defer { try? FileManager.default.removeItem(at: zipURL) }
         if let status = (response as? HTTPURLResponse)?.statusCode, status != 200 {

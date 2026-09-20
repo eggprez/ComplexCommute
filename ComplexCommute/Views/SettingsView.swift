@@ -105,14 +105,16 @@ private struct FeedRow: View {
                 .buttonStyle(.borderless)
         case .failed, nil:
             if info != nil {
-                Menu("Manage", systemImage: "checkmark.circle.fill") {
+                Menu {
                     Button("Update Now", systemImage: "arrow.down.circle") { store.install(feed) }
                     Button("Remove", systemImage: "trash", role: .destructive) {
                         Task { await store.remove(feed) }
                     }
+                } label: {
+                    Label("Manage", systemImage: "checkmark.circle.fill")
+                        .labelStyle(.iconOnly)
+                        .foregroundStyle(.green)
                 }
-                .labelStyle(.iconOnly)
-                .tint(.green)
             } else {
                 Button("Download", systemImage: "icloud.and.arrow.down") { store.install(feed) }
                     .labelStyle(.iconOnly)

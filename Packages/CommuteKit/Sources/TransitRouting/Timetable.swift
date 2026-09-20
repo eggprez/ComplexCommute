@@ -20,14 +20,18 @@ public struct Timetable: Sendable {
         let canBoard: [Bool]
         let canAlight: [Bool]
         let headsigns: [String?]
-        /// Row-major `[trip][position]`.
+        /// Row-major `[trip][position]`. Live predictions where known, otherwise the schedule.
         let arrivals: [Int32]
         let departures: [Int32]
+        /// What the schedule said, for showing delays and keeping a trip's identity stable.
+        let scheduledDepartures: [Int32]
+        let isRealtime: [Bool]
 
         var tripCount: Int { headsigns.count }
 
         func arrival(trip: Int, position: Int) -> Int { Int(arrivals[trip * stops.count + position]) }
         func departure(trip: Int, position: Int) -> Int { Int(departures[trip * stops.count + position]) }
+        func scheduledDeparture(trip: Int, position: Int) -> Int { Int(scheduledDepartures[trip * stops.count + position]) }
 
         /// First trip leaving `position` at or after `time`, searching only trips before `limit`.
         func earliestTrip(at position: Int, notBefore time: Int, limit: Int) -> Int? {
@@ -48,7 +52,13 @@ public struct Timetable: Sendable {
     }
 
     public let stops: [Stop]
+    /// Midnight starting the base service day; every time in the timetable is seconds from here.
+    public let midnight: Date
     let routes: [RouteBadge]
+    /// Feed and route_id for each entry of `routes`, which is how alerts name routes.
+    let routeSources: [(feedID: String, routeID: String)]
+    /// Trips by stop sequence, as scheduled. Patterns are derived from these, and re-derived with live times.
+    private let groups: [TripGroup]
     let patterns: [Pattern]
     /// For each stop: the patterns calling there and the position within each.
     let patternsAtStop: [[(pattern: Int, position: Int)]]
@@ -69,9 +79,10 @@ public struct Timetable: Sendable {
         Int((meters * walkDetourFactor / walkMetersPerSecond).rounded())
     }
 
-    public init(feeds: [FeedTimetableData]) {
+    public init(feeds: [FeedTimetableData], midnight: Date = Date(timeIntervalSince1970: 0)) {
         var stops: [Stop] = []
         var routes: [RouteBadge] = []
+        var routeSources: [(feedID: String, routeID: String)] = []
         var groups: [PatternKey: [TripTimes]] = [:]
         var links: [[Int: Footpath]] = []
 
@@ -83,13 +94,14 @@ public struct Timetable: Sendable {
                                   station: stopOffset + (stop.parent ?? index)))
             }
             routes.append(contentsOf: feed.routes)
+            routeSources.append(contentsOf: feed.routeIDs.map { (feed.feedID, $0) })
 
             for trip in feed.trips {
                 let calls = feed.stopTimes[trip.stopTimes]
                 let key = PatternKey(route: routeOffset + trip.route, stops: calls.map { stopOffset + $0.stop },
                                      canBoard: calls.map(\.canBoard), canAlight: calls.map(\.canAlight))
-                groups[key, default: []].append(TripTimes(headsign: trip.headsign, arrivals: calls.map { Int32($0.arrival) },
-                                                          departures: calls.map { Int32($0.departure) }))
+                groups[key, default: []].append(TripTimes(feedID: feed.feedID, tripID: trip.id, serviceDate: trip.serviceDate, headsign: trip.headsign,
+                                                          arrivals: calls.map { Int32($0.arrival) }, departures: calls.map { Int32($0.departure) }))
             }
         }
         links = Array(repeating: [:], count: stops.count)
@@ -140,27 +152,73 @@ public struct Timetable: Sendable {
             }
         }
 
-        var patterns: [Pattern] = []
-        var patternsAtStop: [[(pattern: Int, position: Int)]] = Array(repeating: [], count: stops.count)
         // Sorted so pattern numbering, and therefore tie-breaking, is deterministic.
-        let orderedGroups = groups.sorted {
-            $0.key.route != $1.key.route ? $0.key.route < $1.key.route : $0.key.stops.lexicographicallyPrecedes($1.key.stops)
-        }
-        for (key, trips) in orderedGroups {
-            for lane in Self.nonOvertakingLanes(trips) {
-                for (position, stop) in key.stops.enumerated() {
+        let orderedGroups = groups
+            .sorted { $0.key.route != $1.key.route ? $0.key.route < $1.key.route : $0.key.stops.lexicographicallyPrecedes($1.key.stops) }
+            .map { TripGroup(key: $0.key, trips: $0.value) }
+
+        self.stops = stops
+        self.midnight = midnight
+        self.routes = routes
+        self.routeSources = routeSources
+        self.groups = orderedGroups
+        self.footpaths = links.map { $0.values.sorted { $0.seconds < $1.seconds } }
+        (patterns, patternsAtStop) = Self.patterns(for: orderedGroups, stopCount: stops.count)
+    }
+
+    private init(copying base: Timetable, groups: [TripGroup]) {
+        stops = base.stops
+        midnight = base.midnight
+        routes = base.routes
+        routeSources = base.routeSources
+        footpaths = base.footpaths
+        self.groups = base.groups
+        (patterns, patternsAtStop) = Self.patterns(for: groups, stopCount: base.stops.count)
+    }
+
+    private static func patterns(for groups: [TripGroup], stopCount: Int) -> ([Pattern], [[(pattern: Int, position: Int)]]) {
+        var patterns: [Pattern] = []
+        var patternsAtStop: [[(pattern: Int, position: Int)]] = Array(repeating: [], count: stopCount)
+        for group in groups {
+            for lane in nonOvertakingLanes(group.trips) {
+                for (position, stop) in group.key.stops.enumerated() {
                     patternsAtStop[stop].append((patterns.count, position))
                 }
-                patterns.append(Pattern(route: key.route, stops: key.stops, canBoard: key.canBoard, canAlight: key.canAlight,
-                                        headsigns: lane.map(\.headsign), arrivals: lane.flatMap(\.arrivals), departures: lane.flatMap(\.departures)))
+                patterns.append(Pattern(
+                    route: group.key.route, stops: group.key.stops, canBoard: group.key.canBoard, canAlight: group.key.canAlight,
+                    headsigns: lane.map(\.headsign), arrivals: lane.flatMap(\.arrivals), departures: lane.flatMap(\.departures),
+                    scheduledDepartures: lane.flatMap { $0.scheduledDepartures ?? $0.departures }, isRealtime: lane.map { $0.scheduledDepartures != nil }
+                ))
+            }
+        }
+        return (patterns, patternsAtStop)
+    }
+
+    // MARK: Realtime
+
+    /// A copy of the schedule with live predictions folded in: matched trips take their predicted times
+    /// (so the router catches what is really coming and re-checks connections) and cancelled trips disappear.
+    public func applying(_ realtime: [String: FeedRealtime]) -> Timetable {
+        guard realtime.values.contains(where: { !$0.tripUpdates.isEmpty }) else { return self }
+        let base = Int(midnight.timeIntervalSince1970)
+
+        var updates: [String: [String: [RealtimeFeed.TripUpdate]]] = [:]
+        for (feedID, feed) in realtime {
+            for update in feed.tripUpdates {
+                updates[feedID, default: [:]][feed.source.matchKey(forTripID: update.tripID), default: []].append(update)
             }
         }
 
-        self.stops = stops
-        self.routes = routes
-        self.patterns = patterns
-        self.patternsAtStop = patternsAtStop
-        self.footpaths = links.map { $0.values.sorted { $0.seconds < $1.seconds } }
+        let liveGroups = groups.map { group in
+            TripGroup(key: group.key, trips: group.trips.compactMap { trip -> TripTimes? in
+                guard let source = realtime[trip.feedID]?.source,
+                      let candidates = updates[trip.feedID]?[source.matchKey(forTripID: trip.tripID)],
+                      let update = candidates.first(where: { $0.startDate == nil || $0.startDate == trip.serviceDate }) else { return trip }
+                if update.isCanceled { return nil }
+                return trip.applying(update, stopIDs: group.key.stops.map { stops[$0].id }, midnight: base)
+            })
+        }
+        return Timetable(copying: self, groups: liveGroups)
     }
 
     /// Boardable stops for a station or stop id: its platforms, or itself.
@@ -199,13 +257,60 @@ public struct Timetable: Sendable {
         return lanes
     }
 
-    struct TripTimes {
+    struct TripTimes: Sendable {
+        var feedID = ""
+        var tripID = ""
+        var serviceDate = 0
         let headsign: String?
-        let arrivals: [Int32]
-        let departures: [Int32]
+        var arrivals: [Int32]
+        var departures: [Int32]
+        /// Set once live times replace `departures`.
+        var scheduledDepartures: [Int32]?
+
+        /// Overlays a trip update. Agencies list only upcoming stops, so stops before the first update keep
+        /// their scheduled times and stops after the last inherit its delay.
+        func applying(_ update: RealtimeFeed.TripUpdate, stopIDs: [String], midnight: Int) -> TripTimes {
+            var live = self
+            var cursor = 0
+            var delay: Int32?
+
+            for stopTime in update.stopTimes where !stopTime.isSkipped {
+                guard let stopID = stopTime.stopID, let position = stopIDs[cursor...].firstIndex(of: stopID) else { continue }
+                if let delay {
+                    for index in cursor..<position {
+                        live.arrivals[index] += delay
+                        live.departures[index] += delay
+                    }
+                }
+                let arrival = stopTime.arrival.map { Int32(clamping: $0 - midnight) } ?? stopTime.arrivalDelay.map { arrivals[position] + Int32(clamping: $0) }
+                let departure = stopTime.departure.map { Int32(clamping: $0 - midnight) } ?? stopTime.departureDelay.map { departures[position] + Int32(clamping: $0) }
+                guard let known = departure ?? arrival else { continue }
+                live.arrivals[position] = arrival ?? known
+                live.departures[position] = departure ?? known
+                delay = live.departures[position] - departures[position]
+                cursor = position + 1
+            }
+            guard let delay else { return self }
+            for index in cursor..<stopIDs.count {
+                live.arrivals[index] += delay
+                live.departures[index] += delay
+            }
+            // Predictions for neighbouring stops can cross; a vehicle never runs backwards in time.
+            for index in live.arrivals.indices {
+                if index > 0 { live.arrivals[index] = max(live.arrivals[index], live.departures[index - 1]) }
+                live.departures[index] = max(live.departures[index], live.arrivals[index])
+            }
+            live.scheduledDepartures = departures
+            return live
+        }
     }
 
-    private struct PatternKey: Hashable {
+    struct TripGroup: Sendable {
+        let key: PatternKey
+        let trips: [TripTimes]
+    }
+
+    struct PatternKey: Hashable, Sendable {
         let route: Int
         let stops: [Int]
         let canBoard: [Bool]

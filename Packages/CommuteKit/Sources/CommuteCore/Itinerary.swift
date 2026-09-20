@@ -41,6 +41,24 @@ public struct Ride: Codable, Hashable, Sendable {
     }
 }
 
+/// A disruption notice from an agency that touches a ride in the leg.
+public struct ServiceAlert: Codable, Hashable, Identifiable, Sendable {
+    public var id: String
+    public var header: String
+    public var details: String
+    public var url: URL?
+    /// Display names of the affected routes that this leg actually uses.
+    public var routeNames: [String]
+
+    public init(id: String, header: String, details: String = "", url: URL? = nil, routeNames: [String] = []) {
+        self.id = id
+        self.header = header
+        self.details = details
+        self.url = url
+        self.routeNames = routeNames
+    }
+}
+
 /// One way of covering a single template segment, as produced by a `LegResolving`.
 public struct LegOption: Hashable, Sendable {
     public var mode: TravelMode
@@ -53,12 +71,14 @@ public struct LegOption: Hashable, Sendable {
     public var rides: [Ride]
     /// Walking time from the last ride's exit to the end of the leg.
     public var walkAfter: TimeInterval
+    public var alerts: [ServiceAlert]
     public var summary: String?
     /// True when times are a coarse estimate rather than a concrete schedule.
     public var isEstimate: Bool
 
     public init(mode: TravelMode, departure: Date, arrival: Date, distanceMeters: Double? = nil, walkingMeters: Double = 0,
-                geometry: [Coordinate] = [], rides: [Ride] = [], walkAfter: TimeInterval = 0, summary: String? = nil, isEstimate: Bool = false) {
+                geometry: [Coordinate] = [], rides: [Ride] = [], walkAfter: TimeInterval = 0, alerts: [ServiceAlert] = [],
+                summary: String? = nil, isEstimate: Bool = false) {
         self.mode = mode
         self.departure = departure
         self.arrival = arrival
@@ -67,6 +87,7 @@ public struct LegOption: Hashable, Sendable {
         self.geometry = geometry
         self.rides = rides
         self.walkAfter = walkAfter
+        self.alerts = alerts
         self.summary = summary
         self.isEstimate = isEstimate
     }
@@ -117,6 +138,8 @@ public struct Itinerary: Hashable, Identifiable, Sendable {
     public var walkingMeters: Double { legs.reduce(0) { $0 + $1.option.walkingMeters } }
     public var rideCount: Int { legs.reduce(0) { $0 + $1.option.rides.count } }
     public var hasEstimates: Bool { legs.contains { $0.option.isEstimate } }
+    public var hasRealtime: Bool { legs.contains { $0.option.rides.contains(where: \.isRealtime) } }
+    public var alerts: [ServiceAlert] { legs.flatMap(\.option.alerts) }
 
     /// Idle time before the given leg starts (e.g. waiting on a platform).
     public func wait(before index: Int) -> TimeInterval {

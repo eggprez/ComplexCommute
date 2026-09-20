@@ -5,8 +5,10 @@ import GTFSKit
 /// Plans transit legs from the installed schedules. Keeps the current service day's network in memory.
 public actor TransitPlanner {
     private let library: FeedLibrary
+    private let realtime: RealtimeService?
     private let calendar: Calendar
     private var cache: (key: CacheKey, timetable: Timetable, midnight: Date)?
+    private var liveCache: (key: CacheKey, version: Int, timetable: Timetable)?
 
     private struct CacheKey: Equatable {
         let serviceDate: Int
@@ -24,8 +26,12 @@ public actor TransitPlanner {
     /// An option with an extra ride must save at least this much to be worth showing.
     static let worthwhileSavingPerRide: TimeInterval = 180
 
-    public init(library: FeedLibrary, timeZone: TimeZone = TimeZone(identifier: "America/New_York")!) {
+    /// Predictions only reach an hour or two ahead; beyond that the schedule is all anyone knows.
+    static let realtimeHorizon: TimeInterval = 2 * 3_600
+
+    public init(library: FeedLibrary, realtime: RealtimeService? = nil, timeZone: TimeZone = TimeZone(identifier: "America/New_York")!) {
         self.library = library
+        self.realtime = realtime
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = timeZone
         self.calendar = calendar
@@ -33,7 +39,9 @@ public actor TransitPlanner {
 
     /// Ways to ride from `origin` to `destination`, soonest arrival first. Empty when no installed schedule connects them.
     public func options(from origin: Waypoint, to destination: Waypoint, departingAt departure: Date) async -> [LegOption] {
-        guard let (timetable, midnight) = await timetable(for: departure, near: [origin.coordinate, destination.coordinate]) else { return [] }
+        guard let (scheduled, midnight, key) = await timetable(for: departure, near: [origin.coordinate, destination.coordinate]) else { return [] }
+        let snapshot = abs(departure.timeIntervalSinceNow) < Self.realtimeHorizon ? await realtime?.snapshot(for: key.feedIDs) : nil
+        let timetable = snapshot.map { liveTimetable(scheduled, key: key, snapshot: $0) } ?? scheduled
         let access = stops(for: origin, in: timetable, stationSeconds: Self.stationEntrySeconds)
         let egress = stops(for: destination, in: timetable, stationSeconds: 0)
         guard !access.isEmpty, !egress.isEmpty else { return [] }
@@ -45,7 +53,7 @@ public actor TransitPlanner {
 
         for _ in 0..<Self.departuresToTry {
             let journeys = router.journeys(from: access, to: egress, departure: clock)
-            let found = journeys.map { legOption(for: $0, in: timetable, midnight: midnight, from: origin, to: destination) }
+            let found = journeys.map { legOption(for: $0, in: timetable, midnight: midnight, from: origin, to: destination, snapshot: snapshot) }
             guard let soonest = found.map(\.departure).min() else { break }
             for option in Self.worthwhile(found) where seen.insert(Self.signature(option)).inserted {
                 options.append(option)
@@ -58,7 +66,17 @@ public actor TransitPlanner {
 
     // MARK: Timetable
 
-    private func timetable(for date: Date, near coordinates: [Coordinate]) async -> (Timetable, Date)? {
+    /// Re-deriving patterns is the expensive part of going live, so do it once per fetched snapshot.
+    private func liveTimetable(_ scheduled: Timetable, key: CacheKey, snapshot: RealtimeSnapshot) -> Timetable {
+        if let liveCache, liveCache.key == key, liveCache.version == snapshot.version {
+            return liveCache.timetable
+        }
+        let live = scheduled.applying(snapshot.feeds)
+        liveCache = (key, snapshot.version, live)
+        return live
+    }
+
+    private func timetable(for date: Date, near coordinates: [Coordinate]) async -> (Timetable, Date, CacheKey)? {
         let midnight = calendar.startOfDay(for: date)
         let revision = await library.revision
 
@@ -76,13 +94,13 @@ public actor TransitPlanner {
         let feedIDs = await library.feedIDs(near: coordinates)
         let key = CacheKey(serviceDate: today.date, libraryRevision: revision, feedIDs: feedIDs)
         if let cache, cache.key == key {
-            return (cache.timetable, cache.midnight)
+            return (cache.timetable, cache.midnight, key)
         }
         let feeds = await library.timetableData(for: days, feedIDs: feedIDs)
         guard !feeds.isEmpty else { return nil }
-        let timetable = Timetable(feeds: feeds)
+        let timetable = Timetable(feeds: feeds, midnight: midnight)
         cache = (key, timetable, midnight)
-        return (timetable, midnight)
+        return (timetable, midnight, key)
     }
 
     private func stops(for waypoint: Waypoint, in timetable: Timetable, stationSeconds: Int) -> [StopAccess] {
@@ -98,8 +116,11 @@ public actor TransitPlanner {
 
     // MARK: Results
 
-    private func legOption(for journey: Journey, in timetable: Timetable, midnight: Date, from origin: Waypoint, to destination: Waypoint) -> LegOption {
+    private func legOption(for journey: Journey, in timetable: Timetable, midnight: Date, from origin: Waypoint, to destination: Waypoint,
+                           snapshot: RealtimeSnapshot?) -> LegOption {
         var rides: [Ride] = []
+        var alerts: [ServiceAlert] = []
+        let now = Int(Date.now.timeIntervalSince1970)
         var geometry = [origin.coordinate]
         var walkingMeters = journey.walkAfter.meters
 
@@ -108,15 +129,29 @@ public actor TransitPlanner {
             let route = timetable.routes[pattern.route]
             let path = pattern.stops[ride.boardPosition...ride.alightPosition].map { timetable.stops[$0].coordinate }
             let board = midnight.addingTimeInterval(TimeInterval(pattern.departure(trip: ride.trip, position: ride.boardPosition)))
+            let scheduledBoard = midnight.addingTimeInterval(TimeInterval(pattern.scheduledDeparture(trip: ride.trip, position: ride.boardPosition)))
             rides.append(Ride(
                 routeName: route.name, routeColorHex: route.colorHex, routeTextColorHex: route.textColorHex, routeType: route.type,
                 headsign: pattern.headsigns[ride.trip],
                 boardStopName: timetable.stops[pattern.stops[ride.boardPosition]].name,
                 alightStopName: timetable.stops[pattern.stops[ride.alightPosition]].name,
-                scheduledBoard: board, board: board,
+                scheduledBoard: scheduledBoard, board: board,
                 alight: midnight.addingTimeInterval(TimeInterval(pattern.arrival(trip: ride.trip, position: ride.alightPosition))),
-                path: path, walkBefore: TimeInterval(ride.walkBefore.seconds)
+                isRealtime: pattern.isRealtime[ride.trip], path: path, walkBefore: TimeInterval(ride.walkBefore.seconds)
             ))
+
+            // Alerts naming this route; when an alert also names stops, only if the ride touches one of them.
+            let source = timetable.routeSources[pattern.route]
+            let riddenStops = Set(pattern.stops[ride.boardPosition...ride.alightPosition].flatMap { [timetable.stops[$0].id, timetable.stops[timetable.stops[$0].station].id] })
+            for alert in snapshot?.feeds[source.feedID]?.alerts ?? [] where alert.isActive(at: now) && alert.routeIDs.contains(source.routeID) {
+                guard alert.stopIDs.isEmpty || !alert.stopIDs.isDisjoint(with: riddenStops) else { continue }
+                if let existing = alerts.firstIndex(where: { $0.id == alert.id }) {
+                    if !alerts[existing].routeNames.contains(route.name) { alerts[existing].routeNames.append(route.name) }
+                } else {
+                    alerts.append(ServiceAlert(id: alert.id, header: alert.header, details: alert.details,
+                                               url: alert.url.flatMap { URL(string: $0) }, routeNames: [route.name]))
+                }
+            }
             geometry.append(contentsOf: path)
             walkingMeters += ride.walkBefore.meters
         }
@@ -132,7 +167,8 @@ public actor TransitPlanner {
             walkingMeters: walkingMeters * Timetable.walkDetourFactor,
             geometry: geometry,
             rides: rides,
-            walkAfter: TimeInterval(journey.walkAfter.seconds)
+            walkAfter: TimeInterval(journey.walkAfter.seconds),
+            alerts: alerts
         )
     }
 

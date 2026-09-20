@@ -49,9 +49,21 @@ struct ItineraryCard: View {
                     .foregroundStyle(Color.primary)
             }
 
-            Text("\(itinerary.departure, format: .dateTime.hour().minute()) – \(itinerary.arrival, format: .dateTime.hour().minute())")
-                .font(.subheadline)
-                .foregroundStyle(Color.secondary)
+            HStack(spacing: 6) {
+                Text("\(itinerary.departure, format: .dateTime.hour().minute()) – \(itinerary.arrival, format: .dateTime.hour().minute())")
+                    .foregroundStyle(Color.secondary)
+                if itinerary.hasRealtime {
+                    Label("Live", systemImage: "dot.radiowaves.left.and.right")
+                        .labelStyle(.iconOnly)
+                        .foregroundStyle(Color.green)
+                }
+                if !itinerary.alerts.isEmpty {
+                    Label("Service alerts", systemImage: "exclamationmark.triangle.fill")
+                        .labelStyle(.iconOnly)
+                        .foregroundStyle(Color.orange)
+                }
+            }
+            .font(.subheadline)
 
             HStack(spacing: 6) {
                 ForEach(Array(itinerary.legs.enumerated()), id: \.element.id) { index, leg in
@@ -120,6 +132,9 @@ private struct LegRow: View {
         }
         if !leg.option.rides.isEmpty {
             WalkStepRow(seconds: leg.option.walkAfter, destination: leg.to.name)
+        }
+        ForEach(leg.option.alerts) { alert in
+            AlertRow(alert: alert)
         }
     }
 
@@ -194,7 +209,13 @@ private struct RideRow: View {
                         .font(.footnote.weight(.medium))
                         .foregroundStyle(Color.primary)
                 }
-                Text("\(ride.board, format: .dateTime.hour().minute())  \(ride.boardStopName)")
+                HStack(spacing: 4) {
+                    Text("\(ride.board, format: .dateTime.hour().minute())  \(ride.boardStopName)")
+                    if ride.isRealtime {
+                        Text(ride.liveStatus)
+                            .foregroundStyle(ride.isLate ? Color.orange : Color.green)
+                    }
+                }
                 Text("\(ride.alight, format: .dateTime.hour().minute())  \(ride.alightStopName) · \(ride.stopCount) \(ride.stopCount == 1 ? "stop" : "stops")")
             }
             .font(.footnote)
@@ -204,7 +225,76 @@ private struct RideRow: View {
     }
 }
 
+private struct AlertRow: View {
+    let alert: ServiceAlert
+    @State private var isShowingDetails = false
+
+    var body: some View {
+        Button {
+            isShowingDetails = true
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(Color.orange)
+                    .frame(width: 44, alignment: .trailing)
+                Text(alert.header)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .foregroundStyle(Color.primary)
+            }
+            .font(.footnote)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(.rect)
+        }
+        .sheet(isPresented: $isShowingDetails) {
+            NavigationStack {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 4) {
+                            ForEach(alert.routeNames, id: \.self) { name in
+                                Text(name)
+                                    .font(.caption.weight(.bold))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 3)
+                                    .background(Color(.systemGray4), in: .capsule)
+                            }
+                        }
+                        Text(alert.header)
+                            .font(.headline)
+                        if !alert.details.isEmpty {
+                            Text(alert.details)
+                        }
+                        if let url = alert.url {
+                            Link("More Information", destination: url)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+                }
+                .navigationTitle("Service Alert")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done", systemImage: "checkmark") { isShowingDetails = false }
+                    }
+                }
+            }
+            .presentationDetents([.medium, .large])
+        }
+    }
+}
+
 extension Ride {
+    /// A minute or more behind schedule.
+    var isLate: Bool { board.timeIntervalSince(scheduledBoard) >= 60 }
+
+    var liveStatus: String {
+        let delay = board.timeIntervalSince(scheduledBoard)
+        if delay >= 60 { return "· \(delay.shortDuration) late" }
+        if delay <= -60 { return "· \((-delay).shortDuration) early" }
+        return "· on time"
+    }
+
     var badge: RouteBadge {
         RouteBadge(name: routeName, colorHex: routeColorHex, textColorHex: routeTextColorHex, type: routeType)
     }

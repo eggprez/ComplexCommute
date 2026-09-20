@@ -41,12 +41,18 @@ public struct FeedTimetableData: Sendable {
     }
 
     public struct Trip: Sendable {
+        /// The feed's trip_id, which realtime updates refer to.
+        public var id: String
+        /// The requested service day (yyyymmdd) this instance of the trip runs on.
+        public var serviceDate: Int
         public var route: Int
         public var headsign: String?
         /// Range of this trip's calls in `stopTimes`.
         public var stopTimes: Range<Int>
 
-        public init(route: Int, headsign: String? = nil, stopTimes: Range<Int>) {
+        public init(id: String = "", serviceDate: Int = 0, route: Int, headsign: String? = nil, stopTimes: Range<Int>) {
+            self.id = id
+            self.serviceDate = serviceDate
             self.route = route
             self.headsign = headsign
             self.stopTimes = stopTimes
@@ -85,14 +91,17 @@ public struct FeedTimetableData: Sendable {
     public var feedID: String
     public var stops: [Stop]
     public var routes: [RouteBadge]
+    /// The feed's route_id for each entry of `routes`, which alerts refer to.
+    public var routeIDs: [String]
     public var trips: [Trip]
     public var stopTimes: [StopTime]
     public var transfers: [Transfer]
 
-    public init(feedID: String, stops: [Stop], routes: [RouteBadge], trips: [Trip], stopTimes: [StopTime], transfers: [Transfer] = []) {
+    public init(feedID: String, stops: [Stop], routes: [RouteBadge], routeIDs: [String]? = nil, trips: [Trip], stopTimes: [StopTime], transfers: [Transfer] = []) {
         self.feedID = feedID
         self.stops = stops
         self.routes = routes
+        self.routeIDs = routeIDs ?? routes.map(\.name)
         self.trips = trips
         self.stopTimes = stopTimes
         self.transfers = transfers
@@ -147,8 +156,10 @@ extension FeedDatabase {
         }
 
         var routes: [RouteBadge] = []
-        let routeRows = try database.prepare("SELECT short_name, long_name, color, text_color, type FROM routes ORDER BY route_idx")
+        var routeIDs: [String] = []
+        let routeRows = try database.prepare("SELECT short_name, long_name, color, text_color, type, route_id FROM routes ORDER BY route_idx")
         while try routeRows.step() {
+            routeIDs.append(routeRows.string(5) ?? "")
             routes.append(RouteBadge(name: routeRows.string(0) ?? routeRows.string(1) ?? "", colorHex: routeRows.string(2),
                                      textColorHex: routeRows.string(3), type: routeRows.int(4)))
         }
@@ -179,15 +190,16 @@ extension FeedDatabase {
         }
 
         struct TripRow {
+            var id: String
             var route: Int
             var headsign: String?
             var days: [ServiceDay]
         }
         var tripRows: [Int: TripRow] = [:]
-        let tripStatement = try database.prepare("SELECT trip_idx, route_idx, service_idx, headsign FROM trips")
+        let tripStatement = try database.prepare("SELECT trip_idx, route_idx, service_idx, headsign, trip_id FROM trips")
         while try tripStatement.step() {
             guard let days = daysByService[tripStatement.int(2)] else { continue }
-            tripRows[tripStatement.int(0)] = TripRow(route: tripStatement.int(1), headsign: tripStatement.string(3), days: days)
+            tripRows[tripStatement.int(0)] = TripRow(id: tripStatement.string(4) ?? "", route: tripStatement.int(1), headsign: tripStatement.string(3), days: days)
         }
 
         var trips: [FeedTimetableData.Trip] = []
@@ -208,7 +220,7 @@ extension FeedDatabase {
                     shifted.departure += day.offsetSeconds
                     stopTimes.append(shifted)
                 }
-                trips.append(.init(route: row.route, headsign: row.headsign, stopTimes: start..<stopTimes.count))
+                trips.append(.init(id: row.id, serviceDate: day.date, route: row.route, headsign: row.headsign, stopTimes: start..<stopTimes.count))
             }
         }
 
@@ -227,6 +239,6 @@ extension FeedDatabase {
         }
         flush()
 
-        return FeedTimetableData(feedID: feedID, stops: stops, routes: routes, trips: trips, stopTimes: stopTimes, transfers: transfers)
+        return FeedTimetableData(feedID: feedID, stops: stops, routes: routes, routeIDs: routeIDs, trips: trips, stopTimes: stopTimes, transfers: transfers)
     }
 }

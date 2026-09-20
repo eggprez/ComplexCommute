@@ -72,8 +72,8 @@ Packages/CommuteKit/
 
 | Agency | Static | Realtime | Key |
 |---|---|---|---|
-| MTA Subway | GTFS | GTFS-RT (NYCT extensions) | none |
-| MTA Bus | GTFS (per borough) | Bus Time SIRI / GTFS-RT | MTA Bus Time key |
+| MTA Subway | GTFS **supplemented** (planned work for 7 days; refreshed daily on Wi-Fi) | GTFS-RT, matched by origin time + route + direction (~88%) | none |
+| MTA Bus | GTFS (per borough) | GTFS-RT, one citywide 1.5 MB feed | none (open as of 2026-09) |
 | LIRR / Metro-North | GTFS | GTFS-RT | none |
 | NJ Transit | GTFS (public zip) | GTFS-RT | NJT developer credentials (realtime only) |
 | PATH | GTFS | unofficial/bridged feed | none |
@@ -93,7 +93,11 @@ Static URLs verified 2026-09-19 and live in `FeedCatalog.swift`. Realtime detail
    same-station + proximity footpaths, so agencies interconnect), latest-departure pass, successive-departure
    alternatives with pointless-option filtering, expired-calendar fallback, rides drawn in route colors.
    Falls back to MapKit's transit ETA where no installed feed connects the waypoints.
-4. **Realtime + keys** — Settings key entry (Keychain), realtime overlays, service alerts.
+4. ✅ **Realtime** — dependency-free GTFS-realtime decoder; `RealtimeService` fetches per-feed sources (shared URLs
+   fetched once, 30–60 s freshness, stale data dropped after 5 min, failures fall back to the schedule);
+   predictions are folded into the timetable so the router catches late trains and re-checks connections;
+   alerts attach to the rides they affect. Live for MTA subway/bus/LIRR/Metro-North (no key) and WMATA (key).
+   Not yet: NJ Transit (token API), PATH (unofficial feed, trip ids don't match), MARC (endpoint unverified).
 5. **Active trip** — live re-plan from GPS, quick waypoint edits on the go.
 6. **Later** — leave-by notifications, Live Activity + widgets, Apple Watch.
 

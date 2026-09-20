@@ -31,7 +31,8 @@ private struct FeedBuilder {
             for (id, offset) in stops {
                 data.stopTimes.append(.init(stop: index(id), arrival: start + offset, departure: start + offset, canBoard: !noBoarding.contains(id)))
             }
-            data.trips.append(.init(route: data.routes.count - 1, headsign: stops.last?.0, stopTimes: first..<data.stopTimes.count))
+            data.trips.append(.init(id: "\(name)-\(start - eight)", serviceDate: 20260921, route: data.routes.count - 1,
+                                    headsign: stops.last?.0, stopTimes: first..<data.stopTimes.count))
         }
     }
 
@@ -202,5 +203,91 @@ private extension Timetable {
         #expect(TransitPlanner.makesPointless(option(leave: 10, arrive: 49, rides: 2), option(leave: 14, arrive: 49, rides: 2)))
         // ...unless it costs an extra transfer.
         #expect(!TransitPlanner.makesPointless(option(leave: 10, arrive: 49, rides: 1), option(leave: 14, arrive: 49, rides: 2)))
+    }
+}
+
+@Suite struct RealtimeOverlayTests {
+    private static let source = FeedCatalog.feed(id: "mta-lirr")!.realtime!
+    private static let midnight = Date(timeIntervalSince1970: 1_800_000_000)
+
+    /// Line L: A -> B -> C every 10 minutes from 8:00, 5 minutes between stops. Trip ids are "L-<seconds after 8:00>".
+    private static func network() -> Timetable {
+        var feed = FeedBuilder()
+        for id in ["A", "B", "C"] { feed.stop(id, latitude: 40 + Double(feed.data.stops.count)) }
+        feed.line("L", starts: every(600, from: eight, count: 6), stops: [("A", 0), ("B", 300), ("C", 600)])
+        return Timetable(feeds: [feed.data], midnight: midnight)
+    }
+
+    private static func update(_ tripID: String, date: Int? = 20260921, canceled: Bool = false, _ stops: [(String, Int)]) -> RealtimeFeed.TripUpdate {
+        var update = RealtimeFeed.TripUpdate(tripID: tripID)
+        update.startDate = date
+        update.isCanceled = canceled
+        update.stopTimes = stops.map { stop, time in
+            var stopTime = RealtimeFeed.StopTimeUpdate()
+            stopTime.stopID = stop
+            stopTime.departure = Int(midnight.timeIntervalSince1970) + eight + time
+            stopTime.arrival = stopTime.departure
+            return stopTime
+        }
+        return update
+    }
+
+    private func firstRide(_ timetable: Timetable, from: String = "A", departure: Int = eight) -> (board: Int, scheduled: Int, arrive: Int, live: Bool)? {
+        let journeys = RaptorRouter(timetable: timetable).journeys(
+            from: [StopAccess(stop: timetable.stop(from))], to: [StopAccess(stop: timetable.stop("C"))], departure: departure)
+        guard let ride = journeys.first?.rides.first else { return nil }
+        let pattern = timetable.patterns[ride.pattern]
+        return (pattern.departure(trip: ride.trip, position: ride.boardPosition) - eight,
+                pattern.scheduledDeparture(trip: ride.trip, position: ride.boardPosition) - eight,
+                pattern.arrival(trip: ride.trip, position: ride.alightPosition) - eight, pattern.isRealtime[ride.trip])
+    }
+
+    @Test func delaysCarryDownTheLineAndKeepTheScheduledIdentity() throws {
+        // The 8:00 train is predicted at B 4 minutes late; C isn't mentioned and inherits the delay.
+        let live = Self.network().applying(["test": FeedRealtime(source: Self.source, tripUpdates: [Self.update("L-0", [("B", 540)])])])
+        let ride = try #require(firstRide(live, from: "B", departure: eight + 400))
+        #expect(ride.board == 540)
+        #expect(ride.scheduled == 300)
+        #expect(ride.arrive == 840)
+        #expect(ride.live)
+        // A was already behind the train when the update was issued, so it keeps its scheduled time.
+        #expect(firstRide(live)?.board == 0)
+    }
+
+    @Test func aLateTrainCanStillBeCaught() throws {
+        // Arriving at A at 8:01 misses the 8:00 on paper, but it's running 3 minutes late.
+        let scheduled = Self.network()
+        #expect(firstRide(scheduled, departure: eight + 60)?.board == 600)
+        let live = scheduled.applying(["test": FeedRealtime(source: Self.source, tripUpdates: [Self.update("L-0", [("A", 180), ("B", 480), ("C", 780)])])])
+        let ride = try #require(firstRide(live, departure: eight + 60))
+        #expect(ride.board == 180)
+        #expect(ride.arrive == 780)
+    }
+
+    @Test func cancelledTripsDisappearAndOtherDaysAreIgnored() {
+        let scheduled = Self.network()
+        let cancelled = scheduled.applying(["test": FeedRealtime(source: Self.source, tripUpdates: [Self.update("L-0", canceled: true, [])])])
+        #expect(firstRide(cancelled)?.board == 600)
+        // Same trip_id but yesterday's run: not this train.
+        let yesterday = scheduled.applying(["test": FeedRealtime(source: Self.source, tripUpdates: [Self.update("L-0", date: 20260920, canceled: true, [])])])
+        #expect(firstRide(yesterday)?.board == 0)
+        // An update whose stops aren't on the trip changes nothing and isn't flagged live.
+        let unrelated = scheduled.applying(["test": FeedRealtime(source: Self.source, tripUpdates: [Self.update("L-0", [("Z", 999)])])])
+        #expect(firstRide(unrelated)?.live == false)
+    }
+
+    @Test func aTrainOvertakenMidRouteStillRoutesCorrectly() throws {
+        // The 8:00 leaves A on time but is held before B until 8:16:40, so the 8:10 (B at 8:15) passes it.
+        // Binary search needs trips ordered at every stop, so the two must land in separate lanes.
+        let live = Self.network().applying(["test": FeedRealtime(source: Self.source, tripUpdates: [Self.update("L-0", [("A", 0), ("B", 1000), ("C", 1300)])])])
+        #expect(live.patterns.count == 2)
+        // From A at 8:01 the held train is gone; the 8:10 is next and is not slowed by the train it passes.
+        let fromA = try #require(firstRide(live, departure: eight + 60))
+        #expect(fromA.board == 600)
+        #expect(fromA.arrive == 1200)
+        // At B at 8:15:30 the 8:10 has just left; the held 8:00 comes next, well before the 8:20's 8:25 call.
+        let fromB = try #require(firstRide(live, from: "B", departure: eight + 930))
+        #expect(fromB.board == 1000)
+        #expect(fromB.arrive == 1300)
     }
 }

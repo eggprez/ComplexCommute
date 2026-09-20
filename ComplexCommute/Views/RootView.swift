@@ -14,7 +14,8 @@ struct RootView: View {
     init() {
         let location = LocationService()
         let transitData = TransitDataStore()
-        let resolver = CommuteLegResolver(mapKit: MapKitLegResolver(), transit: TransitPlanner(library: transitData.library))
+        let realtime = RealtimeService { KeychainStore.string(for: $0.rawValue) }
+        let resolver = CommuteLegResolver(mapKit: MapKitLegResolver(), transit: TransitPlanner(library: transitData.library, realtime: realtime))
         _location = State(initialValue: location)
         _transitData = State(initialValue: transitData)
         _planner = State(initialValue: TripPlannerModel(location: location, resolver: resolver))
