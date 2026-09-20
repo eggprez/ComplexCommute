@@ -1,4 +1,5 @@
 import SwiftUI
+import TransitRouting
 
 /// Full-screen map with an always-present bottom sheet, like Maps.
 struct RootView: View {
@@ -7,13 +8,16 @@ struct RootView: View {
 
     @State private var location: LocationService
     @State private var planner: TripPlannerModel
+    @State private var transitData: TransitDataStore
     @State private var detent = RootView.half
-    @State private var transitData = TransitDataStore()
 
     init() {
         let location = LocationService()
+        let transitData = TransitDataStore()
+        let resolver = CommuteLegResolver(mapKit: MapKitLegResolver(), transit: TransitPlanner(library: transitData.library))
         _location = State(initialValue: location)
-        _planner = State(initialValue: TripPlannerModel(location: location))
+        _transitData = State(initialValue: transitData)
+        _planner = State(initialValue: TripPlannerModel(location: location, resolver: resolver))
     }
 
     var body: some View {

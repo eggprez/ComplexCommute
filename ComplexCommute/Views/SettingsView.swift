@@ -81,7 +81,10 @@ private struct FeedRow: View {
             Text(message)
                 .foregroundStyle(.red)
         case nil:
-            if let info {
+            if let info, info.isExpired() {
+                Text("Agency's published schedule has ended. Using its final week until they post an update.")
+                    .foregroundStyle(.orange)
+            } else if let info {
                 Text("\(info.stopCount) stops · \(Int64(info.fileSize), format: .byteCount(style: .file)) · Updated \(info.importedAt, format: .dateTime.month().day())")
             } else if let key = feed.requiredKey, store.isMissingKey(for: feed) {
                 Text("Requires a \(key.name) API key")

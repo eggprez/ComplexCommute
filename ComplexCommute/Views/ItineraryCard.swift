@@ -1,4 +1,5 @@
 import CommuteCore
+import GTFSKit
 import MapKit
 import SwiftUI
 
@@ -58,10 +59,16 @@ struct ItineraryCard: View {
                         Image(systemName: "chevron.compact.right")
                             .foregroundStyle(Color.secondary.opacity(0.6))
                     }
-                    Label(leg.duration.shortDuration, systemImage: leg.mode.symbol)
-                        .labelStyle(.titleAndIcon)
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(leg.mode.tint)
+                    if leg.option.rides.isEmpty {
+                        Label(leg.duration.shortDuration, systemImage: leg.mode.symbol)
+                            .labelStyle(.titleAndIcon)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(leg.mode.tint)
+                    } else {
+                        ForEach(Array(leg.option.rides.enumerated()), id: \.offset) { _, ride in
+                            RouteBadgeView(route: ride.badge)
+                        }
+                    }
                 }
             }
             .lineLimit(1)
@@ -103,12 +110,25 @@ private struct LegRow: View {
 
             Spacer()
 
-            Button("Open in Maps", systemImage: "arrow.triangle.turn.up.right.circle") {
-                openInMaps()
+            if leg.option.rides.isEmpty {
+                openInMapsButton
             }
-            .labelStyle(.iconOnly)
-            .font(.title3)
         }
+        ForEach(Array(leg.option.rides.enumerated()), id: \.offset) { _, ride in
+            WalkStepRow(seconds: ride.walkBefore, destination: ride.boardStopName)
+            RideRow(ride: ride)
+        }
+        if !leg.option.rides.isEmpty {
+            WalkStepRow(seconds: leg.option.walkAfter, destination: leg.to.name)
+        }
+    }
+
+    private var openInMapsButton: some View {
+        Button("Open in Maps", systemImage: "arrow.triangle.turn.up.right.circle") {
+            openInMaps()
+        }
+        .labelStyle(.iconOnly)
+        .font(.title3)
     }
 
     private var detail: String {
@@ -121,6 +141,10 @@ private struct LegRow: View {
         }
         if leg.option.isEstimate {
             parts.append("estimate")
+        }
+        if leg.option.walkingMeters > 0, leg.mode == .transit {
+            let walk = Measurement(value: leg.option.walkingMeters, unit: UnitLength.meters).formatted(.measurement(width: .abbreviated, usage: .road))
+            parts.append("\(walk) walking")
         }
         return parts.joined(separator: " · ")
     }
@@ -136,5 +160,52 @@ private struct LegRow: View {
         case .transit: MKLaunchOptionsDirectionsModeTransit
         }
         MKMapItem.openMaps(with: [source, destination], launchOptions: [MKLaunchOptionsDirectionsModeKey: mode])
+    }
+}
+
+/// A walk inside a transit leg: to the first station, between stations, or from the last one.
+private struct WalkStepRow: View {
+    let seconds: TimeInterval
+    let destination: String
+
+    var body: some View {
+        if seconds >= 60 {
+            HStack(spacing: 8) {
+                Image(systemName: "figure.walk")
+                    .frame(width: 44, alignment: .trailing)
+                Text("Walk \(seconds.shortDuration) to \(destination)")
+            }
+            .font(.footnote)
+            .foregroundStyle(Color.secondary)
+        }
+    }
+}
+
+private struct RideRow: View {
+    let ride: Ride
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            RouteBadgeView(route: ride.badge)
+                .frame(width: 44, alignment: .trailing)
+            VStack(alignment: .leading, spacing: 2) {
+                if let headsign = ride.headsign {
+                    Text("toward \(headsign)")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(Color.primary)
+                }
+                Text("\(ride.board, format: .dateTime.hour().minute())  \(ride.boardStopName)")
+                Text("\(ride.alight, format: .dateTime.hour().minute())  \(ride.alightStopName) · \(ride.stopCount) \(ride.stopCount == 1 ? "stop" : "stops")")
+            }
+            .font(.footnote)
+            .foregroundStyle(Color.secondary)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+extension Ride {
+    var badge: RouteBadge {
+        RouteBadge(name: routeName, colorHex: routeColorHex, textColorHex: routeTextColorHex, type: routeType)
     }
 }

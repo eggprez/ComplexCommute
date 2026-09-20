@@ -4,6 +4,9 @@ import Foundation
 public struct Ride: Codable, Hashable, Sendable {
     public var routeName: String
     public var routeColorHex: String?
+    public var routeTextColorHex: String?
+    /// GTFS route_type (1 subway, 2 rail, 3 bus, ...).
+    public var routeType: Int
     public var headsign: String?
     public var boardStopName: String
     public var alightStopName: String
@@ -11,11 +14,23 @@ public struct Ride: Codable, Hashable, Sendable {
     public var board: Date
     public var alight: Date
     public var isRealtime: Bool
+    /// Coordinates of every stop from boarding to exit, for drawing the ride.
+    public var path: [Coordinate]
+    /// Walking time from the previous ride (or the leg's start) to the boarding stop.
+    public var walkBefore: TimeInterval
 
-    public init(routeName: String, routeColorHex: String? = nil, headsign: String? = nil, boardStopName: String,
-                alightStopName: String, scheduledBoard: Date, board: Date, alight: Date, isRealtime: Bool = false) {
+    /// Stops ridden, counting the exit but not the boarding stop.
+    public var stopCount: Int { max(0, path.count - 1) }
+
+    public init(routeName: String, routeColorHex: String? = nil, routeTextColorHex: String? = nil, routeType: Int = 1,
+                headsign: String? = nil, boardStopName: String, alightStopName: String, scheduledBoard: Date, board: Date,
+                alight: Date, isRealtime: Bool = false, path: [Coordinate] = [], walkBefore: TimeInterval = 0) {
         self.routeName = routeName
         self.routeColorHex = routeColorHex
+        self.routeTextColorHex = routeTextColorHex
+        self.routeType = routeType
+        self.path = path
+        self.walkBefore = walkBefore
         self.headsign = headsign
         self.boardStopName = boardStopName
         self.alightStopName = alightStopName
@@ -36,12 +51,14 @@ public struct LegOption: Hashable, Sendable {
     public var walkingMeters: Double
     public var geometry: [Coordinate]
     public var rides: [Ride]
+    /// Walking time from the last ride's exit to the end of the leg.
+    public var walkAfter: TimeInterval
     public var summary: String?
     /// True when times are a coarse estimate rather than a concrete schedule.
     public var isEstimate: Bool
 
     public init(mode: TravelMode, departure: Date, arrival: Date, distanceMeters: Double? = nil, walkingMeters: Double = 0,
-                geometry: [Coordinate] = [], rides: [Ride] = [], summary: String? = nil, isEstimate: Bool = false) {
+                geometry: [Coordinate] = [], rides: [Ride] = [], walkAfter: TimeInterval = 0, summary: String? = nil, isEstimate: Bool = false) {
         self.mode = mode
         self.departure = departure
         self.arrival = arrival
@@ -49,6 +66,7 @@ public struct LegOption: Hashable, Sendable {
         self.walkingMeters = walkingMeters
         self.geometry = geometry
         self.rides = rides
+        self.walkAfter = walkAfter
         self.summary = summary
         self.isEstimate = isEstimate
     }

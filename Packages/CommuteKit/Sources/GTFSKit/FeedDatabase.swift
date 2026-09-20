@@ -8,6 +8,13 @@ public struct RouteBadge: Codable, Hashable, Sendable {
     public let textColorHex: String?
     /// GTFS route_type (0 tram, 1 subway, 2 rail, 3 bus, ...).
     public let type: Int
+
+    public init(name: String, colorHex: String? = nil, textColorHex: String? = nil, type: Int = 1) {
+        self.name = name
+        self.colorHex = colorHex
+        self.textColorHex = textColorHex
+        self.type = type
+    }
 }
 
 public struct TransitStop: Hashable, Identifiable, Sendable {
@@ -27,13 +34,26 @@ public struct FeedInfo: Hashable, Sendable {
     public let stopCount: Int
     public let routeCount: Int
     public let fileSize: Int
+    /// Last day covered by the feed's calendar (yyyymmdd). Past it, plans reuse the final published week.
+    public let lastServiceDate: Int?
+
+    public func isExpired(on date: Date = .now, calendar: Calendar = .current) -> Bool {
+        guard let lastServiceDate else { return false }
+        let parts = calendar.dateComponents([.year, .month, .day], from: date)
+        return (parts.year ?? 0) * 10_000 + (parts.month ?? 0) * 100 + (parts.day ?? 0) > lastServiceDate
+    }
 }
 
 /// Read-only access to one imported feed.
 final class FeedDatabase {
     let feedID: String
-    private let database: SQLiteDatabase
+    struct BoundingBox {
+        let minLatitude, maxLatitude, minLongitude, maxLongitude: Double
+    }
+
+    let database: SQLiteDatabase
     private let url: URL
+    private(set) lazy var boundingBox: BoundingBox? = loadBoundingBox()
 
     init(url: URL) throws {
         self.url = url
@@ -54,7 +74,8 @@ final class FeedDatabase {
             importedAt: Date(timeIntervalSince1970: importedAt),
             stopCount: try count("SELECT COUNT(*) FROM stops WHERE searchable = 1"),
             routeCount: try count("SELECT COUNT(*) FROM routes"),
-            fileSize: size
+            fileSize: size,
+            lastServiceDate: try lastServiceDate()
         )
     }
 

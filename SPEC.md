@@ -53,7 +53,7 @@ Packages/CommuteKit/
   CommuteCore              Pure models: modes, waypoints, legs, itineraries, chain timing
   GTFSKit                  Feed catalog, streaming zip/CSV → one SQLite file per feed, stop search;
                            GTFS-realtime decoding later (phase 4). No third-party dependencies.
-  TransitRouting           RAPTOR router over the local timetable, multi-criteria   (phase 3)
+  TransitRouting           Timetable (RAPTOR layout), RaptorRouter, TransitPlanner actor → [LegOption]
 ```
 
 - Feed storage: `Application Support/Feeds/<feed-id>.sqlite`, excluded from backup. String ids are mapped
@@ -61,7 +61,10 @@ Packages/CommuteKit/
   The subway (565k stop_times) imports in seconds to ~15 MB.
 
 - Routing: **RAPTOR** (round-based; naturally yields fewest-transfer vs. earliest-arrival
-  Pareto options), footpath transfers from `transfers.txt` + proximity.
+  Pareto options), footpath transfers from `transfers.txt` + proximity. On real data (subway + PATH)
+  the day's timetable builds in ~0.4 s once per service day and a query takes ~10 ms.
+- Known data issue: PATH's official feed calendar ended 2026-06-01; feeds past their calendar reuse the
+  same weekday of their final published week and are flagged in Transit Data.
 - Realtime: GTFS-RT TripUpdates/Alerts where available; WMATA + MTA Bus Time JSON APIs otherwise.
 - Feeds are downloaded per region on demand (user enables NYC and/or DC), refreshed periodically.
 
@@ -86,7 +89,10 @@ Static URLs verified 2026-09-19 and live in `FeedCatalog.swift`. Realtime detail
    drive/walk legs via MapKit drawn on the map, chain timing, Apple Maps handoff.
 2. ✅ **GTFS static** — feed catalog, download/unzip/import to SQLite, stop search, stops as waypoints,
    Transit Data settings with per-feed install and WMATA key entry (Keychain).
-3. **Transit routing** — RAPTOR, multiple alternatives, full chained itineraries.
+3. ✅ **Transit routing** — RAPTOR over per-day in-memory timetables (patterns, non-overtaking lanes, published +
+   same-station + proximity footpaths, so agencies interconnect), latest-departure pass, successive-departure
+   alternatives with pointless-option filtering, expired-calendar fallback, rides drawn in route colors.
+   Falls back to MapKit's transit ETA where no installed feed connects the waypoints.
 4. **Realtime + keys** — Settings key entry (Keychain), realtime overlays, service alerts.
 5. **Active trip** — live re-plan from GPS, quick waypoint edits on the go.
 6. **Later** — leave-by notifications, Live Activity + widgets, Apple Watch.

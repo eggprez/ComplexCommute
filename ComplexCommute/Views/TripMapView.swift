@@ -21,8 +21,18 @@ struct TripMapView: View {
 
                 if let itinerary = planner.selected {
                     ForEach(itinerary.legs) { leg in
-                        MapPolyline(coordinates: leg.option.geometry.map(\.clCoordinate))
-                            .stroke(leg.mode.tint, style: strokeStyle(for: leg))
+                        if leg.option.rides.isEmpty {
+                            MapPolyline(coordinates: leg.option.geometry.map(\.clCoordinate))
+                                .stroke(leg.mode.tint, style: strokeStyle(for: leg))
+                        } else {
+                            // The full path shows through as dotted walking wherever no ride covers it.
+                            MapPolyline(coordinates: leg.option.geometry.map(\.clCoordinate))
+                                .stroke(TravelMode.walk.tint, style: StrokeStyle(lineWidth: 5, lineCap: .round, dash: [1, 9]))
+                            ForEach(Array(leg.option.rides.enumerated()), id: \.offset) { _, ride in
+                                MapPolyline(coordinates: ride.path.map(\.clCoordinate))
+                                    .stroke(Color(hex: ride.routeColorHex) ?? leg.mode.tint, style: StrokeStyle(lineWidth: 6, lineCap: .round, lineJoin: .round))
+                            }
+                        }
                     }
                 }
             }

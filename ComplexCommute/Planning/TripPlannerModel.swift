@@ -32,7 +32,7 @@ final class TripPlannerModel {
     /// How often "leave now" trips re-plan while on screen.
     static let refreshInterval: Duration = .seconds(30)
 
-    init(location: LocationService, resolver: any LegResolving = MapKitLegResolver()) {
+    init(location: LocationService, resolver: any LegResolving) {
         self.location = location
         self.planner = ChainPlanner(resolver: resolver)
     }

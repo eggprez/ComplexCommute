@@ -146,6 +146,17 @@ private struct Fixture {
     }
 }
 
+@Suite struct ExpiredCalendarTests {
+    @Test func fallsBackToTheSameWeekdayInTheLastPublishedWeek() {
+        // Within the calendar: unchanged.
+        #expect(FeedDatabase.fallbackDate(for: 20260601, lastServiceDate: 20260601) == 20260601)
+        // 2026-06-01 is a Monday. Monday 2026-09-21 maps back onto it; Sunday 2026-09-20 onto Sunday 2026-05-31.
+        #expect(FeedDatabase.fallbackDate(for: 20260921, lastServiceDate: 20260601) == 20260601)
+        #expect(FeedDatabase.fallbackDate(for: 20260920, lastServiceDate: 20260601) == 20260531)
+        #expect(FeedDatabase.fallbackDate(for: 20260602, lastServiceDate: 20260601) == 20260526)
+    }
+}
+
 @Suite struct FeedLibraryTests {
     @Test func importsAndSearches() async throws {
         let fixture = try Fixture()
@@ -155,6 +166,7 @@ private struct Fixture {
         let info = try await library.install(feedID: "test", zip: fixture.zipURL)
         #expect(info.feedID == "test")
         #expect(info.version == "v42")
+        #expect(info.lastServiceDate == 20261231)
         #expect(info.routeCount == 4)
         // Two stations + one standalone bus stop; platforms, entrances and unserved stops aren't searchable.
         #expect(info.stopCount == 3)

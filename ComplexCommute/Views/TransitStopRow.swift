@@ -57,7 +57,8 @@ extension TransitStop {
 
     var waypoint: Waypoint {
         let agency = FeedCatalog.feed(id: feedID)?.name
-        let lines = routes.prefix(6).map(\.name).joined(separator: " ")
+        // Single-line systems name their route after themselves ("PATH · PATH").
+        let lines = routes.prefix(6).map(\.name).filter { $0 != agency }.joined(separator: " ")
         let subtitle = [agency, lines.isEmpty ? nil : lines].compactMap { $0 }.joined(separator: " · ")
         return Waypoint(name: name, subtitle: subtitle, coordinate: coordinate, kind: .stop(feedID: feedID, stopID: stopID))
     }

@@ -93,7 +93,7 @@ struct TripView: View {
                 case .replace(let index):
                     planner.template.replaceWaypoint(at: index, with: waypoint)
                 case .append:
-                    planner.template.append(waypoint, mode: planner.template.modes.last == .walk ? .transit : .walk)
+                    planner.template.append(waypoint, mode: defaultMode(to: waypoint))
                 }
             }
         }
@@ -163,6 +163,14 @@ struct TripView: View {
             }
             .disabled(!planner.template.isPlannable)
         }
+    }
+
+    /// Station to station means riding; otherwise alternate walking with transit, the usual shape of a commute.
+    private func defaultMode(to waypoint: Waypoint) -> TravelMode {
+        if case .stop = waypoint.kind, case .stop = planner.template.waypoints.last?.kind {
+            return .transit
+        }
+        return planner.template.modes.last == .walk ? .transit : .walk
     }
 
     private func modeBinding(forSegment index: Int) -> Binding<TravelMode> {

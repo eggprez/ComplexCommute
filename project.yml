@@ -18,6 +18,8 @@ targets:
         product: CommuteCore
       - package: CommuteKit
         product: GTFSKit
+      - package: CommuteKit
+        product: TransitRouting
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.complexcommute.app
