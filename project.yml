@@ -1,0 +1,34 @@
+name: ComplexCommute
+options:
+  bundleIdPrefix: com.complexcommute
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+packages:
+  CommuteKit:
+    path: Packages/CommuteKit
+targets:
+  ComplexCommute:
+    type: application
+    platform: iOS
+    sources:
+      - ComplexCommute
+    dependencies:
+      - package: CommuteKit
+        product: CommuteCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.complexcommute.app
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "6.0"
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+        SWIFT_APPROACHABLE_CONCURRENCY: YES
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        INFOPLIST_KEY_CFBundleDisplayName: Commute
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: Your location is used as the starting point of trips and to keep route options up to date while you travel.
