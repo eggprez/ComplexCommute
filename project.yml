@@ -16,6 +16,8 @@ targets:
     dependencies:
       - package: CommuteKit
         product: CommuteCore
+      - package: CommuteKit
+        product: GTFSKit
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.complexcommute.app

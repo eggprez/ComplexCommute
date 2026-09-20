@@ -25,6 +25,7 @@ struct HomeSheetView: View {
     @State private var picked: (purpose: Picking, waypoint: Waypoint)?
     @State private var placeBeingNamed: Waypoint?
     @State private var placeName = ""
+    @State private var isShowingSettings = false
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -83,6 +84,11 @@ struct HomeSheetView: View {
             }
             .navigationTitle("Commute")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button("Transit Data", systemImage: "tram") { isShowingSettings = true }
+                }
+            }
             .navigationDestination(for: Route.self) { route in
                 switch route {
                 case .trip(let commute):
@@ -101,6 +107,9 @@ struct HomeSheetView: View {
                 allowsCurrentLocation: false,
                 location: planner.location
             ) { picked = (purpose, $0) }
+        }
+        .sheet(isPresented: $isShowingSettings, onDismiss: { detent = RootView.half }) {
+            SettingsView()
         }
         .alert("Name This Place", isPresented: isNamingPlace) {
             TextField("Name", text: $placeName)

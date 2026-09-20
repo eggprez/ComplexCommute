@@ -51,10 +51,14 @@ starting at the moment the previous leg ends. Realtime trip updates overlay sche
 ComplexCommute/            SwiftUI app (views, SwiftData models, MapKit, location)
 Packages/CommuteKit/
   CommuteCore              Pure models: modes, waypoints, legs, itineraries, chain timing
-  GTFSKit                  GTFS static parsing → SQLite; GTFS-realtime decoding     (phase 2/4)
+  GTFSKit                  Feed catalog, streaming zip/CSV → one SQLite file per feed, stop search;
+                           GTFS-realtime decoding later (phase 4). No third-party dependencies.
   TransitRouting           RAPTOR router over the local timetable, multi-criteria   (phase 3)
-  AgencyFeeds              Feed catalog: URLs, auth style, key requirements          (phase 2/4)
 ```
+
+- Feed storage: `Application Support/Feeds/<feed-id>.sqlite`, excluded from backup. String ids are mapped
+  to dense integer indexes at import; imports build a temp file and swap it in atomically.
+  The subway (565k stop_times) imports in seconds to ~15 MB.
 
 - Routing: **RAPTOR** (round-based; naturally yields fewest-transfer vs. earliest-arrival
   Pareto options), footpath transfers from `transfers.txt` + proximity.
@@ -68,19 +72,20 @@ Packages/CommuteKit/
 | MTA Subway | GTFS | GTFS-RT (NYCT extensions) | none |
 | MTA Bus | GTFS (per borough) | Bus Time SIRI / GTFS-RT | MTA Bus Time key |
 | LIRR / Metro-North | GTFS | GTFS-RT | none |
-| NJ Transit | GTFS (developer portal) | GTFS-RT | NJT developer credentials |
+| NJ Transit | GTFS (public zip) | GTFS-RT | NJT developer credentials (realtime only) |
 | PATH | GTFS | unofficial/bridged feed | none |
-| WMATA Rail + Bus | GTFS | GTFS-RT + predictions JSON | WMATA key |
+| WMATA Rail + Bus | GTFS (needs key, `api_key` header) | GTFS-RT + predictions JSON | WMATA key |
 | MARC | GTFS (MTA Maryland) | GTFS-RT | none |
 | VRE | GTFS | limited | none |
 
-(URLs and auth details get verified when each feed is implemented.)
+Static URLs verified 2026-09-19 and live in `FeedCatalog.swift`. Realtime details get verified in phase 4.
 
 ## Phases
 
-1. **Shell** — project, map + bottom sheet, places, commute templates (SwiftData), trip editor,
+1. ✅ **Shell** — project, map + bottom sheet, places, commute templates (SwiftData), trip editor,
    drive/walk legs via MapKit drawn on the map, chain timing, Apple Maps handoff.
-2. **GTFS static** — feed catalog, download/unzip/import to SQLite, stop search, stops as waypoints.
+2. ✅ **GTFS static** — feed catalog, download/unzip/import to SQLite, stop search, stops as waypoints,
+   Transit Data settings with per-feed install and WMATA key entry (Keychain).
 3. **Transit routing** — RAPTOR, multiple alternatives, full chained itineraries.
 4. **Realtime + keys** — Settings key entry (Keychain), realtime overlays, service alerts.
 5. **Active trip** — live re-plan from GPS, quick waypoint edits on the go.

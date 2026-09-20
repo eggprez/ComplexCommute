@@ -6,9 +6,12 @@ let package = Package(
     platforms: [.iOS(.v26), .macOS(.v15)],
     products: [
         .library(name: "CommuteCore", targets: ["CommuteCore"]),
+        .library(name: "GTFSKit", targets: ["GTFSKit"]),
     ],
     targets: [
         .target(name: "CommuteCore"),
         .testTarget(name: "CommuteCoreTests", dependencies: ["CommuteCore"]),
+        .target(name: "GTFSKit", dependencies: ["CommuteCore"], linkerSettings: [.linkedLibrary("sqlite3")]),
+        .testTarget(name: "GTFSKitTests", dependencies: ["GTFSKit"]),
     ]
 )

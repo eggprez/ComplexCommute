@@ -8,6 +8,7 @@ struct RootView: View {
     @State private var location: LocationService
     @State private var planner: TripPlannerModel
     @State private var detent = RootView.half
+    @State private var transitData = TransitDataStore()
 
     init() {
         let location = LocationService()
@@ -22,7 +23,9 @@ struct RootView: View {
                     .presentationDetents([Self.collapsed, Self.half, .large], selection: $detent)
                     .presentationBackgroundInteraction(.enabled(upThrough: Self.half))
                     .interactiveDismissDisabled()
+                    .environment(transitData)
             }
             .task { location.start() }
+            .task { await transitData.load() }
     }
 }
