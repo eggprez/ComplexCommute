@@ -20,7 +20,9 @@ public struct ChainPlanner: Sendable {
         self.maxAlternatives = maxAlternatives
     }
 
-    public func plan(_ template: TripTemplate, departingAt departure: Date) async throws -> [Itinerary] {
+    /// - Parameter canDelayDeparture: slide leading drive/walk legs later to meet the first train. Turn off for a
+    ///   rider already on the move, whose first leg really does start now.
+    public func plan(_ template: TripTemplate, departingAt departure: Date, canDelayDeparture: Bool = true) async throws -> [Itinerary] {
         guard template.isPlannable else { throw PlanningError.notPlannable }
 
         var partials: [Itinerary] = [Itinerary(legs: [])]
@@ -38,7 +40,7 @@ public struct ChainPlanner: Sendable {
             guard !extended.isEmpty else { throw PlanningError.noRoute(segmentIndex: segment.index) }
             partials = Self.prune(extended, keeping: maxAlternatives)
         }
-        return partials.map(Self.departingAsLateAsPossible)
+        return canDelayDeparture ? partials.map(Self.departingAsLateAsPossible) : partials
     }
 
     /// Drops duplicates and itineraries that are no better than another on arrival, rides and walking.

@@ -25,6 +25,7 @@ struct TripView: View {
     @State var commute: Commute?
     /// Called after a nested sheet closes; presenting one forces the main sheet to full height.
     var restoreSheet: () -> Void = {}
+    var onStart: () -> Void = {}
 
     @Environment(\.modelContext) private var modelContext
     @State private var pickerTarget: PickerTarget?
@@ -59,6 +60,22 @@ struct TripView: View {
 
             Section {
                 DeparturePicker(departure: $planner.departure)
+            }
+
+            if planner.selected != nil {
+                Section {
+                    Button {
+                        if planner.startActiveTrip() { onStart() }
+                    } label: {
+                        Label("Start Trip", systemImage: "location.north.line.fill")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
+                }
             }
 
             Section {

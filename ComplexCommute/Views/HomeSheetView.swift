@@ -5,6 +5,7 @@ import SwiftUI
 struct HomeSheetView: View {
     private enum Route: Hashable {
         case trip(Commute?)
+        case activeTrip
     }
 
     private enum Picking: String, Identifiable {
@@ -92,13 +93,20 @@ struct HomeSheetView: View {
             .navigationDestination(for: Route.self) { route in
                 switch route {
                 case .trip(let commute):
-                    TripView(planner: planner, commute: commute) { detent = RootView.half }
+                    TripView(planner: planner, commute: commute, restoreSheet: { detent = RootView.half }, onStart: { path.append(.activeTrip) })
+                case .activeTrip:
+                    ActiveTripView(planner: planner, onEdit: {
+                        planner.editRemainingTrip()
+                        path = [.trip(nil)]
+                    }, onDone: { path = [] })
                 }
             }
         }
         .onChange(of: path) {
             if path.isEmpty {
                 planner.start(TripTemplate())
+            } else if !path.contains(.activeTrip) {
+                planner.endActiveTrip()
             }
         }
         .sheet(item: $picking, onDismiss: handlePick) { purpose in

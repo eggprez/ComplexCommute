@@ -1,0 +1,192 @@
+import Foundation
+
+/// A trip being travelled: which leg the rider is on, and how to re-plan the rest from where they really are.
+///
+/// GPS is unreliable underground, so progress combines three signals: proximity to the next waypoint,
+/// the clock (a train's departure time passing means "aboard" unless the rider says otherwise), and
+/// explicit corrections from the rider.
+public struct ActiveTrip: Sendable {
+    public enum Notice: Sendable {
+        /// The followed plan stopped being possible (a missed or cancelled train) and was replaced.
+        case planChanged(previousArrival: Date)
+        /// The followed plan still works, but another gets there meaningfully sooner.
+        case fasterOption(Itinerary)
+    }
+
+    /// What to plan next: a template for the part of the trip still ahead.
+    public struct ReplanRequest: Sendable {
+        public let template: TripTemplate
+        public let departure: Date
+        /// Segment of the original template that the request's first segment corresponds to.
+        public let firstSegment: Int
+        /// False once the rider is moving: sliding the first leg later would misstate when they arrive.
+        public let canDelayDeparture: Bool
+    }
+
+    public let template: TripTemplate
+    /// The followed itinerary, one leg per template segment.
+    public private(set) var legs: [Leg]
+    public private(set) var currentSegment = 0
+    /// Aboard the current transit leg (or, for a leg without ride details, under way on it).
+    public private(set) var hasBoarded = false
+    public private(set) var notice: Notice?
+
+    private var startLocation: Coordinate?
+    private var isUnderway = false
+    /// Set by `markMissed` until the next plan lands, so the clock doesn't immediately re-assume boarding.
+    private var isAwaitingReplan = false
+
+    /// An alternative has to save at least this much before it interrupts the rider.
+    public static let worthwhileSaving: TimeInterval = 5 * 60
+
+    public init?(template: TripTemplate, itinerary: Itinerary) {
+        guard template.isPlannable, itinerary.legs.count == template.segments.count else { return nil }
+        self.template = template
+        self.legs = itinerary.legs
+    }
+
+    public var isFinished: Bool { currentSegment >= legs.count }
+    public var currentLeg: Leg? { isFinished ? nil : legs[currentSegment] }
+    public var remainingLegs: [Leg] { Array(legs[min(currentSegment, legs.count)...]) }
+    public var arrival: Date { legs.last?.arrival ?? .distantPast }
+    /// Moving along the current drive/walk leg, as opposed to waiting for the time to leave.
+    public var isMoving: Bool { isUnderway }
+
+    /// The ride the rider is on or waiting for within the current transit leg.
+    public func currentRide(at now: Date) -> Ride? {
+        guard let leg = currentLeg else { return nil }
+        return leg.option.rides.first { $0.alight > now } ?? leg.option.rides.last
+    }
+
+    // MARK: Progress
+
+    /// Folds in a location fix and the clock. Returns true if the rider moved on to another leg.
+    @discardableResult
+    public mutating func update(location: Coordinate?, now: Date) -> Bool {
+        let segmentBefore = currentSegment
+        if let location {
+            if startLocation == nil { startLocation = location }
+            if let startLocation, location.distance(to: startLocation) > 150 { isUnderway = true }
+
+            while let leg = currentLeg, location.distance(to: leg.to.coordinate) <= arrivalRadius(for: leg, now: now) {
+                advance()
+            }
+        }
+        if let leg = currentLeg, leg.mode == .transit, !hasBoarded, !isAwaitingReplan {
+            let boardTime = leg.option.rides.first?.board ?? leg.departure
+            if now >= boardTime.addingTimeInterval(30) { hasBoarded = true }
+        }
+        return currentSegment != segmentBefore
+    }
+
+    /// The rider says they have reached the next waypoint.
+    public mutating func markArrived() {
+        guard !isFinished else { return }
+        advance()
+    }
+
+    /// The rider says the train left without them; the next plan starts again from this station.
+    public mutating func markMissed() {
+        hasBoarded = false
+        isAwaitingReplan = true
+    }
+
+    public mutating func dismissNotice() {
+        notice = nil
+    }
+
+    private mutating func advance() {
+        currentSegment += 1
+        hasBoarded = false
+        isUnderway = true
+    }
+
+    private func arrivalRadius(for leg: Leg, now: Date) -> Double {
+        switch leg.mode {
+        case .drive:
+            return 250 // parking is rarely at the pin
+        case .walk:
+            return 120
+        case .transit:
+            // Surfacing from a big station can put the first fix blocks from its pin, so be generous once the
+            // train is due in. Before that, stay strict: the next station may simply be close by.
+            return hasBoarded && now >= leg.arrival.addingTimeInterval(-90) ? 600 : 200
+        }
+    }
+
+    // MARK: Re-planning
+
+    /// The part of the trip that can still change, or nil when there is nothing left to decide.
+    public func replanRequest(location: Coordinate?, now: Date) -> ReplanRequest? {
+        guard let leg = currentLeg else { return nil }
+        let waypoints = template.waypoints
+        let modes = template.modes
+
+        if leg.mode == .transit {
+            if hasBoarded {
+                // Aboard: this leg is fixed. Everything after it starts when it arrives.
+                let next = currentSegment + 1
+                guard next < legs.count else { return nil }
+                return ReplanRequest(template: TripTemplate(waypoints: Array(waypoints[next...]), modes: Array(modes[next...])),
+                                     departure: max(now, leg.arrival), firstSegment: next, canDelayDeparture: false)
+            }
+            // Waiting at the station: what can be caught from here now?
+            return ReplanRequest(template: TripTemplate(waypoints: Array(waypoints[currentSegment...]), modes: Array(modes[currentSegment...])),
+                                 departure: now, firstSegment: currentSegment, canDelayDeparture: false)
+        }
+
+        // Driving or walking: measure from where the rider actually is.
+        var remaining = Array(waypoints[currentSegment...])
+        if let location {
+            remaining[0] = .currentLocation(location)
+        }
+        return ReplanRequest(template: TripTemplate(waypoints: remaining, modes: Array(modes[currentSegment...])),
+                             departure: now, firstSegment: currentSegment, canDelayDeparture: !isUnderway)
+    }
+
+    /// Takes fresh plans for `request`. Keeps following the same vehicles when that is still possible (updating
+    /// their times), and otherwise switches to the best new plan and says so.
+    public mutating func apply(_ itineraries: [Itinerary], for request: ReplanRequest) {
+        // A request is stale if the rider moved on while it was being planned.
+        guard !itineraries.isEmpty, request.firstSegment >= currentSegment, request.firstSegment < legs.count else { return }
+        isAwaitingReplan = false
+
+        let followedID = Itinerary(legs: Array(legs[request.firstSegment...])).id
+        let best = itineraries.min { $0.arrival < $1.arrival } ?? itineraries[0]
+
+        if let same = itineraries.first(where: { $0.id == followedID }) {
+            replaceLegs(from: request.firstSegment, with: same)
+            if best.id != followedID, same.arrival.timeIntervalSince(best.arrival) >= Self.worthwhileSaving {
+                notice = .fasterOption(Self.reindexed(best, from: request.firstSegment))
+            } else if case .fasterOption = notice {
+                notice = nil
+            }
+        } else {
+            let previousArrival = arrival
+            replaceLegs(from: request.firstSegment, with: best)
+            notice = .planChanged(previousArrival: previousArrival)
+        }
+    }
+
+    /// Switches to an alternative that a `.fasterOption` notice offered.
+    public mutating func follow(_ itinerary: Itinerary) {
+        guard let first = itinerary.legs.first?.segmentIndex, first >= currentSegment,
+              first + itinerary.legs.count == legs.count else { return }
+        legs.replaceSubrange(first..., with: itinerary.legs)
+        notice = nil
+    }
+
+    private mutating func replaceLegs(from firstSegment: Int, with itinerary: Itinerary) {
+        guard firstSegment + itinerary.legs.count == legs.count else { return }
+        legs.replaceSubrange(firstSegment..., with: Self.reindexed(itinerary, from: firstSegment).legs)
+    }
+
+    /// Plans for a truncated template number their legs from zero; put them back on the original numbering.
+    private static func reindexed(_ itinerary: Itinerary, from firstSegment: Int) -> Itinerary {
+        Itinerary(legs: itinerary.legs.map { leg in
+            var leg = leg
+            leg.segmentIndex += firstSegment
+            return leg
+        })
+    }
+}

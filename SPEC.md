@@ -98,7 +98,13 @@ Static URLs verified 2026-09-19 and live in `FeedCatalog.swift`. Realtime detail
    predictions are folded into the timetable so the router catches late trains and re-checks connections;
    alerts attach to the rides they affect. Live for MTA subway/bus/LIRR/Metro-North (no key) and WMATA (key).
    Not yet: NJ Transit (token API), PATH (unofficial feed, trip ids don't match), MARC (endpoint unverified).
-5. **Active trip** — live re-plan from GPS, quick waypoint edits on the go.
+5. ✅ **Active trip** — `ActiveTrip` (CommuteCore) tracks the current leg from GPS proximity, the clock (a train's
+   departure passing means aboard, since GPS dies underground) and rider corrections ("I'm at…", "I missed this
+   train"). Every 20 s and on arrival at a waypoint it re-plans what's left: drive/walk legs from the actual
+   position (without sliding the departure once moving), transit from the station while waiting, and only the
+   legs after a ride once aboard. The followed trains are kept while still catchable; a broken plan is replaced
+   with a notice, and an alternative is offered only if it saves 5+ minutes. Edit Trip reopens the remaining
+   trip in the editor. The screen stays awake while a trip is active.
 6. **Later** — leave-by notifications, Live Activity + widgets, Apple Watch.
 
 ## Design guidelines

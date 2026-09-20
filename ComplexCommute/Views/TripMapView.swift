@@ -19,7 +19,7 @@ struct TripMapView: View {
                         .tint(waypoint.id == waypoints.last?.id ? Color.red : Color.gray)
                 }
 
-                if let itinerary = planner.selected {
+                if let itinerary = planner.displayedItinerary {
                     ForEach(itinerary.legs) { leg in
                         if leg.option.rides.isEmpty {
                             MapPolyline(coordinates: leg.option.geometry.map(\.clCoordinate))
@@ -42,7 +42,7 @@ struct TripMapView: View {
             }
             // Keep fitted content clear of the sheet.
             .safeAreaPadding(.bottom, sheetIsCollapsed ? 88 : proxy.size.height * 0.45)
-            .onChange(of: planner.selected?.id) { fitTrip() }
+            .onChange(of: planner.displayedItinerary?.id) { fitTrip() }
             .onChange(of: planner.template.waypoints) { fitTrip() }
         }
         .ignoresSafeArea(.keyboard)
@@ -61,7 +61,7 @@ struct TripMapView: View {
 
     private func fitTrip() {
         let fixed = planner.template.waypoints.filter { $0.kind != .currentLocation }.map(\.coordinate)
-        let route = planner.selected?.legs.flatMap(\.option.geometry) ?? []
+        let route = planner.displayedItinerary?.legs.flatMap(\.option.geometry) ?? []
         let coordinates = fixed + route
         guard !coordinates.isEmpty else {
             withAnimation { position = .userLocation(fallback: .automatic) }

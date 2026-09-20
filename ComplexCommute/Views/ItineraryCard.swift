@@ -103,7 +103,7 @@ struct ItineraryCard: View {
     }
 }
 
-private struct LegRow: View {
+struct LegRow: View {
     let leg: Leg
 
     var body: some View {
