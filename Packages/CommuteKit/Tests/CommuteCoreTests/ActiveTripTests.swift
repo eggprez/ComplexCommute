@@ -173,6 +173,221 @@ private func itinerary(train: TimeInterval = 900, route: String = "A", delay: Ti
     }
 }
 
+/// A transit leg that changes trains at Junction: `A` in, `B` out, with `delay` on the first one.
+private func changingItinerary(delay: TimeInterval = 0, isRealtime: Bool = true, from firstSegment: Int = 0) -> Itinerary {
+    let junction = StationRef(feedID: "f", stopID: "J", name: "Junction", coordinate: Coordinate(latitude: 40.73, longitude: -74.02))
+    var first = ride("A", board: 900, alight: 1500, delay: delay)
+    first.isRealtime = isRealtime
+    first.alightStopName = "Junction"
+    var second = Ride(routeName: "B", boardStopName: "Junction", alightStopName: "Station B",
+                      scheduledBoard: t0 + 1740, board: t0 + 1740, alight: t0 + 2400, isRealtime: isRealtime,
+                      stops: [RideStop(station: junction, time: t0 + 1740)], walkBefore: 120)
+    second.isRealtime = isRealtime
+    let all = [
+        Leg(segmentIndex: 0, from: home, to: stationA, option: LegOption(mode: .drive, departure: t0, arrival: t0 + 600)),
+        Leg(segmentIndex: 1, from: stationA, to: stationB,
+            option: LegOption(mode: .transit, departure: t0 + 900 + delay, arrival: t0 + 2400, rides: [first, second])),
+        Leg(segmentIndex: 2, from: stationB, to: office, option: LegOption(mode: .walk, departure: t0 + 2400, arrival: t0 + 2700)),
+    ]
+    return Itinerary(legs: all[firstSegment...].enumerated().map { offset, leg in
+        var leg = leg
+        leg.segmentIndex = offset
+        return leg
+    })
+}
+
+@Suite struct ActiveTripLearningTests {
+    /// Drive due in at t0+600 for a train at t0+900: five minutes of planned buffer.
+    private func trip() throws -> ActiveTrip {
+        try #require(ActiveTrip(template: template, itinerary: itinerary(driveStart: 0)))
+    }
+
+    @Test func recordsWhatWasReallyInHandOnReachingTheStation() throws {
+        var trip = try trip()
+        trip.update(location: stationA.coordinate, now: t0 + 780) // three minutes later than planned
+        let record = try #require(trip.drainRecords().first)
+        #expect(record.approach == .drive)
+        #expect(record.stationName == "Station A")
+        #expect(record.routeName == "A")
+        #expect(record.isObserved)
+        #expect(!record.wasMissed)
+        #expect(record.plannedBuffer == 300)
+        #expect(record.timeInHand == 120)
+        #expect(record.bufferUsed == 180)
+        #expect(trip.drainRecords().isEmpty) // handed over once
+    }
+
+    @Test func aTrainRunningLateCountsAsTimeInHand() throws {
+        var trip = try trip()
+        let request = try #require(trip.replanRequest(location: home.coordinate, now: t0 + 100))
+        trip.apply([itinerary(delay: 300, driveStart: 0)], for: request) // same train, five minutes down
+        trip.update(location: stationA.coordinate, now: t0 + 780)
+
+        let record = try #require(trip.drainRecords().first)
+        #expect(record.plannedDeparture == t0 + 900)
+        #expect(record.actualDeparture == t0 + 1200)
+        #expect(record.timeInHand == 420)
+        #expect(record.bufferUsed == -120) // needed less buffer than the plan set aside
+    }
+
+    @Test func arrivingAfterTheTrainHasGoneIsRecordedAsAMiss() throws {
+        var trip = try trip()
+        trip.update(location: stationA.coordinate, now: t0 + 1000)
+        let record = try #require(trip.drainRecords().first)
+        #expect(record.wasMissed)
+        #expect(record.timeInHand == -100)
+    }
+
+    @Test func sayingTheTrainWasMissedCorrectsTheConnectionRatherThanCountingItTwice() throws {
+        var trip = try trip()
+        trip.update(location: stationA.coordinate, now: t0 + 700)
+        trip.update(location: nil, now: t0 + 960) // the clock assumes boarding
+        #expect(trip.hasBoarded)
+
+        trip.markMissed(now: t0 + 960)
+        let records = trip.drainRecords()
+        #expect(records.count == 1)
+        let record = try #require(records.first)
+        #expect(record.wasMissed)
+        #expect(record.timeInHand == 0)
+        #expect(record.bufferUsed == 300) // the whole planned buffer went, and it still wasn't enough
+    }
+
+    @Test func recordsAChangeOfTrainsFromWhatRealtimeMadeOfIt() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: changingItinerary()))
+        trip.update(location: stationA.coordinate, now: t0 + 600)
+        _ = trip.drainRecords()
+
+        // Riding: the first train comes in four minutes down, which eats the change at Junction.
+        let request = try #require(trip.replanRequest(location: stationA.coordinate, now: t0 + 700))
+        trip.apply([changingItinerary(delay: 240, from: 1)], for: request)
+        trip.update(location: nil, now: t0 + 1200)
+        trip.update(location: stationB.coordinate, now: t0 + 2400)
+
+        let change = try #require(trip.drainRecords().first { $0.approach == .change })
+        #expect(change.stationName == "Junction")
+        #expect(change.routeName == "B")
+        #expect(!change.isObserved)
+        #expect(change.plannedBuffer == 120)  // alight 1500, two minutes across, board 1740
+        #expect(change.timeInHand == -120)    // four minutes down turns two minutes in hand into a miss
+        #expect(change.wasMissed)
+    }
+
+    @Test func leavesTheScheduleAloneWhenNothingLiveIsKnownAboutTheChange() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: changingItinerary(isRealtime: false)))
+        trip.update(location: stationA.coordinate, now: t0 + 600)
+        trip.update(location: stationB.coordinate, now: t0 + 2400)
+        #expect(trip.drainRecords().allSatisfy { $0.approach != .change })
+    }
+
+    @Test func tracksTheArriveByTargetAndSettlesOnArrival() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary(driveStart: 0), arriveBy: t0 + 2500))
+        let progress = try #require(trip.arriveByProgress(now: t0))
+        #expect(progress.projectedArrival == t0 + 2400) // the plan gets there a hundred seconds early
+        #expect(progress.standing == .onTime)
+        #expect(!progress.isFinal)
+
+        trip.markArrived(now: t0 + 700)
+        trip.markArrived(now: t0 + 2200)
+        trip.markArrived(now: t0 + 3300)
+        #expect(trip.isFinished)
+        let settled = try #require(trip.arriveByProgress(now: t0 + 9000))
+        #expect(settled.isFinal)
+        #expect(settled.projectedArrival == t0 + 3300)
+        #expect(settled.standing == .late) // thirteen minutes past the target
+    }
+
+    /// A trip that starts with a ride: the walk to the platform is inside the leg, so there is no leg
+    /// boundary to time it from — only the rider turning up at the stop.
+    @Test func timesTheFirstBoardingFromTurningUpOnThePlatform() throws {
+        let walkThenRide = Itinerary(legs: [
+            Leg(segmentIndex: 0, from: home, to: stationB,
+                option: LegOption(mode: .transit, departure: t0 + 300, arrival: t0 + 2_100,
+                                  rides: [Ride(routeName: "A", boardStopName: "Station A", alightStopName: "Station B",
+                                               scheduledBoard: t0 + 900, board: t0 + 900, alight: t0 + 2_100,
+                                               stops: [RideStop(station: StationRef(feedID: "f", stopID: "A", name: "Station A", coordinate: stationA.coordinate), time: t0 + 900)],
+                                               walkBefore: 420)]))
+        ])
+        let straight = TripTemplate(waypoints: [home, stationB], modes: [.transit])
+        var trip = try #require(ActiveTrip(template: straight, itinerary: walkThenRide))
+
+        // Due on the platform at t0 + 720; there at t0 + 800, and the train goes at t0 + 900.
+        trip.update(location: home.coordinate, now: t0 + 300)
+        trip.update(location: stationA.coordinate, now: t0 + 800)
+        #expect(trip.drainRecords().isEmpty) // nothing to say until the train is caught
+        trip.update(location: stationA.coordinate, now: t0 + 940)
+        #expect(trip.hasBoarded)
+
+        let record = try #require(trip.drainRecords().first)
+        #expect(record.approach == .walk)
+        #expect(record.stationName == "Station A")
+        #expect(record.plannedBuffer == 180)
+        #expect(record.timeInHand == 100)
+        #expect(!record.wasMissed)
+    }
+
+    /// Setting off from the platform itself teaches nothing about getting to it.
+    @Test func learnsNothingFromATripStartedOnThePlatform() throws {
+        let walkThenRide = Itinerary(legs: [
+            Leg(segmentIndex: 0, from: home, to: stationB,
+                option: LegOption(mode: .transit, departure: t0 + 300, arrival: t0 + 2_100,
+                                  rides: [Ride(routeName: "A", boardStopName: "Station A", alightStopName: "Station B",
+                                               scheduledBoard: t0 + 900, board: t0 + 900, alight: t0 + 2_100,
+                                               stops: [RideStop(station: StationRef(feedID: "f", stopID: "A", name: "Station A", coordinate: stationA.coordinate), time: t0 + 900)],
+                                               walkBefore: 420)]))
+        ])
+        var trip = try #require(ActiveTrip(template: TripTemplate(waypoints: [home, stationB], modes: [.transit]), itinerary: walkThenRide))
+        trip.update(location: stationA.coordinate, now: t0)      // already there when Go was tapped
+        trip.update(location: stationA.coordinate, now: t0 + 940)
+        #expect(trip.hasBoarded)
+        #expect(trip.drainRecords().isEmpty)
+    }
+
+    /// Walking to the station faster than the plan allowed for must not keep pushing the train back.
+    @Test func replansFromThePlatformOnceTheRiderIsStandingOnIt() throws {
+        let station = StationRef(feedID: "f", stopID: "A", name: "Station A", coordinate: stationA.coordinate)
+        let walkThenRide = Itinerary(legs: [
+            Leg(segmentIndex: 0, from: home, to: stationB,
+                option: LegOption(mode: .transit, departure: t0 + 300, arrival: t0 + 2_100,
+                                  rides: [Ride(routeName: "A", boardStopName: "Station A", alightStopName: "Station B",
+                                               scheduledBoard: t0 + 900, board: t0 + 900, alight: t0 + 2_100,
+                                               stops: [RideStop(station: station, time: t0 + 900)], walkBefore: 420)]))
+        ])
+        var trip = try #require(ActiveTrip(template: TripTemplate(waypoints: [home, stationB], modes: [.transit]), itinerary: walkThenRide))
+
+        // Still at home, where the trip starts: a doorstep is not a platform, so the time in hand for
+        // getting into the station still has to be allowed for.
+        let atHome = try #require(trip.replanRequest(location: home.coordinate, now: t0))
+        #expect(!atHome.isWaitingAtOrigin)
+
+        // Still on the way: the plan has to keep allowing for the rest of the walk.
+        let partWay = Coordinate(latitude: 40.71, longitude: -74.075)
+        let onTheWay = try #require(trip.replanRequest(location: partWay, now: t0 + 60))
+        #expect(!onTheWay.isWaitingAtOrigin)
+        #expect(onTheWay.template.waypoints.first?.name == "Home")
+
+        // There early: plan from the platform, or the walk gets allowed for twice over.
+        trip.update(location: stationA.coordinate, now: t0 + 400)
+        let waiting = try #require(trip.replanRequest(location: stationA.coordinate, now: t0 + 400))
+        #expect(waiting.isWaitingAtOrigin)
+        #expect(waiting.template.waypoints.first?.kind == .stop(feedID: "f", stopID: "A"))
+        #expect(waiting.template.waypoints.map(\.name) == ["Station A", "Station B"])
+    }
+
+    @Test func doesNotCountThePlatformTwiceWhenTheLegBoundaryAlreadyTimedIt() throws {
+        var trip = try trip()
+        trip.update(location: stationA.coordinate, now: t0 + 780)
+        trip.update(location: stationA.coordinate, now: t0 + 940) // boards, still standing at the same stop
+        #expect(trip.hasBoarded)
+        #expect(trip.drainRecords().count == 1)
+    }
+
+    @Test func withoutATargetThereIsNothingToReport() throws {
+        let trip = try trip()
+        #expect(trip.arriveByProgress(now: t0) == nil)
+    }
+}
+
 extension ActiveTrip.Notice: Equatable {
     public static func == (lhs: Self, rhs: Self) -> Bool {
         switch (lhs, rhs) {

@@ -3,7 +3,18 @@ options:
   bundleIdPrefix: scottai
   deploymentTarget:
     iOS: "26.0"
+    watchOS: "26.0"
   createIntermediateGroups: true
+# The app, its widget extension and its Watch app are versioned and signed as one.
+settings:
+  base:
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: 6S26L64S3C
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "6.0"
+    SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+    SWIFT_APPROACHABLE_CONCURRENCY: YES
 packages:
   CommuteKit:
     path: Packages/CommuteKit
@@ -13,7 +24,20 @@ targets:
     platform: iOS
     sources:
       - ComplexCommute
+      - Shared
+    # Background refresh needs real Info.plist entries; the INFOPLIST_KEY_ settings below still merge in.
+    info:
+      path: ComplexCommute/Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # `location` keeps a trip in progress followed (and its Live Activity current) with the phone locked.
+        UIBackgroundModes: [fetch, location]
+        BGTaskSchedulerPermittedIdentifiers: [scottai.commuter-app.refresh]
+        NSSupportsLiveActivities: true
     dependencies:
+      - target: ComplexCommuteWidgets
+      - target: ComplexCommuteWatch
       - package: CommuteKit
         product: CommuteCore
       - package: CommuteKit
@@ -23,13 +47,6 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: scottai.commuter-app
-        MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: "1"
-        DEVELOPMENT_TEAM: 6S26L64S3C
-        CODE_SIGN_STYLE: Automatic
-        SWIFT_VERSION: "6.0"
-        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
-        SWIFT_APPROACHABLE_CONCURRENCY: YES
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -37,4 +54,53 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: Commute
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
-        INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: Your location is used as the starting point of trips and to keep route options up to date while you travel.
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+        INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: Your location is used as the starting point of trips and to keep route options up to date while you travel, including on the Lock Screen while a trip is in progress.
+
+  # The Live Activity: Lock Screen, Dynamic Island, and the Watch's Smart Stack.
+  ComplexCommuteWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - ComplexCommuteWidgets
+      - Shared
+    info:
+      path: ComplexCommuteWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: Commute
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    dependencies:
+      - package: CommuteKit
+        product: CommuteCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: scottai.commuter-app.widgets
+        TARGETED_DEVICE_FAMILY: "1"
+
+  ComplexCommuteWatch:
+    type: application
+    platform: watchOS
+    sources:
+      - ComplexCommuteWatch
+      - path: Shared
+        # ActivityKit is the phone's; the Watch gets the activity from it, not from here.
+        excludes: [TripActivityAttributes.swift]
+    info:
+      path: ComplexCommuteWatch/Info.plist
+      properties:
+        CFBundleDisplayName: Commute
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        WKApplication: true
+        WKCompanionAppBundleIdentifier: scottai.commuter-app
+    dependencies:
+      - package: CommuteKit
+        product: CommuteCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: scottai.commuter-app.watchkitapp
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor

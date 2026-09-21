@@ -36,12 +36,19 @@ private struct Fixture {
             HOLIDAY,20261126,1
             """,
         "trips.txt": """
-            route_id,service_id,trip_id,trip_headsign,direction_id
-            R1,WKD,T1,Uptown,0
-            RX,WKD,T2,Uptown,0
-            B9,HOLIDAY,T3,Crosstown,1
-            R1X,WKD,T4,Uptown,0
-            R1,WKD,ORPHAN,Nowhere,0
+            route_id,service_id,trip_id,trip_headsign,direction_id,shape_id
+            R1,WKD,T1,Uptown,0,UP
+            RX,WKD,T2,Uptown,0,UP
+            B9,HOLIDAY,T3,Crosstown,1,
+            R1X,WKD,T4,Uptown,0,MISSING
+            R1,WKD,ORPHAN,Nowhere,0,
+            """,
+        // Out of order, with a point on the straight that simplifying drops.
+        "shapes.txt": """
+            shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence
+            UP,40.7553,-73.9869,3
+            UP,40.7506,-73.9911,1
+            UP,40.75295,-73.9890,2
             """,
         "stop_times.txt": """
             trip_id,arrival_time,departure_time,stop_id,stop_sequence
@@ -135,7 +142,7 @@ private struct Fixture {
         let found = try archive.read("stop_times.txt", chunkSize: 16) { bytes.append(contentsOf: $0) }
         #expect(found)
         #expect(String(decoding: bytes, as: UTF8.self) == Fixture.files["stop_times.txt"])
-        #expect(try archive.read("shapes.txt") { _ in } == false)
+        #expect(try archive.read("fare_rules.txt") { _ in } == false)
     }
 
     @Test func rejectsNonZipFiles() throws {
@@ -184,6 +191,26 @@ private struct Fixture {
 
         let nearby = await library.stops(near: Coordinate(latitude: 40.7550, longitude: -73.9870), radiusMeters: 700)
         #expect(nearby.map(\.stopID) == ["S1", "S2"])
+    }
+
+    @Test func importsShapesAndTiesThemToTrips() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let library = FeedLibrary(directory: fixture.directory.appendingPathComponent("feeds"))
+        let info = try await library.install(feedID: "test", zip: fixture.zipURL)
+        #expect(info.hasShapes)
+
+        let monday = ServiceDay(date: 20260921, weekday: 0, offsetSeconds: 0)
+        let data = try #require(await library.timetableData(for: [monday], feedIDs: ["test"]).first)
+        let uptown = try #require(data.trips.first { $0.id == "T1" })
+        // A trip naming a shape the feed never defines simply has none.
+        #expect(data.trips.first { $0.id == "T4" }?.shape == nil)
+
+        let index = try #require(uptown.shape)
+        let shape = try #require(await library.shape(feedID: "test", index: index))
+        #expect(shape.count == 2)
+        #expect(abs(shape[0].latitude - 40.7506) < 0.00001 && abs(shape[1].longitude + 73.9869) < 0.00001)
+        #expect(await library.shape(feedID: "test", index: 99) == nil)
     }
 
     @Test func survivesRelaunchReinstallAndRemoval() async throws {

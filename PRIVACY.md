@@ -13,7 +13,11 @@ about you stays on your iPhone.
 
 - **Your location.** Used to plan trips from where you are and to re-plan while you travel. It
   is read by the app on your device and never leaves it. The app does not record location
-  history.
+  history. While a trip is in progress, and only then, the app keeps reading your location with
+  the screen locked so the trip on your Lock Screen and Apple Watch stays current; this stops
+  when the trip ends.
+- **The trip in progress.** Kept on your iPhone so it can be picked back up if the app is
+  closed, shown in a Live Activity, and sent directly to your own paired Apple Watch.
 - **Your commutes and saved places.** Stored locally on your iPhone using Apple's SwiftData.
   They are not uploaded anywhere.
 - **Agency API keys.** If you add a key to receive realtime arrivals, it is stored in the iOS

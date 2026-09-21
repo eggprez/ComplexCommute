@@ -4,10 +4,24 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(TransitDataStore.self) private var store
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(StationBuffer.key) private var bufferMinutes = StationBuffer.defaultMinutes
 
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    NavigationLink {
+                        BufferStatsView()
+                    } label: {
+                        LabeledContent("Station Buffer", value: bufferMinutes == 0 ? "None" : "\(bufferMinutes) min")
+                    }
+                    NotificationRow()
+                } header: {
+                    Text("Planning")
+                } footer: {
+                    Text("Time to have in hand when you reach a station and every time you change trains or buses. The app times your real connections as you travel and can suggest a buffer that covers them.")
+                }
+
                 ForEach(TransitRegion.allCases) { region in
                     Section {
                         ForEach(FeedCatalog.feeds(in: region)) { feed in
@@ -41,6 +55,27 @@ struct SettingsView: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done", systemImage: "checkmark") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+/// Says whether the app may raise a notification, since a "no" quietly turns off the time-to-leave
+/// reminder and the offer of a faster train.
+private struct NotificationRow: View {
+    @Environment(TripNotifier.self) private var notifier
+
+    var body: some View {
+        switch notifier.authorization {
+        case .authorized, .provisional, .ephemeral:
+            LabeledContent("Trip Notifications", value: "On")
+        case .notDetermined:
+            LabeledContent("Trip Notifications", value: "Asked when you start a trip")
+        default:
+            if let url = URL(string: UIApplication.openSettingsURLString) {
+                Link(destination: url) {
+                    LabeledContent("Trip Notifications", value: "Off")
                 }
             }
         }
@@ -84,6 +119,8 @@ private struct FeedRow: View {
             if let info, info.isExpired() {
                 Text("Agency's published schedule has ended. Using its final week until they post an update.")
                     .foregroundStyle(.orange)
+            } else if let info, !info.hasShapes {
+                Text("Update to draw this agency's lines along their real routes. Happens by itself on Wi-Fi.")
             } else if let info {
                 Text("\(info.stopCount) stops · \(Int64(info.fileSize), format: .byteCount(style: .file)) · Updated \(info.importedAt, format: .dateTime.month().day())")
             } else if let key = feed.requiredKey, store.isMissingKey(for: feed) {

@@ -15,41 +15,19 @@ struct PlacePickerView: View {
     @Query(sort: \SavedPlace.createdAt) private var places: [SavedPlace]
 
     @State private var query = ""
-    @State private var results: [MKMapItem] = []
+    @State private var suggestions = PlaceSuggestions()
+    /// Full search results, once a search is submitted or a category suggestion is chosen. Nil while suggesting.
+    @State private var results: [MKMapItem]?
+    @State private var isSearching = false
     @State private var stops: [TransitStop] = []
     @State private var nearbyStops: [TransitStop] = []
-    @State private var searchFailed = false
+    @State private var recents = RecentPlaces.all
 
     var body: some View {
         NavigationStack {
             List {
                 if query.isEmpty {
-                    if allowsCurrentLocation {
-                        Button {
-                            pick(.currentLocation())
-                        } label: {
-                            Label("Current Location", systemImage: "location.fill")
-                        }
-                    }
-                    if !nearbyStops.isEmpty {
-                        Section("Nearby Stops") {
-                            ForEach(nearbyStops) { stop in
-                                stopButton(stop, showsDistance: true)
-                            }
-                        }
-                    }
-                    if !places.isEmpty {
-                        Section("Places") {
-                            ForEach(places) { place in
-                                Button {
-                                    pick(place.waypoint)
-                                } label: {
-                                    row(name: place.name, subtitle: place.subtitle, symbol: "mappin.circle.fill")
-                                }
-                                .tint(.primary)
-                            }
-                        }
-                    }
+                    suggestionsForEmptyQuery
                 } else {
                     if !stops.isEmpty {
                         Section("Stations & Stops") {
@@ -58,25 +36,43 @@ struct PlacePickerView: View {
                             }
                         }
                     }
-                    Section(stops.isEmpty ? "" : "Places") {
-                        ForEach(results, id: \.self) { item in
-                            Button {
-                                pick(Waypoint(name: item.name ?? "Pin", subtitle: item.shortAddress, coordinate: Coordinate(item.location.coordinate)))
-                            } label: {
-                                row(name: item.name ?? "Pin", subtitle: item.shortAddress, symbol: item.isTransit ? "tram.circle.fill" : "mappin.circle.fill")
+                    if let results {
+                        Section(stops.isEmpty ? "" : "Places") {
+                            ForEach(results, id: \.self) { item in
+                                Button {
+                                    Task { await pick(item) }
+                                } label: {
+                                    PlaceResultRow(item: item, distanceMeters: location.coordinate?.distance(to: Coordinate(item.location.coordinate)))
+                                }
+                                .tint(.primary)
                             }
-                            .tint(.primary)
+                        }
+                    } else {
+                        Section(stops.isEmpty ? "" : "Suggestions") {
+                            ForEach(suggestions.completions, id: \.self) { completion in
+                                Button {
+                                    Task { await choose(completion) }
+                                } label: {
+                                    CompletionRow(completion: completion)
+                                }
+                                .tint(.primary)
+                            }
                         }
                     }
                 }
             }
             .overlay {
-                if !query.isEmpty && results.isEmpty && stops.isEmpty && searchFailed {
+                if isSearching {
+                    ProgressView()
+                } else if !query.isEmpty, results?.isEmpty == true, stops.isEmpty {
                     ContentUnavailableView.search(text: query)
                 }
             }
             .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search places, stations, addresses")
-            .task(id: query) { await search() }
+            .onSubmit(of: .search) {
+                Task { _ = await search(MKLocalSearch.Request(), text: query) }
+            }
+            .task(id: query) { await suggest() }
             .task {
                 if let coordinate = location.coordinate {
                     nearbyStops = await transitData.library.stops(near: coordinate)
@@ -92,15 +88,52 @@ struct PlacePickerView: View {
         }
     }
 
-    private func row(name: String, subtitle: String?, symbol: String) -> some View {
-        Label {
-            Text(name)
-            if let subtitle {
-                Text(subtitle)
+    @ViewBuilder
+    private var suggestionsForEmptyQuery: some View {
+        if allowsCurrentLocation {
+            Button {
+                pick(.currentLocation())
+            } label: {
+                Label("Current Location", systemImage: "location.fill")
             }
-        } icon: {
-            Image(systemName: symbol)
         }
+        if !nearbyStops.isEmpty {
+            Section("Nearby Stops") {
+                ForEach(nearbyStops) { stop in
+                    stopButton(stop, showsDistance: true)
+                }
+            }
+        }
+        if !places.isEmpty {
+            Section("Places") {
+                ForEach(places) { place in
+                    waypointButton(place.waypoint, symbol: "mappin.circle.fill")
+                }
+            }
+        }
+        if !recents.isEmpty {
+            Section("Recents") {
+                ForEach(recents) { recent in
+                    waypointButton(recent, symbol: recent.station == nil ? "clock" : "tram.fill")
+                }
+            }
+        }
+    }
+
+    private func waypointButton(_ waypoint: Waypoint, symbol: String) -> some View {
+        Button {
+            pick(waypoint)
+        } label: {
+            Label {
+                Text(waypoint.name)
+                if let subtitle = waypoint.subtitle {
+                    Text(subtitle)
+                }
+            } icon: {
+                Image(systemName: symbol)
+            }
+        }
+        .tint(.primary)
     }
 
     private func stopButton(_ stop: TransitStop, showsDistance: Bool) -> some View {
@@ -113,46 +146,112 @@ struct PlacePickerView: View {
     }
 
     private func pick(_ waypoint: Waypoint) {
+        RecentPlaces.add(waypoint)
         onPick(waypoint)
         dismiss()
     }
 
-    private func search() async {
-        let text = query.trimmingCharacters(in: .whitespaces)
-        guard !text.isEmpty else {
-            results = []
-            stops = []
-            return
+    /// Apple's transit stations become the matching station of an installed schedule, so rides start from its platforms.
+    private func pick(_ item: MKMapItem) async {
+        let coordinate = Coordinate(item.location.coordinate)
+        if item.isTransit {
+            let words = Set((item.name ?? "").lowercased().split(separator: " ").filter { $0.count > 3 })
+            let nearby = await transitData.library.stops(near: coordinate, radiusMeters: 150, limit: 8)
+            let sameName = nearby.first { !words.isDisjoint(with: $0.name.lowercased().split(separator: " ")) }
+            if let stop = sameName ?? nearby.first {
+                pick(stop.waypoint)
+                return
+            }
         }
-        // Installed schedules answer instantly; Apple's search follows after the debounce.
-        stops = await transitData.library.searchStops(matching: text, near: location.coordinate, limit: 8)
-        // Debounce typing; .task(id:) cancels this when the query changes.
-        try? await Task.sleep(for: .milliseconds(300))
-        guard !Task.isCancelled else { return }
+        pick(Waypoint(name: item.name ?? "Pin", subtitle: item.shortAddress, coordinate: coordinate))
+    }
 
-        let request = MKLocalSearch.Request()
-        request.naturalLanguageQuery = text
+    /// Installed schedules answer instantly; Apple's suggestions stream in behind them.
+    private func suggest() async {
+        let text = query.trimmingCharacters(in: .whitespaces)
+        results = nil
+        suggestions.update(query: text, near: location.location?.coordinate)
+        stops = text.isEmpty ? [] : await transitData.library.searchStops(matching: text, near: location.coordinate, limit: 6)
+    }
+
+    /// A suggestion naming one place is picked outright; a category or chain lists what matches nearby.
+    private func choose(_ completion: MKLocalSearchCompletion) async {
+        let found = await search(MKLocalSearch.Request(completion: completion), text: nil)
+        if !completion.isQuery, let item = found.first {
+            await pick(item)
+        }
+    }
+
+    @discardableResult
+    private func search(_ request: MKLocalSearch.Request, text: String?) async -> [MKMapItem] {
+        if let text {
+            request.naturalLanguageQuery = text
+        }
         request.resultTypes = [.address, .pointOfInterest]
         if let center = location.location?.coordinate {
             request.region = MKCoordinateRegion(center: center, latitudinalMeters: 80_000, longitudinalMeters: 80_000)
         }
-        do {
-            results = try await MKLocalSearch(request: request).start().mapItems
-            searchFailed = results.isEmpty
-        } catch {
-            guard !Task.isCancelled else { return }
-            results = []
-            searchFailed = true
-        }
+        isSearching = true
+        defer { isSearching = false }
+        let items = (try? await MKLocalSearch(request: request).start().mapItems) ?? []
+        results = items
+        return items
     }
 }
 
-private extension MKMapItem {
-    var shortAddress: String? {
-        address?.shortAddress ?? address?.fullAddress
+/// A suggestion as Maps shows it: the typed part stands out, with where or what it is underneath.
+private struct CompletionRow: View {
+    let completion: MKLocalSearchCompletion
+
+    var body: some View {
+        Label {
+            Text(highlighted(completion.title, ranges: completion.titleHighlightRanges))
+            if !completion.subtitle.isEmpty {
+                Text(completion.subtitle)
+                    .lineLimit(1)
+            }
+        } icon: {
+            Image(systemName: completion.isQuery ? "magnifyingglass" : "mappin.circle.fill")
+                .foregroundStyle(completion.isQuery ? Color.secondary : Color.red)
+        }
     }
 
-    var isTransit: Bool {
-        pointOfInterestCategory == .publicTransport
+    private func highlighted(_ text: String, ranges: [NSValue]) -> AttributedString {
+        var attributed = AttributedString(text)
+        attributed.foregroundColor = ranges.isEmpty ? .primary : .secondary
+        for value in ranges {
+            guard let range = Range(value.rangeValue, in: text), let matched = Range(range, in: attributed) else { continue }
+            attributed[matched].foregroundColor = .primary
+            attributed[matched].font = .body.weight(.semibold)
+        }
+        return attributed
+    }
+}
+
+private struct PlaceResultRow: View {
+    let item: MKMapItem
+    let distanceMeters: Double?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: item.categorySymbol)
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(width: 30, height: 30)
+                .background(item.categoryColor.gradient, in: .circle)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.name ?? "Pin")
+                Text([item.categoryName, distanceMeters?.roadDistance].compactMap { $0 }.joined(separator: " · "))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                if let address = item.shortAddress {
+                    Text(address)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+        }
+        .accessibilityElement(children: .combine)
     }
 }

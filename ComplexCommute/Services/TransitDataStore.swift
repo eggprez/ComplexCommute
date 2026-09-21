@@ -37,11 +37,12 @@ final class TransitDataStore {
         refreshStaleFeeds()
     }
 
-    /// Quietly replaces schedules that have aged out. Never on cellular, and a failure just leaves the old copy in use.
+    /// Quietly replaces schedules that have aged out, or that were imported before route shapes were kept.
+    /// Never on cellular, and a failure just leaves the old copy in use.
     private func refreshStaleFeeds() {
         for feed in FeedCatalog.feeds {
-            guard let info = installed[feed.id], Date.now.timeIntervalSince(info.importedAt) > feed.refreshInterval,
-                  !isMissingKey(for: feed) else { continue }
+            guard let info = installed[feed.id], !isMissingKey(for: feed),
+                  Date.now.timeIntervalSince(info.importedAt) > feed.refreshInterval || !info.hasShapes else { continue }
             install(feed, isAutomatic: true)
         }
     }

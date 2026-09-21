@@ -36,6 +36,8 @@ public struct FeedInfo: Hashable, Sendable {
     public let fileSize: Int
     /// Last day covered by the feed's calendar (yyyymmdd). Past it, plans reuse the final published week.
     public let lastServiceDate: Int?
+    /// False for a file imported before route shapes were kept; its rides are drawn stop to stop until it is refreshed.
+    public let hasShapes: Bool
 
     public func isExpired(on date: Date = .now, calendar: Calendar = .current) -> Bool {
         guard let lastServiceDate else { return false }
@@ -61,8 +63,20 @@ final class FeedDatabase {
         feedID = try Self.meta("feed_id", in: database) ?? url.deletingPathExtension().lastPathComponent
     }
 
-    var isCurrentSchema: Bool {
-        (try? Self.meta("schema_version", in: database)).flatMap { $0 }.flatMap(Int.init) == GTFSImporter.schemaVersion
+    private(set) lazy var schemaVersion = (try? Self.meta("schema_version", in: database)).flatMap { $0 }.flatMap(Int.init) ?? 0
+
+    var isUsableSchema: Bool {
+        (GTFSImporter.oldestUsableSchemaVersion...GTFSImporter.schemaVersion).contains(schemaVersion)
+    }
+
+    var hasShapes: Bool { schemaVersion >= 2 }
+
+    /// Where trips with this shape run, in travel order.
+    func shape(_ index: Int) throws -> [Coordinate]? {
+        guard hasShapes else { return nil }
+        let statement = try database.prepare("SELECT points FROM shapes WHERE shape_idx = ?")
+        statement.bind(index, at: 1)
+        return try statement.step() ? statement.data(0).map(ShapeCoding.path) : nil
     }
 
     func info() throws -> FeedInfo {
@@ -75,7 +89,8 @@ final class FeedDatabase {
             stopCount: try count("SELECT COUNT(*) FROM stops WHERE searchable = 1"),
             routeCount: try count("SELECT COUNT(*) FROM routes"),
             fileSize: size,
-            lastServiceDate: try lastServiceDate()
+            lastServiceDate: try lastServiceDate(),
+            hasShapes: hasShapes
         )
     }
 

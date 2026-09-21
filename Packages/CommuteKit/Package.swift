@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "CommuteKit",
-    platforms: [.iOS(.v26), .macOS(.v15)],
+    platforms: [.iOS(.v26), .macOS(.v15), .watchOS(.v26)],
     products: [
         .library(name: "CommuteCore", targets: ["CommuteCore"]),
         .library(name: "GTFSKit", targets: ["GTFSKit"]),

@@ -1,5 +1,33 @@
 import Foundation
 
+/// A station or stop the app has a schedule for.
+public struct StationRef: Codable, Hashable, Identifiable, Sendable {
+    public var feedID: String
+    public var stopID: String
+    public var name: String
+    public var coordinate: Coordinate
+
+    public var id: String { "\(feedID):\(stopID)" }
+
+    public init(feedID: String, stopID: String, name: String, coordinate: Coordinate) {
+        self.feedID = feedID
+        self.stopID = stopID
+        self.name = name
+        self.coordinate = coordinate
+    }
+}
+
+/// A call a ride makes, from boarding to exit.
+public struct RideStop: Codable, Hashable, Sendable {
+    public var station: StationRef
+    public var time: Date
+
+    public init(station: StationRef, time: Date) {
+        self.station = station
+        self.time = time
+    }
+}
+
 /// One vehicle boarding within a transit leg.
 public struct Ride: Codable, Hashable, Sendable {
     public var routeName: String
@@ -14,22 +42,29 @@ public struct Ride: Codable, Hashable, Sendable {
     public var board: Date
     public var alight: Date
     public var isRealtime: Bool
-    /// Coordinates of every stop from boarding to exit, for drawing the ride.
-    public var path: [Coordinate]
+    /// Every stop from boarding to exit.
+    public var stops: [RideStop]
     /// Walking time from the previous ride (or the leg's start) to the boarding stop.
     public var walkBefore: TimeInterval
 
+    /// Where the vehicle actually runs between boarding and exit: the agency's published shape when it has one,
+    /// otherwise straight lines from stop to stop.
+    public var path: [Coordinate]
+
     /// Stops ridden, counting the exit but not the boarding stop.
-    public var stopCount: Int { max(0, path.count - 1) }
+    public var stopCount: Int { max(0, stops.count - 1) }
+    /// Stops passed through without getting off.
+    public var intermediateStops: [RideStop] { Array(stops.dropFirst().dropLast()) }
 
     public init(routeName: String, routeColorHex: String? = nil, routeTextColorHex: String? = nil, routeType: Int = 1,
                 headsign: String? = nil, boardStopName: String, alightStopName: String, scheduledBoard: Date, board: Date,
-                alight: Date, isRealtime: Bool = false, path: [Coordinate] = [], walkBefore: TimeInterval = 0) {
+                alight: Date, isRealtime: Bool = false, stops: [RideStop] = [], walkBefore: TimeInterval = 0, path: [Coordinate]? = nil) {
         self.routeName = routeName
         self.routeColorHex = routeColorHex
         self.routeTextColorHex = routeTextColorHex
         self.routeType = routeType
-        self.path = path
+        self.stops = stops
+        self.path = path ?? stops.map(\.station.coordinate)
         self.walkBefore = walkBefore
         self.headsign = headsign
         self.boardStopName = boardStopName
@@ -60,7 +95,7 @@ public struct ServiceAlert: Codable, Hashable, Identifiable, Sendable {
 }
 
 /// One way of covering a single template segment, as produced by a `LegResolving`.
-public struct LegOption: Hashable, Sendable {
+public struct LegOption: Codable, Hashable, Sendable {
     public var mode: TravelMode
     public var departure: Date
     public var arrival: Date
@@ -73,12 +108,14 @@ public struct LegOption: Hashable, Sendable {
     public var walkAfter: TimeInterval
     public var alerts: [ServiceAlert]
     public var summary: String?
+    /// Turn-by-turn maneuvers for drive and walk legs.
+    public var steps: [RouteStep]
     /// True when times are a coarse estimate rather than a concrete schedule.
     public var isEstimate: Bool
 
     public init(mode: TravelMode, departure: Date, arrival: Date, distanceMeters: Double? = nil, walkingMeters: Double = 0,
                 geometry: [Coordinate] = [], rides: [Ride] = [], walkAfter: TimeInterval = 0, alerts: [ServiceAlert] = [],
-                summary: String? = nil, isEstimate: Bool = false) {
+                summary: String? = nil, steps: [RouteStep] = [], isEstimate: Bool = false) {
         self.mode = mode
         self.departure = departure
         self.arrival = arrival
@@ -89,13 +126,14 @@ public struct LegOption: Hashable, Sendable {
         self.walkAfter = walkAfter
         self.alerts = alerts
         self.summary = summary
+        self.steps = steps
         self.isEstimate = isEstimate
     }
 
     public var duration: TimeInterval { arrival.timeIntervalSince(departure) }
 }
 
-public struct Leg: Hashable, Identifiable, Sendable {
+public struct Leg: Codable, Hashable, Identifiable, Sendable {
     public var segmentIndex: Int
     public var from: Waypoint
     public var to: Waypoint
@@ -115,7 +153,7 @@ public struct Leg: Hashable, Identifiable, Sendable {
     }
 }
 
-public struct Itinerary: Hashable, Identifiable, Sendable {
+public struct Itinerary: Codable, Hashable, Identifiable, Sendable {
     public var legs: [Leg]
 
     public init(legs: [Leg]) {

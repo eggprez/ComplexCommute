@@ -2,7 +2,7 @@ import CommuteCore
 import CoreLocation
 import MapKit
 
-/// Resolves drive and walk legs with MapKit directions. MapKit exposes no transit steps, only an ETA,
+/// Resolves drive and walk legs, with their turn-by-turn steps, from MapKit directions. MapKit exposes no transit steps, only an ETA,
 /// so transit legs are a coarse estimate until the GTFS router replaces them.
 nonisolated struct MapKitLegResolver: LegResolving {
     private let cache: RouteCache
@@ -13,7 +13,7 @@ nonisolated struct MapKitLegResolver: LegResolving {
     }
 
     @MainActor
-    func options(from: Waypoint, to: Waypoint, mode: TravelMode, departingAt: Date) async throws -> [LegOption] {
+    func options(from: Waypoint, to: Waypoint, mode: TravelMode, departingAt: Date, isWaitingAtOrigin: Bool = false) async throws -> [LegOption] {
         if let cached = cache.option(from: from.coordinate, to: to.coordinate, mode: mode, departingAt: departingAt) {
             return [cached]
         }
@@ -35,7 +35,8 @@ nonisolated struct MapKitLegResolver: LegResolving {
                 distanceMeters: route.distance,
                 walkingMeters: mode == .walk ? route.distance : 0,
                 geometry: route.polyline.coordinates,
-                summary: route.name.isEmpty ? nil : route.name
+                summary: route.name.isEmpty ? nil : route.name,
+                steps: route.steps.map { RouteStep(instruction: $0.instructions, distanceMeters: $0.distance, geometry: $0.polyline.coordinates) }
             )
         case .transit:
             request.transportType = .transit

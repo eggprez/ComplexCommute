@@ -47,9 +47,10 @@ extension ItineraryTag {
     }
 }
 
-extension TimeInterval {
-    /// "8 min", "1 hr 12 min"
-    var shortDuration: String {
-        Duration.seconds(max(60, self)).formatted(.units(allowed: [.hours, .minutes], width: .abbreviated))
+extension Color {
+    /// "RRGGBB" as published in GTFS; nil for missing or malformed values.
+    init?(hex: String?) {
+        guard let hex, hex.count == 6, let value = UInt32(hex, radix: 16) else { return nil }
+        self.init(red: Double((value >> 16) & 0xFF) / 255, green: Double((value >> 8) & 0xFF) / 255, blue: Double(value & 0xFF) / 255)
     }
 }

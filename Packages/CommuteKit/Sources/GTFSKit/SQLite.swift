@@ -99,6 +99,12 @@ final class SQLiteStatement {
         }
     }
 
+    func bind(_ data: Data, at position: Int32) {
+        data.withUnsafeBytes { bytes in
+            _ = sqlite3_bind_blob(statement, position, bytes.baseAddress, Int32(bytes.count), transient)
+        }
+    }
+
     /// Runs a statement that returns no rows, then resets it for reuse.
     func run() throws {
         let code = sqlite3_step(statement)
@@ -134,6 +140,11 @@ final class SQLiteStatement {
 
     func double(_ column: Int32) -> Double {
         sqlite3_column_double(statement, column)
+    }
+
+    func data(_ column: Int32) -> Data? {
+        guard let bytes = sqlite3_column_blob(statement, column) else { return nil }
+        return Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, column)))
     }
 
     func string(_ column: Int32) -> String? {

@@ -77,6 +77,17 @@ private extension Timetable {
         return Timetable(feeds: [feed.data])
     }
 
+    @Test func listsUpcomingDeparturesButNotTerminatingTrips() {
+        let timetable = Self.network()
+        let start = Date(timeIntervalSince1970: TimeInterval(eight + 60))
+        let board = timetable.departures(feedID: "test", stopID: "A", from: start, within: 1_800, limit: 10)
+        #expect(board.map { "\($0.route.name)>\($0.destination) @\(Int($0.time.timeIntervalSince1970) - eight)" }
+                == ["Local>D @600", "Express>D @900", "Local>D @1200", "Local>D @1800"])
+        #expect(board.allSatisfy { !$0.isRealtime })
+        // Everything reaching D ends there, so nothing departs.
+        #expect(timetable.departures(feedID: "test", stopID: "D", from: start, within: 3_600, limit: 10).isEmpty)
+    }
+
     @Test func takesTheNextDirectTrain() {
         let timetable = Self.network()
         let journeys = RaptorRouter(timetable: timetable).journeys(
@@ -111,6 +122,45 @@ private extension Timetable {
         let fromB = RaptorRouter(timetable: timetable).journeys(
             from: [StopAccess(stop: timetable.stop("B"))], to: [StopAccess(stop: timetable.stop("E"))], departure: eight + 60)
         #expect(fromB.map(timetable.describe) == [["Local B>C @300", "Branch C2>E @900"]])
+    }
+
+    @Test func aLongerBufferSkipsTightConnections() {
+        let timetable = Self.network()
+        var router = RaptorRouter(timetable: timetable)
+        let (a, e) = (timetable.stop("A"), timetable.stop("E"))
+
+        // The published 3 min C→C2 change already satisfies a 3 min buffer: reach C 8:10, Branch at 8:15.
+        router.changeSeconds = 180
+        let comfortable = router.journeys(from: [StopAccess(stop: a)], to: [StopAccess(stop: e)], departure: eight)
+        #expect(comfortable.map(timetable.describe) == [["Local A>C @0", "Branch C2>E @900"]])
+
+        // Wanting 6 min in hand rules the 8:15 out (only 5 to spare), so ride the later local to meet the 8:30.
+        router.changeSeconds = 360
+        let cautious = router.journeys(from: [StopAccess(stop: a)], to: [StopAccess(stop: e)], departure: eight)
+        #expect(cautious.map(timetable.describe) == [["Local A>C @600", "Branch C2>E @1800"]])
+    }
+
+    @Test func theBufferAppliesWhenChangingAtTheSamePlatform() {
+        var feed = FeedBuilder()
+        for id in ["A", "B", "C"] { feed.stop(id, latitude: 40 + Double(feed.data.stops.count)) }
+        feed.line("First", starts: [eight], stops: [("A", 0), ("B", 600)])
+        feed.line("Second", starts: every(120, from: eight + 600, count: 5), stops: [("B", 0), ("C", 300)])
+        let timetable = Timetable(feeds: [feed.data])
+        var router = RaptorRouter(timetable: timetable)
+        router.changeSeconds = 180
+
+        let journeys = router.journeys(from: [StopAccess(stop: timetable.stop("A"))], to: [StopAccess(stop: timetable.stop("C"))], departure: eight)
+        // Off at B at 8:10. Trains leave B at 8:10, 8:12, 8:14…; the first with 3 min in hand is the 8:14.
+        #expect(journeys.map(timetable.describe) == [["First A>B @0", "Second B>C @840"]])
+    }
+
+    @Test func groupsDeparturesByLineAndDestinationKeepingTheNextThree() {
+        let timetable = Self.network()
+        let start = Date(timeIntervalSince1970: TimeInterval(eight + 60))
+        let board = timetable.departures(feedID: "test", stopID: "A", from: start, within: 2 * 3_600, limit: 100)
+        let groups = DepartureGroup.groups(board)
+        #expect(groups.map(\.id) == ["Local|D", "Express|D"])
+        #expect(groups.map { $0.departures.map { Int($0.time.timeIntervalSince1970) - eight } } == [[600, 1200, 1800], [900, 2700, 4500]])
     }
 
     @Test func departingLateSwitchesToALaterFeederTrip() {

@@ -84,6 +84,12 @@ public actor FeedLibrary {
         return feedIDs.compactMap { open[$0] }.compactMap { try? $0.timetableData(for: days) }
     }
 
+    /// The path trips with this shape follow, or nil when the feed has none.
+    public func shape(feedID: String, index: Int) -> [Coordinate]? {
+        scanIfNeeded()
+        return try? open[feedID]?.shape(index)
+    }
+
     private func databaseURL(for feedID: String) -> URL {
         directory.appendingPathComponent(feedID).appendingPathExtension("sqlite")
     }
@@ -93,8 +99,8 @@ public actor FeedLibrary {
         didScan = true
         let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
         for file in files where file.pathExtension == "sqlite" {
-            // Feeds imported by an older schema are dropped; the app offers them for download again.
-            guard let database = try? FeedDatabase(url: file), database.isCurrentSchema else {
+            // Feeds imported by a schema too old to read are dropped; the app offers them for download again.
+            guard let database = try? FeedDatabase(url: file), database.isUsableSchema else {
                 try? FileManager.default.removeItem(at: file)
                 continue
             }

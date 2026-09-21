@@ -28,6 +28,12 @@ public struct Waypoint: Codable, Hashable, Identifiable, Sendable {
         self.kind = kind
     }
 
+    /// A stop with a schedule, as opposed to a place the rider has to get to a stop from.
+    public var isStop: Bool {
+        if case .stop = kind { return true }
+        return false
+    }
+
     public static func currentLocation(_ coordinate: Coordinate = Coordinate(latitude: 0, longitude: 0)) -> Waypoint {
         Waypoint(name: "Current Location", coordinate: coordinate, kind: .currentLocation)
     }

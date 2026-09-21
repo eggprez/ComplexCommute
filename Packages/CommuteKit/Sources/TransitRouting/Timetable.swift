@@ -2,6 +2,46 @@ import CommuteCore
 import Foundation
 import GTFSKit
 
+/// A vehicle due to leave a station.
+public struct StopDeparture: Hashable, Identifiable, Sendable {
+    public let route: RouteBadge
+    /// Where the vehicle is headed: its headsign, or failing that its last stop.
+    public let destination: String
+    public let scheduled: Date
+    public let time: Date
+    public let isRealtime: Bool
+
+    public var id: String { "\(route.name)|\(destination)|\(Int(scheduled.timeIntervalSince1970))" }
+}
+
+/// The next few vehicles of one line to one destination, which is how a rider reads a departure board.
+public struct DepartureGroup: Hashable, Identifiable, Sendable {
+    public let route: RouteBadge
+    public let destination: String
+    /// Soonest first.
+    public let departures: [StopDeparture]
+
+    public var id: String { "\(route.name)|\(destination)" }
+
+    /// Groups time-ordered departures by line and destination, keeping the next `limit` of each.
+    /// Groups are ordered by their soonest departure.
+    public static func groups(_ departures: [StopDeparture], limit: Int = 3) -> [DepartureGroup] {
+        var order: [String] = []
+        var members: [String: [StopDeparture]] = [:]
+        for departure in departures.sorted(by: { $0.time < $1.time }) {
+            let key = "\(departure.route.name)|\(departure.destination)"
+            if members[key] == nil { order.append(key) }
+            if members[key, default: []].count < limit {
+                members[key, default: []].append(departure)
+            }
+        }
+        return order.compactMap { key in
+            guard let group = members[key], let first = group.first else { return nil }
+            return DepartureGroup(route: first.route, destination: first.destination, departures: group)
+        }
+    }
+}
+
 /// An in-memory network laid out for RAPTOR: trips grouped into patterns (same route, same stop
 /// sequence, never overtaking each other) plus walking links between stops.
 public struct Timetable: Sendable {
@@ -20,6 +60,8 @@ public struct Timetable: Sendable {
         let canBoard: [Bool]
         let canAlight: [Bool]
         let headsigns: [String?]
+        /// The feed's shape each trip follows, where it publishes one.
+        let shapes: [Int?]
         /// Row-major `[trip][position]`. Live predictions where known, otherwise the schedule.
         let arrivals: [Int32]
         let departures: [Int32]
@@ -49,6 +91,9 @@ public struct Timetable: Sendable {
         let to: Int
         let seconds: Int
         let meters: Double
+        /// A walk along the street to another station, as opposed to a change inside one. In-station times are
+        /// already the agency's minimum for making the connection; a street walk is only the walking.
+        let isStreet: Bool
     }
 
     public let stops: [Stop]
@@ -100,7 +145,7 @@ public struct Timetable: Sendable {
                 let calls = feed.stopTimes[trip.stopTimes]
                 let key = PatternKey(route: routeOffset + trip.route, stops: calls.map { stopOffset + $0.stop },
                                      canBoard: calls.map(\.canBoard), canAlight: calls.map(\.canAlight))
-                groups[key, default: []].append(TripTimes(feedID: feed.feedID, tripID: trip.id, serviceDate: trip.serviceDate, headsign: trip.headsign,
+                groups[key, default: []].append(TripTimes(feedID: feed.feedID, tripID: trip.id, serviceDate: trip.serviceDate, headsign: trip.headsign, shape: trip.shape,
                                                           arrivals: calls.map { Int32($0.arrival) }, departures: calls.map { Int32($0.departure) }))
             }
         }
@@ -112,11 +157,11 @@ public struct Timetable: Sendable {
         for stop in servedStops {
             platforms[stops[stop].station, default: []].append(stop)
         }
-        func addLink(_ from: Int, _ to: Int, seconds: Int) {
+        func addLink(_ from: Int, _ to: Int, seconds: Int, isStreet: Bool = false) {
             guard from != to else { return }
             let meters = stops[from].coordinate.distance(to: stops[to].coordinate)
             if links[from][to].map({ seconds < $0.seconds }) ?? true {
-                links[from][to] = Footpath(to: to, seconds: seconds, meters: meters)
+                links[from][to] = Footpath(to: to, seconds: seconds, meters: meters, isStreet: isStreet)
             }
         }
 
@@ -148,7 +193,7 @@ public struct Timetable: Sendable {
                 .filter { $0.stop != stop && links[stop][$0.stop] == nil }
                 .prefix(Self.walkLinksPerStop)
             for neighbor in nearby {
-                addLink(stop, neighbor.stop, seconds: Self.walkSeconds(forMeters: neighbor.meters) + 60)
+                addLink(stop, neighbor.stop, seconds: Self.walkSeconds(forMeters: neighbor.meters), isStreet: true)
             }
         }
 
@@ -186,7 +231,7 @@ public struct Timetable: Sendable {
                 }
                 patterns.append(Pattern(
                     route: group.key.route, stops: group.key.stops, canBoard: group.key.canBoard, canAlight: group.key.canAlight,
-                    headsigns: lane.map(\.headsign), arrivals: lane.flatMap(\.arrivals), departures: lane.flatMap(\.departures),
+                    headsigns: lane.map(\.headsign), shapes: lane.map(\.shape), arrivals: lane.flatMap(\.arrivals), departures: lane.flatMap(\.departures),
                     scheduledDepartures: lane.flatMap { $0.scheduledDepartures ?? $0.departures }, isRealtime: lane.map { $0.scheduledDepartures != nil }
                 ))
             }
@@ -228,6 +273,33 @@ public struct Timetable: Sendable {
         return stops.indices.filter { stops[$0].station == station && !patternsAtStop[$0].isEmpty }
     }
 
+    /// What leaves a station next, across all of its platforms, soonest first.
+    public func departures(feedID: String, stopID: String, from date: Date, within horizon: TimeInterval, limit: Int) -> [StopDeparture] {
+        let earliest = Int(date.timeIntervalSince(midnight))
+        let latest = earliest + Int(horizon)
+
+        var departures: [StopDeparture] = []
+        for platform in platforms(feedID: feedID, stopID: stopID) {
+            for (patternIndex, position) in patternsAtStop[platform] {
+                let pattern = patterns[patternIndex]
+                guard position < pattern.stops.count - 1, pattern.canBoard[position],
+                      var trip = pattern.earliestTrip(at: position, notBefore: earliest, limit: pattern.tripCount) else { continue }
+                let lastStop = stops[pattern.stops[pattern.stops.count - 1]].name
+                while trip < pattern.tripCount, pattern.departure(trip: trip, position: position) <= latest {
+                    departures.append(StopDeparture(
+                        route: routes[pattern.route], destination: pattern.headsigns[trip] ?? lastStop,
+                        scheduled: midnight.addingTimeInterval(TimeInterval(pattern.scheduledDeparture(trip: trip, position: position))),
+                        time: midnight.addingTimeInterval(TimeInterval(pattern.departure(trip: trip, position: position))),
+                        isRealtime: pattern.isRealtime[trip]
+                    ))
+                    trip += 1
+                }
+            }
+        }
+        var seen = Set<String>()
+        return Array(departures.sorted { $0.time < $1.time }.filter { seen.insert($0.id).inserted }.prefix(limit))
+    }
+
     /// Served stops near a coordinate, nearest first.
     public func stops(near coordinate: Coordinate, radiusMeters: Double, limit: Int) -> [(stop: Int, meters: Double)] {
         stops.indices
@@ -262,6 +334,7 @@ public struct Timetable: Sendable {
         var tripID = ""
         var serviceDate = 0
         let headsign: String?
+        var shape: Int?
         var arrivals: [Int32]
         var departures: [Int32]
         /// Set once live times replace `departures`.

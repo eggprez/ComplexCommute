@@ -1,3 +1,4 @@
+import CommuteCore
 import Foundation
 
 public enum GTFSImportError: Error, Equatable {
@@ -15,7 +16,11 @@ public struct ImportProgress: Sendable {
 /// Converts a GTFS zip into one compact SQLite file. String ids become dense integer indexes so the
 /// multi-million-row stop_times table stays small and the router can load it straight into arrays.
 public enum GTFSImporter {
-    static let schemaVersion = 1
+    /// 2 added route shapes. Older files stay usable (rides are drawn stop to stop) until they are next refreshed.
+    static let schemaVersion = 2
+    static let oldestUsableSchemaVersion = 1
+    /// Agencies trace shapes far more finely than a phone map can show.
+    static let shapeToleranceMeters = 4.0
 
     private static let schema = """
         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
@@ -27,7 +32,8 @@ public enum GTFSImporter {
         CREATE TABLE calendar (service_idx INTEGER PRIMARY KEY, weekdays INTEGER NOT NULL, start_date INTEGER NOT NULL, end_date INTEGER NOT NULL);
         CREATE TABLE calendar_dates (service_idx INTEGER NOT NULL, date INTEGER NOT NULL, exception_type INTEGER NOT NULL);
         CREATE TABLE trips (trip_idx INTEGER PRIMARY KEY, trip_id TEXT NOT NULL, route_idx INTEGER NOT NULL,
-            service_idx INTEGER NOT NULL, headsign TEXT, direction INTEGER);
+            service_idx INTEGER NOT NULL, headsign TEXT, direction INTEGER, shape_idx INTEGER);
+        CREATE TABLE shapes (shape_idx INTEGER PRIMARY KEY, points BLOB NOT NULL);
         CREATE TABLE stop_times (trip_idx INTEGER NOT NULL, seq INTEGER NOT NULL, stop_idx INTEGER NOT NULL,
             arrival INTEGER, departure INTEGER, pickup_type INTEGER NOT NULL, drop_off_type INTEGER NOT NULL,
             PRIMARY KEY (trip_idx, seq)) WITHOUT ROWID;
@@ -62,7 +68,7 @@ public enum GTFSImporter {
         try database.execute(schema)
         try database.execute("BEGIN")
 
-        let files = ["routes.txt", "stops.txt", "calendar.txt", "calendar_dates.txt", "trips.txt", "stop_times.txt", "transfers.txt", "feed_info.txt"]
+        let files = ["routes.txt", "stops.txt", "calendar.txt", "calendar_dates.txt", "shapes.txt", "trips.txt", "stop_times.txt", "transfers.txt", "feed_info.txt"]
         let totalBytes = max(1, files.reduce(0) { $0 + (archive.entries[$1]?.uncompressedSize ?? 0) })
         var completedBytes = 0
 
@@ -196,13 +202,48 @@ public enum GTFSImporter {
         }
         guard hasCalendar || hasCalendarDates else { throw GTFSImportError.missingFile("calendar.txt") }
 
+        // shapes.txt — where each route really runs. Rows normally come grouped by shape, so one shape is held at a time;
+        // a shape that turns up again later is appended to.
+        var shapeIndexes: [String: Int] = [:]
+        let insertShape = try database.prepare("INSERT INTO shapes VALUES (?, ?)")
+        let extendShape = try database.prepare("UPDATE shapes SET points = points || ?2 WHERE shape_idx = ?1")
+        var shapeID: String?
+        var shapePoints: [(sequence: Int, coordinate: Coordinate)] = []
+        func flushShape() throws {
+            defer { shapePoints.removeAll(keepingCapacity: true) }
+            guard let shapeID, !shapePoints.isEmpty else { return }
+            let path = shapePoints.sorted { $0.sequence < $1.sequence }.map(\.coordinate).simplified(toleranceMeters: shapeToleranceMeters)
+            let statement = shapeIndexes[shapeID] == nil ? insertShape : extendShape
+            let index = shapeIndexes[shapeID] ?? shapeIndexes.count
+            shapeIndexes[shapeID] = index
+            statement.bind(index, at: 1)
+            statement.bind(ShapeCoding.data(for: path), at: 2)
+            try statement.run()
+        }
+        try load("shapes.txt") { header in
+            let id = try column(header, "shape_id", in: "shapes.txt")
+            let (lat, lon, sequence) = (header["shape_pt_lat"], header["shape_pt_lon"], header["shape_pt_sequence"])
+            var lastShapeBytes: [UInt8] = []
+            return { row in
+                let shapeBytes = row.field(id)
+                if !shapeBytes.elementsEqual(lastShapeBytes) {
+                    try flushShape()
+                    lastShapeBytes = Array(shapeBytes)
+                    shapeID = row.string(id)
+                }
+                guard let latitude = row.double(lat), let longitude = row.double(lon) else { return }
+                shapePoints.append((row.int(sequence) ?? shapePoints.count, Coordinate(latitude: latitude, longitude: longitude)))
+            }
+        }
+        try flushShape()
+
         // trips.txt
-        let insertTrip = try database.prepare("INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?)")
+        let insertTrip = try database.prepare("INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?, ?)")
         try load("trips.txt", required: true) { header in
             let id = try column(header, "trip_id", in: "trips.txt")
             let route = try column(header, "route_id", in: "trips.txt")
             let service = try column(header, "service_id", in: "trips.txt")
-            let (headsign, direction) = (header["trip_headsign"], header["direction_id"])
+            let (headsign, direction, shape) = (header["trip_headsign"], header["direction_id"], header["shape_id"])
             return { row in
                 guard let routeIndex = routeIndexes[row.string(route)] else { return }
                 let index = tripIndexes.count
@@ -213,6 +254,7 @@ public enum GTFSImporter {
                 insertTrip.bind(try serviceIndex(row.string(service)), at: 4)
                 insertTrip.bind(row.field(headsign), at: 5)
                 insertTrip.bind(row.int(direction), at: 6)
+                insertTrip.bind(row.nonEmptyString(shape).flatMap { shapeIndexes[$0] }, at: 7)
                 try insertTrip.run()
             }
         }
@@ -298,5 +340,25 @@ public enum GTFSImporter {
 
         try database.execute("COMMIT")
         progress(ImportProgress(file: nil, fraction: 1))
+    }
+}
+
+/// Shapes are stored as packed Float32 latitude/longitude pairs: about half a meter of precision at a third of the size.
+enum ShapeCoding {
+    static func data(for path: [Coordinate]) -> Data {
+        var values: [Float32] = []
+        values.reserveCapacity(path.count * 2)
+        for coordinate in path {
+            values.append(Float32(coordinate.latitude))
+            values.append(Float32(coordinate.longitude))
+        }
+        return values.withUnsafeBytes { Data($0) }
+    }
+
+    static func path(from data: Data) -> [Coordinate] {
+        let values = data.withUnsafeBytes { Array($0.bindMemory(to: Float32.self)) }
+        return stride(from: 0, to: values.count - 1, by: 2).map {
+            Coordinate(latitude: Double(values[$0]), longitude: Double(values[$0 + 1]))
+        }
     }
 }

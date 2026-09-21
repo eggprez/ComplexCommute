@@ -47,14 +47,17 @@ public struct FeedTimetableData: Sendable {
         public var serviceDate: Int
         public var route: Int
         public var headsign: String?
+        /// Index of the feed's shape this trip follows, fetched from the library when a ride is drawn.
+        public var shape: Int?
         /// Range of this trip's calls in `stopTimes`.
         public var stopTimes: Range<Int>
 
-        public init(id: String = "", serviceDate: Int = 0, route: Int, headsign: String? = nil, stopTimes: Range<Int>) {
+        public init(id: String = "", serviceDate: Int = 0, route: Int, headsign: String? = nil, shape: Int? = nil, stopTimes: Range<Int>) {
             self.id = id
             self.serviceDate = serviceDate
             self.route = route
             self.headsign = headsign
+            self.shape = shape
             self.stopTimes = stopTimes
         }
     }
@@ -193,13 +196,15 @@ extension FeedDatabase {
             var id: String
             var route: Int
             var headsign: String?
+            var shape: Int?
             var days: [ServiceDay]
         }
         var tripRows: [Int: TripRow] = [:]
-        let tripStatement = try database.prepare("SELECT trip_idx, route_idx, service_idx, headsign, trip_id FROM trips")
+        let tripStatement = try database.prepare("SELECT trip_idx, route_idx, service_idx, headsign, trip_id, \(hasShapes ? "shape_idx" : "NULL") FROM trips")
         while try tripStatement.step() {
             guard let days = daysByService[tripStatement.int(2)] else { continue }
-            tripRows[tripStatement.int(0)] = TripRow(id: tripStatement.string(4) ?? "", route: tripStatement.int(1), headsign: tripStatement.string(3), days: days)
+            tripRows[tripStatement.int(0)] = TripRow(id: tripStatement.string(4) ?? "", route: tripStatement.int(1), headsign: tripStatement.string(3),
+                                                       shape: tripStatement.optionalInt(5), days: days)
         }
 
         var trips: [FeedTimetableData.Trip] = []
@@ -220,7 +225,7 @@ extension FeedDatabase {
                     shifted.departure += day.offsetSeconds
                     stopTimes.append(shifted)
                 }
-                trips.append(.init(id: row.id, serviceDate: day.date, route: row.route, headsign: row.headsign, stopTimes: start..<stopTimes.count))
+                trips.append(.init(id: row.id, serviceDate: day.date, route: row.route, headsign: row.headsign, shape: row.shape, stopTimes: start..<stopTimes.count))
             }
         }
 

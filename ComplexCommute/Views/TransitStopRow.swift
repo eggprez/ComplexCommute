@@ -32,18 +32,41 @@ struct TransitStopRow: View {
     private static let maxBadges = 9
 }
 
+/// A line's bullet as riders know it from signs: a disc for a subway letter or number, a lozenge for anything longer.
 struct RouteBadgeView: View {
+    enum Size {
+        case small, regular, large
+
+        var height: CGFloat {
+            switch self {
+            case .small: 18
+            case .regular: 22
+            case .large: 30
+            }
+        }
+
+        var font: Font {
+            switch self {
+            case .small: .caption2.weight(.bold)
+            case .regular: .caption.weight(.bold)
+            case .large: .callout.weight(.bold)
+            }
+        }
+    }
+
     let route: RouteBadge
+    var size = Size.small
 
     var body: some View {
         let fill = Color(hex: route.colorHex) ?? Color(.systemGray3)
         Text(route.name)
-            .font(.caption2.weight(.bold))
+            .font(size.font)
             .lineLimit(1)
             .foregroundStyle(Color(hex: route.textColorHex) ?? (route.colorHex == nil ? Color.primary : Color.white))
-            .padding(.horizontal, 5)
-            .frame(minWidth: 18, minHeight: 18)
-            .background(fill, in: .capsule)
+            .padding(.horizontal, route.name.count <= 2 ? 0 : size.height * 0.3)
+            .frame(minWidth: size.height, minHeight: size.height)
+            .background(fill, in: .rect(cornerRadius: route.name.count <= 2 ? size.height / 2 : size.height * 0.28))
+            .accessibilityLabel("\(route.name) line")
     }
 }
 
@@ -61,13 +84,5 @@ extension TransitStop {
         let lines = routes.prefix(6).map(\.name).filter { $0 != agency }.joined(separator: " ")
         let subtitle = [agency, lines.isEmpty ? nil : lines].compactMap { $0 }.joined(separator: " · ")
         return Waypoint(name: name, subtitle: subtitle, coordinate: coordinate, kind: .stop(feedID: feedID, stopID: stopID))
-    }
-}
-
-extension Color {
-    /// "RRGGBB" as published in GTFS; nil for missing or malformed values.
-    init?(hex: String?) {
-        guard let hex, hex.count == 6, let value = UInt32(hex, radix: 16) else { return nil }
-        self.init(red: Double((value >> 16) & 0xFF) / 255, green: Double((value >> 8) & 0xFF) / 255, blue: Double(value & 0xFF) / 255)
     }
 }

@@ -27,6 +27,8 @@ public struct Journey: Sendable {
     public struct Walk: Sendable {
         public var seconds: Int = 0
         public var meters: Double = 0
+        /// Along the street to another station, rather than inside one.
+        public var isStreet = false
     }
 
     public internal(set) var rides: [Ride]
@@ -39,8 +41,15 @@ public struct Journey: Sendable {
 public struct RaptorRouter: Sendable {
     public let timetable: Timetable
     public var maxRides = 5
-    /// Minimum time between stepping off one vehicle and boarding the next at the same stop.
+    /// The rider's buffer at every change of vehicles: the least time between stepping off one and the next leaving,
+    /// and the slack added on top of a street walk to another station.
     public var changeSeconds = 60
+
+    /// Time a connection over `seconds` of footpath needs. An in-station time is already the agency's minimum for
+    /// the connection, so the buffer only raises it; a street walk is just the walking, so the buffer comes on top.
+    func connectionSeconds(walking seconds: Int, isStreet: Bool) -> Int {
+        isStreet ? seconds + changeSeconds : max(seconds, changeSeconds)
+    }
 
     public init(timetable: Timetable) {
         self.timetable = timetable
@@ -49,7 +58,7 @@ public struct RaptorRouter: Sendable {
     private enum Parent {
         case none
         case access(Int)
-        case walk(from: Int, seconds: Int, meters: Double)
+        case walk(from: Int, seconds: Int, meters: Double, isStreet: Bool)
         case ride(pattern: Int, trip: Int, boardPosition: Int, alightPosition: Int)
     }
 
@@ -60,6 +69,8 @@ public struct RaptorRouter: Sendable {
         var best = [Int](repeating: unreached, count: stopCount)
         var arrivals = [[Int](repeating: unreached, count: stopCount)]
         var parents = [[Parent](repeating: .none, count: stopCount)]
+        /// Time still owed at each stop before a vehicle may be boarded there. Nothing in round 0: the walk in already allows for it.
+        var slack = [[Int](repeating: 0, count: stopCount)]
         var marked: [Int] = []
         var isMarked = [Bool](repeating: false, count: stopCount)
         var targetBest = unreached
@@ -80,7 +91,8 @@ public struct RaptorRouter: Sendable {
                     if time < min(best[path.to], targetBest) {
                         arrivals[round][path.to] = time
                         best[path.to] = time
-                        parents[round][path.to] = .walk(from: stop, seconds: path.seconds, meters: path.meters)
+                        parents[round][path.to] = .walk(from: stop, seconds: path.seconds, meters: path.meters, isStreet: path.isStreet)
+                        slack[round][path.to] = round == 0 ? 0 : connectionSeconds(walking: path.seconds, isStreet: path.isStreet) - path.seconds
                         mark(path.to)
                     }
                 }
@@ -102,6 +114,7 @@ public struct RaptorRouter: Sendable {
         for round in 1...maxRides {
             arrivals.append(arrivals[round - 1])
             parents.append([Parent](repeating: .none, count: stopCount))
+            slack.append(slack[round - 1])
 
             // Patterns through any improved stop, scanned from the first such stop.
             var queue: [Int] = []
@@ -133,13 +146,14 @@ public struct RaptorRouter: Sendable {
                             arrivals[round][stop] = arrival
                             best[stop] = arrival
                             parents[round][stop] = .ride(pattern: patternIndex, trip: trip, boardPosition: boardPosition, alightPosition: position)
+                            slack[round][stop] = changeSeconds
                             mark(stop)
                         }
                     }
                     // Could an earlier trip be caught here than the one we're riding?
                     let ready = arrivals[round - 1][stop]
                     guard ready != unreached, pattern.canBoard[position] else { continue }
-                    let readyToBoard = ready + (round > 1 ? changeSeconds : 0)
+                    let readyToBoard = ready + slack[round - 1][stop]
                     if trip.map({ readyToBoard <= pattern.departure(trip: $0, position: position) }) ?? true,
                        let earlier = pattern.earliestTrip(at: position, notBefore: readyToBoard, limit: trip ?? pattern.tripCount) {
                         trip = earlier
@@ -190,13 +204,14 @@ public struct RaptorRouter: Sendable {
                 guard !rides.isEmpty else { return nil }
                 rides[0].walkBefore = pendingWalk
                 return Journey(rides: rides, walkAfter: walkAfter)
-            case .walk(let from, let seconds, let meters):
+            case .walk(let from, let seconds, let meters, let isStreet):
                 if rides.isEmpty {
                     walkAfter.seconds += seconds
                     walkAfter.meters += meters
                 } else {
                     pendingWalk.seconds += seconds
                     pendingWalk.meters += meters
+                    pendingWalk.isStreet = pendingWalk.isStreet || isStreet
                 }
                 stop = from
             case .ride(let pattern, let trip, let boardPosition, let alightPosition):
@@ -220,7 +235,7 @@ public struct RaptorRouter: Sendable {
         for index in stride(from: journey.rides.count - 2, through: 0, by: -1) {
             let next = journey.rides[index + 1]
             let nextBoard = timetable.patterns[next.pattern].departure(trip: next.trip, position: next.boardPosition)
-            let deadline = nextBoard - next.walkBefore.seconds - changeSeconds
+            let deadline = nextBoard - connectionSeconds(walking: next.walkBefore.seconds, isStreet: next.walkBefore.isStreet)
 
             let ride = journey.rides[index]
             let pattern = timetable.patterns[ride.pattern]

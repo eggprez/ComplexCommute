@@ -19,18 +19,33 @@ struct TripView: View {
     private struct PlanKey: Hashable {
         var template: TripTemplate
         var departure: DepartureChoice
+        /// Changing the buffer in Settings changes which connections can be made.
+        var bufferMinutes: Int
+    }
+
+    private enum Naming {
+        case savingCopy
+        case renaming
     }
 
     @Bindable var planner: TripPlannerModel
     @State var commute: Commute?
+    /// A commute keeps itself saved as it is edited; a one-off trip is only saved on request.
+    var autosaves = false
     /// Called after a nested sheet closes; presenting one forces the main sheet to full height.
     var restoreSheet: () -> Void = {}
     var onStart: () -> Void = {}
 
     @Environment(\.modelContext) private var modelContext
+    @AppStorage(StationBuffer.key) private var bufferMinutes = StationBuffer.defaultMinutes
     @State private var pickerTarget: PickerTarget?
-    @State private var isNamingCommute = false
+    @State private var naming = Naming.savingCopy
+    @State private var isNaming = false
     @State private var commuteName = ""
+    /// A commute just created, waiting to be asked whether it has a standing arrival time.
+    @State private var askingArriveBy: Commute?
+    /// Only the editor on screen may write to its commute; one being popped must not save its successor's trip.
+    @State private var isOnScreen = false
 
     var body: some View {
         List {
@@ -60,6 +75,22 @@ struct TripView: View {
 
             Section {
                 DeparturePicker(departure: $planner.departure)
+                if let commute, planner.departure.target != nil {
+                    Toggle("Every Time I Take This Commute", isOn: standingTarget(for: commute))
+                        .font(.subheadline)
+                }
+            }
+
+            if let target = planner.departure.target, let best = planner.selected {
+                Section {
+                    LeaveAtCard(itinerary: best, target: target)
+                } header: {
+                    Text("Leave At")
+                } footer: {
+                    Text(best.arrival <= target
+                         ? "The latest you can leave and still be there by \(target.formatted(date: .omitted, time: .shortened))."
+                         : "Nothing gets you there by \(target.formatted(date: .omitted, time: .shortened)); this is the soonest you can arrive.")
+                }
             }
 
             if planner.selected != nil {
@@ -67,12 +98,14 @@ struct TripView: View {
                     Button {
                         if planner.startActiveTrip() { onStart() }
                     } label: {
-                        Label("Start Trip", systemImage: "location.north.line.fill")
-                            .font(.headline)
+                        Text("Go")
+                            .font(.title3.weight(.bold))
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 6)
                     }
                     .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                    .accessibilityLabel("Start Trip")
                     .listRowInsets(EdgeInsets())
                     .listRowBackground(Color.clear)
                 }
@@ -89,20 +122,32 @@ struct TripView: View {
                     }
                 }
             } footer: {
-                if let updated = planner.lastUpdated, planner.departure == .now, !planner.itineraries.isEmpty {
-                    Text("Updated \(updated, format: .relative(presentation: .named)). Options refresh from your location every 30 seconds.")
+                if let updated = planner.lastUpdated, !planner.itineraries.isEmpty, !isFixedDeparture {
+                    Text("Updated \(updated, format: .relative(presentation: .named)). Options refresh from your location \(planner.departure == .now ? "every 30 seconds" : "every couple of minutes").")
                 }
             }
         }
-        .navigationTitle(commute?.name ?? "Trip")
+        .navigationTitle(commute?.name ?? (autosaves ? "New Commute" : "Trip"))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 saveMenu
             }
         }
-        .task(id: PlanKey(template: planner.template, departure: planner.departure)) {
+        .task(id: PlanKey(template: planner.template, departure: planner.departure, bufferMinutes: bufferMinutes)) {
             await planner.planContinuously()
+        }
+        .onAppear { isOnScreen = true }
+        .onDisappear { isOnScreen = false }
+        .onChange(of: planner.template) { previous, template in
+            autosave(template, replacing: previous)
+        }
+        .sheet(item: $askingArriveBy, onDismiss: restoreSheet) { commute in
+            ArriveByPrompt(commute: commute) { target in
+                planner.departure = target.map(DepartureChoice.arriveBy) ?? planner.departure
+                try? modelContext.save()
+                if target != nil { Task { await planner.notifier.requestAuthorizationIfNeeded() } }
+            }
         }
         .sheet(item: $pickerTarget, onDismiss: restoreSheet) { target in
             PlacePickerView(title: target.id < 0 ? "Add Stop" : "Change Stop", location: planner.location) { waypoint in
@@ -114,16 +159,39 @@ struct TripView: View {
                 }
             }
         }
-        .alert("Save Commute", isPresented: $isNamingCommute) {
+        .alert(naming == .renaming ? "Rename Commute" : "Save Commute", isPresented: $isNaming) {
             TextField("Name", text: $commuteName)
             Button("Cancel", role: .cancel) {}
             Button("Save") {
                 let name = commuteName.trimmingCharacters(in: .whitespaces)
-                let saved = Commute(name: name.isEmpty ? "My Commute" : name, template: planner.template)
-                modelContext.insert(saved)
-                commute = saved
+                if naming == .renaming, let commute {
+                    if !name.isEmpty { commute.name = name }
+                } else {
+                    let saved = Commute(name: name.isEmpty ? Commute.defaultName(for: planner.template) : name, template: planner.template)
+                    modelContext.insert(saved)
+                    commute = saved
+                }
+                try? modelContext.save()
             }
         }
+    }
+
+    /// Commutes save themselves: created once there is somewhere to go, then kept in step with every edit.
+    private func autosave(_ template: TripTemplate, replacing previous: TripTemplate) {
+        guard autosaves, isOnScreen, template.isPlannable else { return }
+        if let commute {
+            // A name the app made up follows the endpoints; one the rider chose stays.
+            if commute.name == Commute.defaultName(for: previous) {
+                commute.name = Commute.defaultName(for: template)
+            }
+            commute.template = template
+        } else {
+            let saved = Commute(name: Commute.defaultName(for: template), template: template)
+            modelContext.insert(saved)
+            commute = saved
+            askingArriveBy = saved
+        }
+        try? modelContext.save()
     }
 
     @ViewBuilder
@@ -132,14 +200,16 @@ struct TripView: View {
             Text("Add at least two stops to see options.")
                 .foregroundStyle(.secondary)
         } else if !planner.itineraries.isEmpty {
-            ForEach(planner.itineraries) { itinerary in
-                ItineraryCard(
-                    itinerary: itinerary,
-                    tags: planner.tags[itinerary.id] ?? [],
-                    isSelected: itinerary.id == planner.selected?.id,
-                    isLeavingNow: planner.departure == .now
-                ) {
-                    withAnimation { planner.selectedID = itinerary.id }
+            if planner.departure.target == nil {
+                ForEach(planner.itineraries) { itinerary in
+                    card(for: itinerary)
+                }
+            } else {
+                // The one to take is already answered above; the rest are there if it doesn't suit.
+                DisclosureGroup("Other Departures") {
+                    ForEach(planner.itineraries) { itinerary in
+                        card(for: itinerary)
+                    }
                 }
             }
         } else {
@@ -160,23 +230,67 @@ struct TripView: View {
         }
     }
 
+    /// A departure time the rider fixed themselves has nothing to watch for.
+    private var isFixedDeparture: Bool {
+        if case .at = planner.departure { return true }
+        return false
+    }
+
+    private func card(for itinerary: Itinerary) -> some View {
+        ItineraryCard(
+            itinerary: itinerary,
+            tags: planner.tags[itinerary.id] ?? [],
+            isSelected: itinerary.id == planner.selected?.id,
+            isLeavingNow: planner.departure == .now,
+            target: planner.departure.target
+        ) {
+            withAnimation { planner.select(itinerary) }
+        }
+    }
+
+    /// Keeps a commute's standing arrival time in step with the one being planned.
+    private func standingTarget(for commute: Commute) -> Binding<Bool> {
+        Binding(
+            get: { commute.arriveByMinutes != nil },
+            set: { isOn in
+                commute.arriveBy = isOn ? planner.departure.target.map { TimeOfDay($0) } : nil
+                commute.hasBeenAskedArriveBy = true
+                try? modelContext.save()
+                if isOn { Task { await planner.notifier.requestAuthorizationIfNeeded() } }
+            }
+        )
+    }
+
     @ViewBuilder
     private var saveMenu: some View {
         if let commute {
-            Menu("Save", systemImage: "bookmark.fill") {
-                Button("Update “\(commute.name)”", systemImage: "arrow.triangle.2.circlepath") {
-                    commute.template = planner.template
+            Menu("Commute", systemImage: "bookmark.fill") {
+                if autosaves {
+                    Section("Changes save automatically") {
+                        Button("Rename…", systemImage: "pencil") {
+                            commuteName = commute.name
+                            naming = .renaming
+                            isNaming = true
+                        }
+                    }
+                } else {
+                    Button("Update “\(commute.name)”", systemImage: "arrow.triangle.2.circlepath") {
+                        commute.template = planner.template
+                        try? modelContext.save()
+                    }
+                    .disabled(commute.template == planner.template)
                 }
-                .disabled(commute.template == planner.template)
                 Button("Save as New Commute…", systemImage: "plus") {
                     commuteName = ""
-                    isNamingCommute = true
+                    naming = .savingCopy
+                    isNaming = true
                 }
             }
-        } else {
+        } else if !autosaves {
             Button("Save Commute", systemImage: "bookmark") {
-                commuteName = ""
-                isNamingCommute = true
+                commuteName = Commute.defaultName(for: planner.template)
+                naming = .savingCopy
+                isNaming = true
             }
             .disabled(!planner.template.isPlannable)
         }
@@ -203,22 +317,30 @@ private struct WaypointRow: View {
     let modeToNext: Binding<TravelMode>?
     let onTap: () -> Void
 
+    @Environment(SheetRouter.self) private var router
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Button(action: onTap) {
-                Label {
-                    Text(waypoint.name)
-                        .foregroundStyle(Color.primary)
-                    if let subtitle = waypoint.subtitle {
-                        Text(subtitle)
-                            .foregroundStyle(Color.secondary)
+            HStack {
+                Button(action: onTap) {
+                    Label {
+                        Text(waypoint.name)
+                            .foregroundStyle(Color.primary)
+                        if let subtitle = waypoint.subtitle {
+                            Text(subtitle)
+                                .foregroundStyle(Color.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: waypoint.symbol)
                     }
-                } icon: {
-                    Image(systemName: waypoint.symbol)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(.rect)
                 }
-                .multilineTextAlignment(.leading)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(.rect)
+                if let station = waypoint.station {
+                    Button("Departures", systemImage: "clock") { router.station = station }
+                        .labelStyle(.iconOnly)
+                }
             }
 
             if let modeToNext {
@@ -236,22 +358,139 @@ private struct WaypointRow: View {
 }
 
 private struct DeparturePicker: View {
-    @Binding var departure: DepartureChoice
+    private enum Plan: String, CaseIterable, Identifiable {
+        case now
+        case leaveAt
+        case arriveBy
 
-    var body: some View {
-        Picker("Leave", selection: isScheduled) {
-            Text("Now").tag(false)
-            Text("At a Time").tag(true)
-        }
-        if case .at(let date) = departure {
-            DatePicker("Departure", selection: Binding(get: { date }, set: { departure = .at($0) }), in: Date.now...)
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .now: "Leave Now"
+            case .leaveAt: "Leave At"
+            case .arriveBy: "Arrive By"
+            }
         }
     }
 
-    private var isScheduled: Binding<Bool> {
+    @Binding var departure: DepartureChoice
+
+    var body: some View {
+        Picker("When", selection: plan) {
+            ForEach(Plan.allCases) { Text($0.label).tag($0) }
+        }
+        .pickerStyle(.segmented)
+
+        switch departure {
+        case .now:
+            EmptyView()
+        case .at(let date):
+            DatePicker("Departure", selection: bound(to: DepartureChoice.at, from: date), in: Date.now...)
+        case .arriveBy(let date):
+            DatePicker("Arrival", selection: bound(to: DepartureChoice.arriveBy, from: date), in: Date.now...)
+        }
+    }
+
+    private func bound(to make: @escaping (Date) -> DepartureChoice, from date: Date) -> Binding<Date> {
+        Binding(get: { date }, set: { departure = make($0) })
+    }
+
+    private var plan: Binding<Plan> {
         Binding(
-            get: { departure != .now },
-            set: { departure = $0 ? .at(Date.now.addingTimeInterval(900)) : .now }
+            get: {
+                switch departure {
+                case .now: .now
+                case .at: .leaveAt
+                case .arriveBy: .arriveBy
+                }
+            },
+            set: { choice in
+                switch choice {
+                case .now: departure = .now
+                case .leaveAt: departure = .at(Date.now.addingTimeInterval(900))
+                case .arriveBy: departure = .arriveBy(Date.now.addingTimeInterval(3_600))
+                }
+            }
         )
+    }
+}
+
+/// The one thing an arrive-by trip is asked for: when to walk out of the door.
+private struct LeaveAtCard: View {
+    let itinerary: Itinerary
+    let target: Date
+
+    var body: some View {
+        let progress = ArriveByProgress(target: target, projectedArrival: itinerary.arrival)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(itinerary.departure.formatted(date: .omitted, time: .shortened))
+                    .font(.system(.largeTitle, design: .rounded, weight: .bold))
+                    .monospacedDigit()
+                    .contentTransition(.numericText())
+                Text(lead)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 6) {
+                Image(systemName: progress.standing.symbol)
+                    .foregroundStyle(progress.standing.tint)
+                Text("Arrive \(itinerary.arrival.formatted(date: .omitted, time: .shortened)) · \(progress.deltaDescription)")
+                    .font(.subheadline)
+            }
+            SegmentStrip(legs: itinerary.legs)
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Leave at \(itinerary.departure.clockTime), \(lead). Arriving \(itinerary.arrival.clockTime), \(progress.deltaDescription).")
+    }
+
+    private var lead: String {
+        let wait = itinerary.departure.timeIntervalSinceNow
+        return wait < 60 ? "leave now" : "in \(wait.shortDuration)"
+    }
+}
+
+/// Asked once, when a commute is first saved: is this a trip with a time to be there by?
+private struct ArriveByPrompt: View {
+    let commute: Commute
+    let onSave: (Date?) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var time = Calendar.current.date(bySettingHour: 9, minute: 0, second: 0, of: .now) ?? .now
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    DatePicker("Arrive By", selection: $time, displayedComponents: .hourAndMinute)
+                } footer: {
+                    Text("“\(commute.name)” will be planned backwards from this time, and can remind you when to leave. You can change or remove it whenever you take the trip.")
+                }
+
+                Section {
+                    Button("Save With This Commute") {
+                        let saved = TimeOfDay(time)
+                        commute.arriveBy = saved
+                        commute.hasBeenAskedArriveBy = true
+                        onSave(saved.next())
+                        dismiss()
+                    }
+                    .fontWeight(.semibold)
+                }
+            }
+            .navigationTitle("Be There By?")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Not Now") {
+                        commute.hasBeenAskedArriveBy = true
+                        onSave(nil)
+                        dismiss()
+                    }
+                }
+            }
+            .presentationDetents([.medium])
+        }
     }
 }
