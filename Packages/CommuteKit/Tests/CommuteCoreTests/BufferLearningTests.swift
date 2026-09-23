@@ -114,10 +114,21 @@ private func record(buffer: Double, slip: Double, station: String = "Metropark",
 
     @Test func positionPutsTheTargetInTheMiddleAndClampsAtTheEnds() {
         #expect(ArriveByProgress(target: t0, projectedArrival: t0).position == 0.5)
-        #expect(ArriveByProgress(target: t0, projectedArrival: t0 + 900).position == 1)
-        #expect(ArriveByProgress(target: t0, projectedArrival: t0 - 900).position == 0)
+        #expect(ArriveByProgress(target: t0, projectedArrival: t0 + 1_800).position == 1)
+        #expect(ArriveByProgress(target: t0, projectedArrival: t0 - 1_800).position == 0)
         #expect(ArriveByProgress(target: t0, projectedArrival: t0 - 3_600).position == 0)
-        #expect(ArriveByProgress(target: t0, projectedArrival: t0 + 450).position == 0.75)
+        #expect(ArriveByProgress(target: t0, projectedArrival: t0 + 900).position == 0.75)
+    }
+
+    @Test func theBandsTileTheBarAndEachHoldsItsOwnArrivals() {
+        let spans = ArrivalStanding.allCases.map(ArriveByProgress.span(of:))
+        #expect(spans.first?.lowerBound == 0)
+        #expect(spans.last?.upperBound == 1)
+        #expect(zip(spans, spans.dropFirst()).allSatisfy { $0.upperBound == $1.lowerBound })
+        for delta in [-1_200.0, -60, 0, 299, 420, 1_500] {
+            let progress = ArriveByProgress(target: t0, projectedArrival: t0 + delta)
+            #expect(ArriveByProgress.span(of: progress.standing).contains(progress.position))
+        }
     }
 
     @Test func aTimeOfDayComesRoundAgainTomorrow() {

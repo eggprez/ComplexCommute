@@ -40,7 +40,7 @@ struct PlacePickerView: View {
                         Section(stops.isEmpty ? "" : "Places") {
                             ForEach(results, id: \.self) { item in
                                 Button {
-                                    Task { await pick(item) }
+                                    pick(item)
                                 } label: {
                                     PlaceResultRow(item: item, distanceMeters: location.coordinate?.distance(to: Coordinate(item.location.coordinate)))
                                 }
@@ -151,19 +151,10 @@ struct PlacePickerView: View {
         dismiss()
     }
 
-    /// Apple's transit stations become the matching station of an installed schedule, so rides start from its platforms.
-    private func pick(_ item: MKMapItem) async {
-        let coordinate = Coordinate(item.location.coordinate)
-        if item.isTransit {
-            let words = Set((item.name ?? "").lowercased().split(separator: " ").filter { $0.count > 3 })
-            let nearby = await transitData.library.stops(near: coordinate, radiusMeters: 150, limit: 8)
-            let sameName = nearby.first { !words.isDisjoint(with: $0.name.lowercased().split(separator: " ")) }
-            if let stop = sameName ?? nearby.first {
-                pick(stop.waypoint)
-                return
-            }
-        }
-        pick(Waypoint(name: item.name ?? "Pin", subtitle: item.shortAddress, coordinate: coordinate))
+    /// Apple's places stay places, even transit ones: the planner then weighs every stop within a walk, rather than
+    /// the one stop a name match happened to land on (LaGuardia's Q90 curb instead of the Q70's).
+    private func pick(_ item: MKMapItem) {
+        pick(Waypoint(name: item.name ?? "Pin", subtitle: item.shortAddress, coordinate: Coordinate(item.location.coordinate)))
     }
 
     /// Installed schedules answer instantly; Apple's suggestions stream in behind them.
@@ -178,7 +169,7 @@ struct PlacePickerView: View {
     private func choose(_ completion: MKLocalSearchCompletion) async {
         let found = await search(MKLocalSearch.Request(completion: completion), text: nil)
         if !completion.isQuery, let item = found.first {
-            await pick(item)
+            pick(item)
         }
     }
 

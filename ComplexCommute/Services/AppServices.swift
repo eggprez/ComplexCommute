@@ -16,15 +16,15 @@ final class AppServices {
     let notifier: TripNotifier
     let container: ModelContainer
     let liveActivity = TripActivityController()
-    let watch = WatchBridge()
+    let motion = MotionService()
+    let stations = StationWatcher()
 
     private let tripStore = ActiveTripStore()
     /// What was last written to disk, so the file is only rewritten when the trip really changed.
-    private var stored: WatchTripState?
-    private var isInFront = false
-    /// The app has been in front at some point in this trip. Until it has, iOS allows neither the
-    /// Live Activity nor location in the background, and the trip can't be kept up to date.
-    private var tripHasBeenInFront = false
+    private var stored: StoredTrip?
+    /// What leaves the change the rider is coming up on, as last looked up, and for which change.
+    private var connections: (station: String, toward: String, board: ConnectionBoard, fetchedAt: Date)?
+    private var connectionLookup: Task<Void, Never>?
 
     /// Also listed in `BGTaskSchedulerPermittedIdentifiers`; iOS refuses the task otherwise.
     static let refreshIdentifier = "scottai.commuter-app.refresh"
@@ -32,6 +32,8 @@ final class AppServices {
     static let watchWindow: TimeInterval = 2 * 3_600
     /// The soonest a background wake is asked for. iOS decides what it actually grants.
     static let refreshInterval: TimeInterval = 10 * 60
+    /// How often the departures from an upcoming change are looked up again. Realtime refreshes about as often.
+    static let connectionsMaxAge: TimeInterval = 30
 
     init() {
         let location = LocationService()
@@ -44,7 +46,7 @@ final class AppServices {
         self.transitData = transitData
         self.transit = transit
         self.notifier = notifier
-        self.planner = TripPlannerModel(location: location, resolver: resolver, notifier: notifier)
+        self.planner = TripPlannerModel(location: location, resolver: resolver, notifier: notifier, trains: transit)
         do {
             container = try ModelContainer(for: Commute.self, SavedPlace.self, ConnectionLog.self)
         } catch {
@@ -52,10 +54,13 @@ final class AppServices {
         }
 
         location.onUpdate = { [planner] in planner.locationDidChange() }
+        motion.onUpdate = { [planner] in planner.motionDidChange($0) }
+        stations.onCrossing = { [planner] id, entered, date in planner.crossed(id, entered: entered, at: date) }
+        TripActionRouter.handler = { [planner] in planner.perform($0) }
+        // Before the trip is picked back up: a geofence crossing may be why the app was launched at all.
+        stations.start()
         planner.recordConnections = { [weak self] in self?.keep($0) }
         planner.onTripChange = { [weak self] in self?.tripDidChange() }
-        watch.handler = { [weak self] in await self?.perform($0) ?? WatchReply(context: WatchContext()) }
-        watch.activate()
 
         if let trip = tripStore.load() {
             planner.resume(trip)
@@ -68,16 +73,19 @@ final class AppServices {
     // MARK: Trip in progress
 
     /// The trip moved on, was re-planned, or ended: tell everything outside the app that shows it.
+    /// The Watch's Smart Stack is the Live Activity too, mirrored there by iOS.
     private func tripDidChange(force: Bool = false) {
         let now = Date.now
         let trip = planner.active
-        if trip == nil { tripHasBeenInFront = false } else if isInFront { tripHasBeenInFront = true }
 
-        var state = trip?.watchState(at: now)
-        state?.needsPhone = !tripHasBeenInFront
-        liveActivity.show(state?.glance, force: force)
-        watch.send(WatchContext(trip: state, commutes: watchCommutes(), sentAt: now))
-        location.keepRunningInBackground(trip.map { !$0.isFinished } ?? false, renew: force)
+        var glance = trip?.glance(at: now)
+        let state = trip.map { StoredTrip(glance: glance ?? $0.glance(at: now), legs: $0.legs) }
+        glance?.connections = connections(for: trip, at: now)
+        liveActivity.show(glance, force: force)
+        let isUnderway = trip.map { !$0.isFinished } ?? false
+        location.keepRunningInBackground(isUnderway, renew: force)
+        if isUnderway { motion.start() } else { motion.stop() }
+        stations.watch(isUnderway ? trip?.placesToWatch ?? [] : [])
 
         guard state != stored else { return }
         stored = state
@@ -88,10 +96,37 @@ final class AppServices {
         }
     }
 
+    /// The next few vehicles from the change coming up that go where the rider is going. Looked up in the
+    /// background: this answers with what was last found, and the trip is told again once more is known.
+    private func connections(for trip: ActiveTrip?, at now: Date) -> ConnectionBoard? {
+        guard let change = trip?.upcomingChange(at: now) else {
+            connections = nil
+            return nil
+        }
+        let (station, toward) = (change.station.id, change.toward.id)
+        let isCurrent = connections.map { $0.station == station && $0.toward == toward } ?? false
+        let isFresh = isCurrent && now.timeIntervalSince(connections?.fetchedAt ?? .distantPast) < Self.connectionsMaxAge
+        if !isFresh, connectionLookup == nil {
+            connectionLookup = Task { [transit] in
+                let found = await transit.departures(from: change.station, toward: change.toward, after: change.catchableFrom,
+                                                     within: 90 * 60, limit: 6)
+                let board = change.board(found.map { departure in
+                    ConnectionBoard.Departure(route: RouteLabel(name: departure.route.name, colorHex: departure.route.colorHex,
+                                                                textColorHex: departure.route.textColorHex),
+                                              time: departure.time, isRealtime: departure.isRealtime)
+                })
+                connections = (station, toward, board, .now)
+                connectionLookup = nil
+                tripDidChange()
+            }
+        }
+        guard isCurrent else { return nil }
+        return connections?.board.catchable(from: change.catchableFrom)
+    }
+
     /// The app came to the front or left it. Coming forward is the one moment iOS lets a Live Activity
     /// and background location begin, so a trip that started without them gets them now.
     func sceneDidChange(isActive: Bool) {
-        isInFront = isActive
         tripDidChange(force: isActive && planner.active != nil)
     }
 
@@ -108,66 +143,6 @@ final class AppServices {
             }
         }
         try? context.save()
-    }
-
-    // MARK: Watch
-
-    private func watchCommutes() -> [WatchCommute] {
-        let commutes = (try? container.mainContext.fetch(FetchDescriptor<Commute>(sortBy: [SortDescriptor(\.createdAt)]))) ?? []
-        return commutes.filter(\.template.isPlannable).map { commute in
-            WatchCommute(id: commute.watchID, name: commute.name, arriveBy: commute.nextArriveBy,
-                         summary: commute.template.waypoints.map(\.name).joined(separator: " → "))
-        }
-    }
-
-    /// Carries out what the rider asked for from the wrist.
-    private func perform(_ command: WatchCommand) async -> WatchReply {
-        var error: String?
-        switch command {
-        case .refresh:
-            break
-        case .start(let commuteID):
-            error = await startCommute(withWatchID: commuteID)
-        case .markArrived:
-            planner.markArrived()
-            await planner.refreshActiveTrip()
-        case .markMissed:
-            planner.markMissed()
-            await planner.refreshActiveTrip()
-        case .followFaster:
-            if case .fasterOption(let itinerary) = planner.active?.notice { planner.follow(itinerary) }
-        case .dismissNotice:
-            planner.dismissNotice()
-        case .endTrip:
-            planner.endActiveTrip()
-        }
-        var state = planner.active?.watchState(at: .now)
-        state?.needsPhone = !tripHasBeenInFront
-        return WatchReply(context: WatchContext(trip: state, commutes: watchCommutes()), error: error)
-    }
-
-    /// Plans a saved commute and sets off on the best option, as tapping Start on the phone would.
-    /// - Returns: what went wrong, if anything did.
-    private func startCommute(withWatchID id: String) async -> String? {
-        let commutes = (try? container.mainContext.fetch(FetchDescriptor<Commute>())) ?? []
-        guard let commute = commutes.first(where: { $0.watchID == id }) else { return "That commute is no longer on your iPhone." }
-
-        location.start()
-        planner.start(commute.template, arrivingBy: commute.nextArriveBy)
-        await planner.plan()
-        // A phone woken for this may not know where it is yet.
-        for _ in 0..<10 where planner.status == .waitingForLocation {
-            try? await Task.sleep(for: .milliseconds(500))
-            await planner.plan()
-        }
-        guard planner.startActiveTrip() else {
-            if case .failed(let message) = planner.status { return message }
-            return planner.status == .waitingForLocation ? "Open Commute on your iPhone so it can find where you are." : "No route found."
-        }
-        if !tripHasBeenInFront {
-            notifier.announceNeedsPhone(for: commute.name)
-        }
-        return nil
     }
 
     // MARK: Background refresh
@@ -212,4 +187,10 @@ final class AppServices {
         }
         .min { $0.1 < $1.1 }
     }
+}
+
+/// What decides whether the trip on disk is out of date: what it shows, and the plan behind it.
+private struct StoredTrip: Equatable {
+    var glance: TripGlance
+    var legs: [Leg]
 }

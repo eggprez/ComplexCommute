@@ -34,9 +34,21 @@ public struct ArriveByProgress: Hashable, Sendable {
     }
 
     /// Where the arrival sits on an early-to-late scale, 0…1, with the target at the middle.
-    public var position: Double {
-        let span = ArriveByProgress.scale
-        return min(max((delta + span) / (2 * span), 0), 1)
+    public var position: Double { Self.position(ofDelta: delta) }
+
+    /// Where being this much late (or, negative, early) falls on the bar.
+    public static func position(ofDelta delta: TimeInterval) -> Double {
+        min(max((delta + scale) / (2 * scale), 0), 1)
+    }
+
+    /// The stretch of the bar each standing covers, so the bar can be painted with what lies either side.
+    public static func span(of standing: ArrivalStanding) -> ClosedRange<Double> {
+        switch standing {
+        case .ahead: 0...position(ofDelta: -onTimeWindow)
+        case .onTime: position(ofDelta: -onTimeWindow)...position(ofDelta: onTimeWindow)
+        case .slipping: position(ofDelta: onTimeWindow)...position(ofDelta: lateWindow)
+        case .late: position(ofDelta: lateWindow)...1
+        }
     }
 
     public init(target: Date, projectedArrival: Date, isFinal: Bool = false) {
@@ -49,8 +61,8 @@ public struct ArriveByProgress: Hashable, Sendable {
     public static let onTimeWindow: TimeInterval = 5 * 60
     /// Past this, being late has stopped being a detail.
     public static let lateWindow: TimeInterval = 10 * 60
-    /// The bar runs from a quarter of an hour early to a quarter of an hour late.
-    public static let scale: TimeInterval = 15 * 60
+    /// The bar runs from half an hour early to half an hour late.
+    public static let scale: TimeInterval = 30 * 60
 }
 
 /// A time of day, as a commute remembers it: 9:00 means 9:00 whichever morning it is.

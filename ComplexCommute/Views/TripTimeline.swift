@@ -51,8 +51,10 @@ struct TimelineRow<Content: View>: View {
     var node = SpineNode.none
     @ViewBuilder var content: Content
 
-    /// Center of the first line of text, where a row's node sits.
-    private static var nodeY: CGFloat { 17 }
+    /// Center of the first line of text, where a row's node sits. Grows with the text beside it.
+    @ScaledMetric(relativeTo: .subheadline) private var nodeY: CGFloat = 17
+    /// Wide enough for "12:59" in the row's own type size.
+    @ScaledMetric(relativeTo: .subheadline) private var timeWidth: CGFloat = 46
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -68,13 +70,13 @@ struct TimelineRow<Content: View>: View {
                     Color.clear
                 }
             }
-            .frame(width: 46, height: Self.nodeY * 2, alignment: .trailing)
+            .frame(width: timeWidth, height: nodeY * 2, alignment: .trailing)
 
             spine
                 .frame(width: 22)
 
             content
-                .frame(maxWidth: .infinity, minHeight: Self.nodeY * 2, alignment: .leading)
+                .frame(maxWidth: .infinity, minHeight: nodeY * 2, alignment: .leading)
         }
         .fixedSize(horizontal: false, vertical: true)
     }
@@ -83,11 +85,11 @@ struct TimelineRow<Content: View>: View {
         ZStack(alignment: .top) {
             VStack(spacing: 0) {
                 SpineLine(spine: above)
-                    .frame(height: Self.nodeY)
+                    .frame(height: nodeY)
                 SpineLine(spine: below)
             }
             nodeView
-                .frame(width: 22, height: Self.nodeY * 2)
+                .frame(width: 22, height: nodeY * 2)
         }
         .accessibilityHidden(true)
     }
@@ -151,9 +153,6 @@ private nonisolated struct VerticalLine: Shape {
 /// blue where they drive and the route's own color where they ride.
 struct TripTimeline: View {
     let legs: [Leg]
-    /// While navigating: the leg under way and the step being travelled, so earlier maneuvers drop off the list.
-    var guidedLegID: Leg.ID?
-    var currentStep: Int?
 
     @Environment(SheetRouter.self) private var router
     @State private var expanded: Set<String> = []
@@ -225,44 +224,32 @@ struct TripTimeline: View {
         }
     }
 
-    /// A drive, a walk, or a transit leg with no schedule behind it: one stretch of line, with its turns on request.
+    /// A drive, a walk, or a transit leg with no schedule behind it: one stretch of line, and a way to be
+    /// shown down it by a maps app.
     @ViewBuilder
     private func travelRows(for leg: Leg) -> some View {
         let spine = Spine.travel(leg)
-        let key = "steps.\(leg.id)"
-        let turns = leg.option.steps.filter { !$0.instruction.isEmpty }.count
         TimelineRow(above: spine, below: spine) {
-            Button {
-                withAnimation(.snappy) { toggle(key) }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: leg.mode.symbol)
-                        .foregroundStyle(leg.mode.tint)
-                        .frame(width: 20)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(travelSummary(for: leg))
-                            .font(.footnote.weight(.medium))
-                            .foregroundStyle(Color.primary)
-                        if let summary = leg.option.summary {
-                            Text("via \(summary)")
-                                .font(.caption)
-                                .foregroundStyle(Color.secondary)
-                        }
-                    }
-                    Spacer(minLength: 0)
-                    if turns > 0 {
-                        chevron(isOpen: expanded.contains(key))
+            HStack(spacing: 6) {
+                Image(systemName: leg.mode.symbol)
+                    .foregroundStyle(leg.mode.tint)
+                    .frame(width: 20)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(travelSummary(for: leg))
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(Color.primary)
+                    if let summary = leg.option.summary {
+                        Text("via \(summary)")
+                            .font(.caption)
+                            .foregroundStyle(Color.secondary)
                     }
                 }
-                .contentShape(.rect)
-            }
-            .disabled(turns == 0)
-            .accessibilityHint(turns > 0 ? "Shows directions" : "")
-        }
-        if expanded.contains(key) || (leg.id == guidedLegID && currentStep != nil) {
-            TimelineRow(above: spine, below: spine) {
-                StepList(steps: leg.option.steps, currentIndex: leg.id == guidedLegID ? currentStep : nil)
-                    .padding(.vertical, 4)
+                Spacer(minLength: 0)
+                if leg.mode != .transit {
+                    DirectionsButton(destination: leg.to, mode: leg.mode)
+                        .labelStyle(.iconOnly)
+                        .accessibilityLabel("Directions to \(leg.to.name)")
+                }
             }
         }
         if leg.option.isEstimate {
@@ -298,7 +285,8 @@ struct TripTimeline: View {
             let previous = index > 0 ? rides[index - 1] : nil
             let isMerged = index == 0 && boardsAtOrigin(ride, of: leg)
             let freeAt = previous?.alight ?? readyAt
-            connectionRow(walk: ride.walkBefore, wait: ride.board.timeIntervalSince(freeAt) - ride.walkBefore, isTransfer: previous != nil)
+            connectionRow(walk: ride.walkBefore, wait: ride.board.timeIntervalSince(freeAt) - ride.walkBefore, isTransfer: previous != nil,
+                          freeTransfer: ride.freeTransfer)
             boardRow(ride, showsName: !isMerged && previous?.alightStopName != ride.boardStopName)
             stopsRows(for: ride, key: "stops.\(leg.id).\(index)")
 
@@ -323,15 +311,23 @@ struct TripTimeline: View {
 
     /// Getting to a platform: the walk there, and the time in hand before the vehicle leaves.
     @ViewBuilder
-    private func connectionRow(walk: TimeInterval, wait: TimeInterval, isTransfer: Bool) -> some View {
-        if walk >= 60 || wait >= 60 {
+    private func connectionRow(walk: TimeInterval, wait: TimeInterval, isTransfer: Bool, freeTransfer: String? = nil) -> some View {
+        if walk >= 60 || wait >= 60 || freeTransfer != nil {
             TimelineRow(above: .walk, below: .walk) {
-                HStack(spacing: 10) {
-                    if walk >= 60 {
-                        caption("\(isTransfer ? "Transfer" : "Walk") \(walk.shortDuration)", systemImage: "figure.walk")
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 10) {
+                        if walk >= 60 {
+                            caption("\(isTransfer ? "Transfer" : "Walk") \(walk.shortDuration)", systemImage: "figure.walk")
+                        }
+                        if wait >= 60 {
+                            caption("Wait \(wait.shortDuration)", systemImage: "clock")
+                        }
                     }
-                    if wait >= 60 {
-                        caption("Wait \(wait.shortDuration)", systemImage: "clock")
+                    // Leaving one station for another usually means paying again; say so when it doesn't.
+                    if let freeTransfer {
+                        Label(freeTransfer, systemImage: "ticket")
+                            .font(.footnote)
+                            .foregroundStyle(Color.goodText)
                     }
                 }
             }
@@ -354,9 +350,8 @@ struct TripTimeline: View {
                                 .lineLimit(1)
                         }
                         if ride.isRealtime {
-                            Label(ride.liveStatus, systemImage: "dot.radiowaves.left.and.right")
+                            LiveStatus(ride: ride)
                                 .font(.caption)
-                                .foregroundStyle(ride.isLate ? Color.orange : Color.green)
                         }
                     }
                 }
@@ -417,11 +412,14 @@ struct TripTimeline: View {
         .accessibilityHint("Shows departures")
     }
 
+    /// Icon and words kept together: a Label inside a List row is spread out to line up with the row's icon column.
     private func caption(_ text: String, systemImage: String) -> some View {
-        Label(text, systemImage: systemImage)
-            .font(.footnote)
-            .foregroundStyle(Color.secondary)
-            .labelStyle(.titleAndIcon)
+        HStack(spacing: 4) {
+            Image(systemName: systemImage)
+            Text(text)
+        }
+        .font(.footnote)
+        .foregroundStyle(Color.secondary)
     }
 
     private var disclosure: some View {
@@ -441,5 +439,21 @@ struct TripTimeline: View {
         if !expanded.insert(key).inserted {
             expanded.remove(key)
         }
+    }
+}
+
+/// "((•)) 2 min late": whether a ride's prediction is live, and how it compares with the timetable.
+struct LiveStatus: View {
+    let ride: Ride
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "dot.radiowaves.left.and.right")
+                .imageScale(.small)
+            Text(ride.liveStatus)
+        }
+        .foregroundStyle(ride.isLate ? Color.warningText : Color.goodText)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Live, \(ride.liveStatus)")
     }
 }

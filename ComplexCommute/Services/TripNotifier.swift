@@ -18,7 +18,7 @@ final class TripNotifier {
     private enum ID {
         static let leaveNow = "leave-now"
         static let fasterOption = "faster-option"
-        static let needsPhone = "needs-phone"
+        static let whichTrain = "which-train"
     }
 
     var isAuthorized: Bool { authorization == .authorized || authorization == .provisional }
@@ -51,16 +51,15 @@ final class TripNotifier {
         center.add(UNNotificationRequest(identifier: ID.fasterOption, content: content, trigger: nil))
     }
 
-    /// A trip started from the Watch with the app closed: iOS only lets the Lock Screen view and
-    /// tracking in the background begin from the app itself, so the rider is asked to open it once.
-    func announceNeedsPhone(for name: String) {
+    /// The location fits a train, but not clearly enough to act on: ask, since the phone is likely in a pocket.
+    func askAboutTrain(_ ride: Ride) {
         guard isAuthorized else { return }
         let content = UNMutableNotificationContent()
-        content.title = "\(name) Started"
-        content.body = "Open Commute once to keep this trip live on your Lock Screen and Apple Watch."
-        content.sound = .default
+        content.title = "On the \(ride.routeName)?"
+        content.body = "Looks like you're on the \(ride.board.formatted(date: .omitted, time: .shortened)) \(ride.routeName)"
+            + "\(ride.headsign.map { " toward \($0)" } ?? ""). Open Commute to confirm so arrival times follow your train."
         content.interruptionLevel = .timeSensitive
-        center.add(UNNotificationRequest(identifier: ID.needsPhone, content: content, trigger: nil))
+        center.add(UNNotificationRequest(identifier: ID.whichTrain, content: content, trigger: nil))
     }
 
     /// Forgets what has been announced, so the next trip starts fresh.

@@ -4,7 +4,9 @@ import Foundation
 public protocol LegResolving: Sendable {
     /// - Parameter isWaitingAtOrigin: the traveller is already standing at `from`, so no time needs allowing for
     ///   getting into the station; whatever leaves next can be caught.
-    func options(from: Waypoint, to: Waypoint, mode: TravelMode, departingAt: Date, isWaitingAtOrigin: Bool) async throws -> [LegOption]
+    /// - Parameter excludedFeedIDs: transit services the rider won't ride; plan as if they didn't run.
+    func options(from: Waypoint, to: Waypoint, mode: TravelMode, departingAt: Date, isWaitingAtOrigin: Bool,
+                 excludedFeedIDs: Set<String>) async throws -> [LegOption]
 }
 
 public enum PlanningError: Error, Equatable {
@@ -44,7 +46,8 @@ public struct ChainPlanner: Sendable {
                 try Task.checkCancellation()
                 let readyAt = partial.legs.isEmpty ? departure : partial.arrival
                 let options = try await resolver.options(from: segment.from, to: segment.to, mode: segment.mode, departingAt: readyAt,
-                                                         isWaitingAtOrigin: isWaitingAtOrigin && segment.index == 0)
+                                                         isWaitingAtOrigin: isWaitingAtOrigin && segment.index == 0,
+                                                         excludedFeedIDs: template.excludedFeedIDs)
                 for option in options where option.departure >= readyAt.addingTimeInterval(-1) {
                     let leg = Leg(segmentIndex: segment.index, from: segment.from, to: segment.to, option: option)
                     extended.append(Itinerary(legs: partial.legs + [leg]))

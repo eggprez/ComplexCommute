@@ -1,4 +1,5 @@
 import CommuteCore
+import GTFSKit
 import SwiftData
 import SwiftUI
 
@@ -75,6 +76,9 @@ struct TripView: View {
 
             Section {
                 DeparturePicker(departure: $planner.departure)
+                if planner.template.modes.contains(.transit) {
+                    ServicesPicker(template: $planner.template, location: planner.location.coordinate)
+                }
                 if let commute, planner.departure.target != nil {
                     Toggle("Every Time I Take This Commute", isOn: standingTarget(for: commute))
                         .font(.subheadline)
@@ -116,7 +120,8 @@ struct TripView: View {
             } header: {
                 HStack {
                     Text("Options")
-                    if planner.isPlanning {
+                    // "Finding routes…" already says so when there is nothing to show yet.
+                    if planner.isPlanning, !planner.itineraries.isEmpty {
                         ProgressView()
                             .controlSize(.mini)
                     }
@@ -127,6 +132,8 @@ struct TripView: View {
                 }
             }
         }
+        // Colored rows (the Go button, a selected option) otherwise show through the title bar as they scroll under it.
+        .scrollEdgeEffectStyle(.hard, for: .top)
         .navigationTitle(commute?.name ?? (autosaves ? "New Commute" : "Trip"))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -141,6 +148,9 @@ struct TripView: View {
         .onDisappear { isOnScreen = false }
         .onChange(of: planner.template) { previous, template in
             autosave(template, replacing: previous)
+            if previous.excludedFeedIDs != template.excludedFeedIDs {
+                ServiceChoice.remember(template.excludedFeedIDs)
+            }
         }
         .sheet(item: $askingArriveBy, onDismiss: restoreSheet) { commute in
             ArriveByPrompt(commute: commute) { target in
@@ -308,6 +318,95 @@ struct TripView: View {
         Binding(
             get: { index < planner.template.modes.count ? planner.template.modes[index] : .walk },
             set: { planner.template.setMode($0, forSegment: index) }
+        )
+    }
+}
+
+/// The transit services this rider last left out, carried into the next trip they start.
+enum ServiceChoice {
+    private static let key = "lastExcludedFeedIDs"
+
+    static var lastExcluded: Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+    }
+
+    static func remember(_ excluded: Set<String>) {
+        UserDefaults.standard.set(excluded.sorted(), forKey: key)
+    }
+}
+
+/// One compact row for turning individual transit services off for this trip, e.g. no buses.
+/// The menu stays open while toggling, so several can be switched in one go.
+private struct ServicesPicker: View {
+    @Binding var template: TripTemplate
+    let location: Coordinate?
+
+    @Environment(TransitDataStore.self) private var store
+
+    var body: some View {
+        if !services.isEmpty {
+            Menu {
+                ForEach(regions) { region in
+                    Section(regions.count > 1 ? region.name : "Take") {
+                        ForEach(services.filter { $0.region == region }) { feed in
+                            Toggle(feed.name, isOn: binding(for: feed))
+                        }
+                    }
+                }
+                if !excluded.isEmpty {
+                    Button("Use All Services", systemImage: "arrow.counterclockwise") {
+                        template.excludedFeedIDs.subtract(services.map(\.id))
+                    }
+                }
+            } label: {
+                LabeledContent {
+                    Text(summary)
+                        .foregroundStyle(excluded.isEmpty ? Color.secondary : Color.accentColor)
+                } label: {
+                    Label("Services", systemImage: "tram")
+                }
+                .contentShape(.rect)
+            }
+            .menuActionDismissBehavior(.disabled)
+            .tint(.primary)
+        }
+    }
+
+    /// Installed cities the trip passes through.
+    private var regions: [TransitRegion] {
+        let coordinates = template.waypoints.compactMap { waypoint in
+            waypoint.kind == .currentLocation ? location : waypoint.coordinate
+        }
+        return TransitRegion.near(coordinates).filter { store.state(of: $0) != .notInstalled }
+    }
+
+    private var services: [FeedDescriptor] {
+        regions.flatMap(FeedCatalog.feeds(in:)).filter { store.installed[$0.id] != nil }
+    }
+
+    private var excluded: [FeedDescriptor] {
+        services.filter { template.excludedFeedIDs.contains($0.id) }
+    }
+
+    private var summary: String {
+        switch excluded.count {
+        case 0: "All"
+        case services.count: "None"
+        case 1...2: "No " + excluded.map(\.name).formatted(.list(type: .and))
+        default: "\(services.count - excluded.count) of \(services.count)"
+        }
+    }
+
+    private func binding(for feed: FeedDescriptor) -> Binding<Bool> {
+        Binding(
+            get: { !template.excludedFeedIDs.contains(feed.id) },
+            set: { isOn in
+                if isOn {
+                    template.excludedFeedIDs.remove(feed.id)
+                } else {
+                    template.excludedFeedIDs.insert(feed.id)
+                }
+            }
         )
     }
 }

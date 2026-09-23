@@ -43,8 +43,9 @@ struct ItineraryCard: View {
             }
 
             HStack(spacing: 6) {
-                Text("\(itinerary.departure, format: .dateTime.hour().minute()) – \(itinerary.arrival, format: .dateTime.hour().minute())")
+                Text(timeRange)
                     .foregroundStyle(Color.secondary)
+                    .monospacedDigit()
                 if let target {
                     let progress = ArriveByProgress(target: target, projectedArrival: itinerary.arrival)
                     Text(progress.deltaDescription)
@@ -54,7 +55,7 @@ struct ItineraryCard: View {
                 if itinerary.hasRealtime {
                     Label("Live", systemImage: "dot.radiowaves.left.and.right")
                         .labelStyle(.iconOnly)
-                        .foregroundStyle(Color.green)
+                        .foregroundStyle(Color.goodText)
                 }
                 if !itinerary.alerts.isEmpty {
                     Label("Service alerts", systemImage: "exclamationmark.triangle.fill")
@@ -71,14 +72,23 @@ struct ItineraryCard: View {
                     ForEach(ItineraryTag.allCases.filter(tags.contains), id: \.self) { tag in
                         Text(tag.label)
                             .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.green)
+                            .foregroundStyle(Color.goodText)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 3)
-                            .background(Color.green.opacity(0.15), in: .capsule)
+                            .background(Color.green.opacity(0.18), in: .capsule)
                     }
                 }
             }
         }
+    }
+
+    /// "8:42 – 9:10 AM": the half of the day is said once unless the trip crosses noon or midnight.
+    private var timeRange: String {
+        let calendar = Calendar.current
+        let sameHalf = calendar.isDate(itinerary.departure, inSameDayAs: itinerary.arrival)
+            && (calendar.component(.hour, from: itinerary.departure) < 12) == (calendar.component(.hour, from: itinerary.arrival) < 12)
+        let start = sameHalf ? itinerary.departure.clockTime : itinerary.departure.formatted(date: .omitted, time: .shortened)
+        return "\(start) – \(itinerary.arrival.formatted(date: .omitted, time: .shortened))"
     }
 
     private var headline: String {
@@ -119,6 +129,20 @@ struct SegmentStrip: View {
     }
 
     var body: some View {
+        // A long trip drops its walks before anything gets squeezed or cut off.
+        let rides = pieces.filter { if case .ride = $0 { true } else { false } }
+        ViewThatFits(in: .horizontal) {
+            strip(pieces).fixedSize()
+            strip(rides).fixedSize()
+            // Several long line names ("Babylon Branch", "City Terminal Zone") still won't fit: let the long
+            // names truncate rather than push the whole card off the screen. Short ones keep their size.
+            strip(rides)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .clipped()
+        }
+    }
+
+    private func strip(_ pieces: [Piece]) -> some View {
         HStack(spacing: 4) {
             ForEach(Array(pieces.enumerated()), id: \.offset) { index, piece in
                 if index > 0 {
@@ -144,7 +168,6 @@ struct SegmentStrip: View {
             }
         }
         .lineLimit(1)
-        .minimumScaleFactor(0.7)
     }
 }
 
@@ -159,7 +182,7 @@ struct AlertRow: View {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(Color.orange)
-                Text(alert.header)
+                Text(alert.header.withoutBulletCodes)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
                     .foregroundStyle(Color.primary)
@@ -182,10 +205,10 @@ struct AlertRow: View {
                                     .background(Color(.systemGray4), in: .capsule)
                             }
                         }
-                        Text(alert.header)
+                        Text(alert.header.withoutBulletCodes)
                             .font(.headline)
                         if !alert.details.isEmpty {
-                            Text(alert.details)
+                            Text(alert.details.withoutBulletCodes)
                         }
                         if let url = alert.url {
                             Link("More Information", destination: url)

@@ -1,6 +1,7 @@
 import CommuteCore
 import Foundation
 import Observation
+import TransitRouting
 
 enum DepartureChoice: Hashable {
     case now
@@ -45,23 +46,29 @@ final class TripPlannerModel {
     private(set) var active: ActiveTrip? {
         didSet { onTripChange?() }
     }
-    /// Position along the current drive or walk leg's turn-by-turn steps.
-    private(set) var guidance: RouteProgress?
-    /// Under way on a drive or walk leg (or due to be), as opposed to waiting for the time to leave.
-    private(set) var isNavigating = false
 
     let location: LocationService
-    let voice = VoiceGuide()
     let notifier: TripNotifier
     /// Where recorded connections go to be kept.
     var recordConnections: (([ConnectionRecord]) -> Void)?
-    /// Anything about the trip in progress may have changed: the Live Activity, the Watch and the
-    /// copy kept on disk all hang off this.
+    /// Anything about the trip in progress may have changed: the Live Activity (and with it the Watch)
+    /// and the copy kept on disk all hang off this.
     var onTripChange: (() -> Void)?
     /// Follows the trip for as long as there is one, whatever is or isn't on screen.
     private var following: Task<Void, Never>?
     private let planner: ChainPlanner
-    private var lastReroute = Date.distantPast
+    /// Finds which train the rider is on, and where every train going their way is.
+    let trains: TransitPlanner?
+    /// Recent fixes, for matching against where each train was. Underground there may be long gaps between them.
+    private var recentFixes: [LocationFix] = []
+    private var lastTrainCheck = Date.distantPast
+    private var trainCheck: Task<Void, Never>?
+
+    /// Fixes older than this say nothing about the train the rider is on now.
+    static let fixMemory: TimeInterval = 8 * 60
+    static let fixSpacing: TimeInterval = 10
+    /// Matching runs on location changes, but no more often than this.
+    static let trainCheckInterval: TimeInterval = 15
 
     /// How often "leave now" trips re-plan while on screen.
     static let refreshInterval: Duration = .seconds(30)
@@ -70,14 +77,12 @@ final class TripPlannerModel {
     static let arriveByRefreshInterval: Duration = .seconds(120)
     /// A trip in progress re-plans more eagerly: a missed connection should show up fast.
     static let activeRefreshInterval: Duration = .seconds(20)
-    /// Straying this far from the route asks for a new one right away, but not more often than `rerouteInterval`.
-    static let offRouteMeters = 50.0
-    static let rerouteInterval: TimeInterval = 8
 
-    init(location: LocationService, resolver: any LegResolving, notifier: TripNotifier = TripNotifier()) {
+    init(location: LocationService, resolver: any LegResolving, notifier: TripNotifier = TripNotifier(), trains: TransitPlanner? = nil) {
         self.location = location
         self.notifier = notifier
         self.planner = ChainPlanner(resolver: resolver)
+        self.trains = trains
     }
 
     /// The rider taps an option: from here it is theirs, not the app's to keep changing.
@@ -93,6 +98,15 @@ final class TripPlannerModel {
     /// What the map draws: the rest of the trip in progress, or the option being considered.
     var displayedItinerary: Itinerary? {
         active.map { Itinerary(legs: $0.remainingLegs) } ?? selected
+    }
+
+    /// The ride whose trains the map follows: the one the rider is on or heading for, or the first of the option picked.
+    var trackedRide: Ride? {
+        if let trip = active {
+            guard let leg = trip.currentLeg else { return nil }
+            return leg.mode == .transit ? trip.currentRide(at: .now) : trip.connection?.ride
+        }
+        return selected?.legs.first { $0.mode == .transit }?.option.rides.first
     }
 
     func start(_ template: TripTemplate, arrivingBy target: Date? = nil) {
@@ -119,7 +133,6 @@ final class TripPlannerModel {
             resolved.updateCurrentLocation(coordinate)
         }
         active = ActiveTrip(template: resolved, itinerary: selected, arriveBy: departure.target)
-        updateGuidance()
         beginFollowing()
         // The reminder has done its job, and from here the trip screen is the thing to watch.
         notifier.cancelLeaveNow()
@@ -141,7 +154,6 @@ final class TripPlannerModel {
         template = trip.template
         departure = trip.arriveBy.map(DepartureChoice.arriveBy) ?? .now
         active = trip
-        updateGuidance()
         beginFollowing()
     }
 
@@ -153,29 +165,10 @@ final class TripPlannerModel {
     func endActiveTrip() {
         following?.cancel()
         following = nil
+        trainCheck?.cancel()
+        trainCheck = nil
+        recentFixes = []
         active = nil
-        guidance = nil
-        isNavigating = false
-        voice.stop()
-    }
-
-    /// The steps being navigated: those of the current leg when it is a drive or a walk.
-    var guidedLeg: Leg? {
-        guard let leg = active?.currentLeg, !leg.option.steps.isEmpty else { return nil }
-        return leg
-    }
-
-    private func updateGuidance() {
-        guard let leg = guidedLeg, let coordinate = location.coordinate else {
-            guidance = nil
-            isNavigating = false
-            return
-        }
-        guidance = RouteProgress(steps: leg.option.steps, location: coordinate)
-        isNavigating = active?.isMoving == true || leg.departure.timeIntervalSinceNow < 60
-        if let guidance, isNavigating {
-            voice.announce(leg.option.steps[guidance.stepIndex], metersAway: guidance.metersToManeuver, mode: leg.mode)
-        }
     }
 
     /// Stops the trip and hands what's left of it to the editor, starting from where the rider is now.
@@ -184,13 +177,17 @@ final class TripPlannerModel {
         let next = min(trip.currentSegment + 1, trip.template.waypoints.count - 1)
         let remaining = [.currentLocation()] + trip.template.waypoints[next...]
         let modes = Array(trip.template.modes[(next - 1)...])
-        start(TripTemplate(waypoints: remaining, modes: modes))
+        start(TripTemplate(waypoints: remaining, modes: modes, excludedFeedIDs: trip.template.excludedFeedIDs))
+    }
+
+    /// The rider set out ahead of the time the plan had them leaving: plan the rest from now.
+    func markLeaving() {
+        active?.markLeaving()
     }
 
     func markArrived() {
         active?.markArrived(now: .now)
         storeRecords()
-        updateGuidance()
     }
 
     func markMissed() {
@@ -212,6 +209,118 @@ final class TripPlannerModel {
         active?.follow(itinerary)
     }
 
+    // MARK: Motion, geofences and the Lock Screen
+
+    /// The motion sensor changed its mind about what the rider is doing.
+    func motionDidChange(_ motion: Motion) {
+        guard active != nil else { return }
+        let movedOn = active?.update(motion: motion, location: location.coordinate, now: .now) == true
+        storeRecords()
+        if movedOn { Task { await refreshActiveTrip() } }
+    }
+
+    /// A station geofence was crossed, possibly with the app woken just to hear it.
+    func crossed(_ id: String, entered: Bool, at date: Date) {
+        guard active != nil else { return }
+        let movedOn = active?.crossed(id, entered: entered, now: date) == true
+        storeRecords()
+        if movedOn { Task { await refreshActiveTrip() } }
+    }
+
+    /// The rider says they're on the train, without saying which: location matching can still tell.
+    func markAboard() {
+        active?.markAboard()
+        storeRecords()
+        Task { await refreshActiveTrip() }
+    }
+
+    func dismissTrainQuestion() {
+        active?.dismissTrainQuestion()
+    }
+
+    /// A button on the Live Activity.
+    func perform(_ action: TripAction) {
+        switch action {
+        case .arrived:
+            markArrived()
+            Task { await refreshActiveTrip() }
+        case .aboard:
+            markAboard()
+        case .missed:
+            markMissed()
+            Task { await refreshActiveTrip() }
+        case .confirmTrain:
+            if active?.suggestedTrain != nil { acceptSuggestedTrain() } else { markAboard() }
+        case .rejectTrain:
+            if active?.suggestedTrain != nil { rejectSuggestedTrain() } else { dismissTrainQuestion() }
+        }
+    }
+
+    // MARK: Which train
+
+    /// The rider says yes to the train the location suggested.
+    func acceptSuggestedTrain() {
+        active?.acceptSuggestedTrain()
+        Task { await refreshActiveTrip() }
+    }
+
+    func rejectSuggestedTrain() {
+        active?.rejectSuggestedTrain()
+    }
+
+    /// The rider picked the train they're on themselves.
+    func board(_ ride: Ride, segment: Int, rideIndex: Int) {
+        active?.board(ride, segment: segment, rideIndex: rideIndex, evidence: .rider)
+        storeRecords()
+        Task { await refreshActiveTrip() }
+    }
+
+    /// The ride the rider could be on or about to be on, and the trains going its way around now, for them to pick from.
+    func trainChoices() async -> (segment: Int, rideIndex: Int, planned: Ride, trains: [Ride])? {
+        guard let trip = active, let trains else { return nil }
+        let segment: Int
+        let index: Int
+        if trip.currentLeg?.mode == .transit {
+            segment = trip.currentSegment
+            index = trip.ridingIndex(at: .now)
+        } else {
+            segment = trip.currentSegment + 1
+            index = 0
+        }
+        guard segment < trip.legs.count, index < trip.legs[segment].option.rides.count else { return nil }
+        let planned = trip.legs[segment].option.rides[index]
+        return (segment, index, planned, await trains.trains(like: planned))
+    }
+
+    /// Where each train going the way of the ride the rider is on or heading for is right now.
+    func vehicles(along ride: Ride) async -> [VehicleEstimate] {
+        await trains?.vehicles(along: ride) ?? []
+    }
+
+    /// Matches recent fixes against where each train going the rider's way was, and takes what that finds.
+    private func checkTrain() async {
+        guard let trains, let watch = active?.ridesToWatch(at: .now) else { return }
+        let now = Date.now
+        recentFixes.removeAll { now.timeIntervalSince($0.time) > Self.fixMemory }
+        guard !recentFixes.isEmpty else { return }
+        lastTrainCheck = now
+        guard let match = await trains.matchTrain(for: watch.rides, fixes: recentFixes, at: now), !Task.isCancelled else { return }
+        let before = active?.suggestedTrain
+        active?.apply(match, segment: watch.segment, now: now)
+        storeRecords()
+        if let suggestion = active?.suggestedTrain, suggestion != before {
+            notifier.askAboutTrain(suggestion.ride)
+        }
+    }
+
+    /// Fresh times for the train the rider is on: the one thing that decides when everything after it happens.
+    private func refreshBoardedRide() async {
+        guard let trains, let trip = active, trip.hasBoarded, trip.currentLeg?.mode == .transit,
+              let ride = trip.currentRide(at: .now), ride.trip != nil,
+              let live = await trains.live(ride), !Task.isCancelled else { return }
+        active?.refreshRide(live)
+    }
+
     /// Tracks progress and keeps re-planning what's left until the trip ends or is called off.
     private func followActiveTrip() async {
         while !Task.isCancelled, let trip = active, !trip.isFinished {
@@ -223,19 +332,34 @@ final class TripPlannerModel {
     /// Cheap enough to run on every location fix: only checks whether the rider reached the next waypoint.
     func locationDidChange() {
         guard active != nil else { return }
-        let changedLeg = active?.update(location: location.coordinate, now: .now) == true
-        if changedLeg { storeRecords() }
-        updateGuidance()
-        let isOffRoute = (guidance?.metersOffRoute ?? 0) > Self.offRouteMeters && !isPlanning
-            && Date.now.timeIntervalSince(lastReroute) > Self.rerouteInterval
-        guard changedLeg || isOffRoute else { return }
-        lastReroute = .now
+        // The turns are another app's business now; here a fix only matters when it ends a leg. Wherever the
+        // rider has strayed to, the regular re-plan measures the rest of the trip from there.
+        // One fix every few seconds is plenty to tell trains apart, and keeps matching cheap.
+        if let fix = location.fix, recentFixes.last.map({ fix.time.timeIntervalSince($0.time) >= Self.fixSpacing }) ?? true {
+            recentFixes.append(fix)
+        }
+        if trainCheck == nil, Date.now.timeIntervalSince(lastTrainCheck) >= Self.trainCheckInterval {
+            trainCheck = Task {
+                let segment = active?.currentSegment
+                await checkTrain()
+                trainCheck = nil
+                // Catching up on a drive the app didn't see end is a change of leg like any other.
+                if active?.currentSegment != segment { await refreshActiveTrip() }
+            }
+        }
+        let wasMoving = active?.isMoving ?? false
+        let movedOn = active?.update(location: location.coordinate, now: .now) == true
+        // Setting out ahead of time changes when the rest of the trip happens, so it's worth a re-plan too.
+        guard movedOn || active?.isMoving != wasMoving else { return }
+        storeRecords()
         Task { await refreshActiveTrip() }
     }
 
     func refreshActiveTrip() async {
         active?.update(location: location.coordinate, now: .now)
         storeRecords()
+        if trainCheck == nil { await checkTrain() }
+        await refreshBoardedRide()
         guard let request = active?.replanRequest(location: location.coordinate, now: .now) else { return }
         isPlanning = true
         defer { isPlanning = false }
@@ -244,7 +368,6 @@ final class TripPlannerModel {
         guard !Task.isCancelled, let planned else { return }
         active?.apply(planned, for: request)
         announceNotice()
-        updateGuidance()
         lastUpdated = .now
     }
 

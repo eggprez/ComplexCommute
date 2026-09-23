@@ -10,6 +10,7 @@ struct ActiveTripView: View {
 
     @Environment(SheetRouter.self) private var router
     @State private var isSettingTarget = false
+    @State private var isPickingTrain = false
     @State private var target = Date.now.addingTimeInterval(3_600)
 
     var body: some View {
@@ -21,6 +22,20 @@ struct ActiveTripView: View {
                 }
                 .listRowBackground(Color.accentColor.opacity(0.12))
 
+                // The turns themselves are left to a maps app; this one keeps following from behind it.
+                if let target = trip.directionsTarget(at: .now) {
+                    DirectionsButton(destination: target.destination, mode: target.mode)
+                        .listRowBackground(Color.accentColor.opacity(0.12))
+                }
+
+                if !trip.isFinished {
+                    Section {
+                        TimelineView(.periodic(from: .now, by: 15)) { context in
+                            TrainCheckSection(trip: trip, now: context.date, planner: planner) { isPickingTrain = true }
+                        }
+                    }
+                }
+
                 if let notice = trip.notice {
                     Section {
                         NoticeRow(notice: notice, arrival: trip.arrival, follow: planner.follow, dismiss: planner.dismissNotice)
@@ -29,8 +44,7 @@ struct ActiveTripView: View {
 
                 if !trip.isFinished {
                     Section {
-                        TripTimeline(legs: trip.remainingLegs, guidedLegID: planner.isNavigating ? planner.guidedLeg?.id : nil,
-                                     currentStep: planner.guidance?.stepIndex)
+                        TripTimeline(legs: trip.remainingLegs)
                     } header: {
                         HStack {
                             Text("Remaining")
@@ -62,13 +76,19 @@ struct ActiveTripView: View {
                                 target = progress.target
                                 isSettingTarget = true
                             }
+                            // Clear of the sheet's grabber above and of the numbers below.
+                            .padding(.horizontal, 16)
+                            .padding(.top, 22)
                         }
-                        TripSummaryBar(trip: trip, guidance: planner.guidance, now: context.date, onEnd: onDone)
+                        TripSummaryBar(trip: trip, now: context.date, onEnd: onDone)
                     }
-                    // The bar's tint is see-through; without this the list scrolls visibly underneath it.
-                    .background(.bar)
+                    // Opaque, and the sheet's own color, so the list neither shows through nor looks like a second panel.
+                    .background(Color(.systemGroupedBackground))
                 }
             }
+        }
+        .sheet(isPresented: $isPickingTrain) {
+            TrainPickerView(planner: planner)
         }
         .sheet(isPresented: $isSettingTarget) {
             ArriveByEditor(target: $target, hasTarget: planner.active?.arriveBy != nil) { chosen in
@@ -83,6 +103,12 @@ struct ActiveTripView: View {
 
     @ViewBuilder
     private func controls(for trip: ActiveTrip) -> some View {
+        if trip.canMarkLeaving {
+            Button("I'm Leaving Now", systemImage: "figure.walk.departure") {
+                withAnimation { planner.markLeaving() }
+                Task { await planner.refreshActiveTrip() }
+            }
+        }
         if let leg = trip.currentLeg {
             Button("I'm at \(leg.to.name)", systemImage: "checkmark.circle") {
                 withAnimation { planner.markArrived() }
@@ -151,11 +177,10 @@ private struct ArriveByEditor: View {
     }
 }
 
-/// Arrival time, minutes and distance to go, with the way out: the strip Maps keeps on screen while navigating.
+/// Arrival time and minutes to go, with the way out: the strip Maps keeps on screen while navigating.
 /// While driving or walking it counts down the leg under way, and names the train that leg is meant to catch.
 private struct TripSummaryBar: View {
     let trip: ActiveTrip
-    let guidance: RouteProgress?
     let now: Date
     let onEnd: () -> Void
 
@@ -169,11 +194,6 @@ private struct TripSummaryBar: View {
                 stat(arrival.clockTime, "arrival")
                 if !trip.isFinished {
                     stat("\(max(1, Int((arrival.timeIntervalSince(now) / 60).rounded())))", "min")
-                }
-                if isGuided, let guidance {
-                    let distance = Measurement(value: guidance.metersRemaining, unit: UnitLength.meters)
-                        .formatted(.measurement(width: .abbreviated, usage: .road)).split(separator: " ")
-                    stat(String(distance.first ?? ""), String(distance.last ?? ""))
                 }
                 Spacer(minLength: 0)
                 Button(trip.isFinished ? "Done" : "End", action: onEnd)
@@ -191,7 +211,6 @@ private struct TripSummaryBar: View {
         .padding(.top, 18)
         .padding(.bottom, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.bar)
     }
 
     private func stat(_ value: String, _ unit: String) -> some View {
@@ -226,6 +245,32 @@ private struct TripSummaryBar: View {
     }
 }
 
+/// Opens the rider's maps app with directions to wherever this part of the trip is headed. A tap uses the
+/// app they used last; holding it offers the other.
+struct DirectionsButton: View {
+    let destination: Waypoint
+    let mode: TravelMode
+
+    @AppStorage(DirectionsApp.key) private var app = DirectionsApp.appleMaps
+
+    var body: some View {
+        Menu {
+            ForEach(DirectionsApp.allCases) { choice in
+                Button("Open in \(choice.name)") {
+                    app = choice
+                    choice.open(to: destination, mode: mode)
+                }
+            }
+        } label: {
+            Label("Directions in \(app.name)", systemImage: "arrow.triangle.turn.up.right.diamond.fill")
+                .font(.headline)
+        } primaryAction: {
+            app.open(to: destination, mode: mode)
+        }
+        .accessibilityHint("To \(destination.name). Commute keeps following your trip.")
+    }
+}
+
 private struct NextStepCard: View {
     let trip: ActiveTrip
     let now: Date
@@ -249,7 +294,7 @@ private struct NextStepCard: View {
     private func step(for leg: Leg) -> some View {
         switch leg.mode {
         case .drive, .walk:
-            // The turns are on the map; what the sheet adds is why the rider is going there.
+            // The turns are in the maps app; what the sheet adds is why the rider is going there.
             let waitsToLeave = !trip.isMoving && leg.departure.timeIntervalSince(now) >= 60
             Label(waitsToLeave ? "Leave in \(leg.departure.timeIntervalSince(now).shortDuration)" : "\(leg.mode.label) to \(leg.to.name)",
                   systemImage: leg.mode.symbol)
@@ -266,7 +311,7 @@ private struct NextStepCard: View {
                     Spacer(minLength: 0)
                     Text(spare >= 60 ? "\(spare.shortDuration) to spare" : "Tight")
                         .fontWeight(.semibold)
-                        .foregroundStyle(spare >= 120 ? Color.green : Color.orange)
+                        .foregroundStyle(spare >= 120 ? Color.goodText : Color.warningText)
                 }
                 .font(.subheadline)
             }
@@ -296,7 +341,7 @@ private struct NextStepCard: View {
         .font(.title2.weight(.bold))
 
         if isAboard {
-            Text("\(ride.alight.formatted(date: .omitted, time: .shortened)) · \(ride.stopCount) \(ride.stopCount == 1 ? "stop" : "stops") from \(ride.boardStopName)")
+            Text("Arrives \(ride.alight.formatted(date: .omitted, time: .shortened)) · \(ride.stopCount) \(ride.stopCount == 1 ? "stop" : "stops") from \(ride.boardStopName)")
                 .foregroundStyle(.secondary)
         } else {
             let wait = ride.board.timeIntervalSince(now)
@@ -309,7 +354,7 @@ private struct NextStepCard: View {
                     .fontWeight(.semibold)
                 if ride.isRealtime {
                     Text("· \(ride.liveStatus)")
-                        .foregroundStyle(ride.isLate ? Color.orange : Color.green)
+                        .foregroundStyle(ride.isLate ? Color.warningText : Color.goodText)
                 }
             }
         }
@@ -362,5 +407,219 @@ private struct NoticeRow: View {
                     .buttonStyle(.bordered)
             }
         }
+    }
+}
+
+// MARK: - Which train
+
+/// Which train the rider is on, why the app thinks so, and the way to put it right: the manual backup to
+/// matching the rider's location against where each train is.
+struct TrainCheckSection: View {
+    let trip: ActiveTrip
+    let now: Date
+    let planner: TripPlannerModel
+    let pickTrain: () -> Void
+
+    var body: some View {
+        if let suggestion = trip.suggestedTrain {
+            suggestionRow(suggestion.ride)
+        } else if trip.isAskingAboutTrain {
+            movingRow
+        } else if let leg = trip.currentLeg {
+            if leg.mode == .transit, trip.hasBoarded, let ride = trip.currentRide(at: now), now >= ride.board {
+                aboardRow(ride)
+            } else if leg.mode == .transit {
+                Button("I'm On a Train", systemImage: "tram.fill", action: pickTrain)
+            } else if trip.connection != nil {
+                // The drive or walk may have ended without the app seeing it: a garage, a dead zone, a fast platform.
+                Button("I'm Already on the Train", systemImage: "tram.fill", action: pickTrain)
+            }
+        }
+    }
+
+    private func suggestionRow(_ ride: Ride) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                RouteBadgeView(route: ride.badge, size: .regular)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("On the \(ride.board.clockTime)\(ride.headsign.map { " to \($0)" } ?? "")?")
+                        .font(.headline)
+                    Text("Your location matches this train. Arrive \(ride.alightStopName) \(ride.alight.clockTime).")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            HStack {
+                Button("Yes") { withAnimation { planner.acceptSuggestedTrain() } }
+                    .buttonStyle(.borderedProminent)
+                Button("Different Train") {
+                    planner.rejectSuggestedTrain()
+                    pickTrain()
+                }
+                .buttonStyle(.bordered)
+                Button("Not Yet") { planner.rejectSuggestedTrain() }
+                    .buttonStyle(.borderless)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// Motion or leaving the station says the rider is on a train, but the planned one wasn't due.
+    private var movingRow: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("On a Train?")
+                        .font(.headline)
+                    Text("You've started moving from the station, but your planned train isn't due yet.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: "figure.walk.motion")
+                    .foregroundStyle(.orange)
+            }
+            HStack {
+                Button("Which Train?", action: pickTrain)
+                    .buttonStyle(.borderedProminent)
+                Button("Not Yet") { planner.dismissTrainQuestion() }
+                    .buttonStyle(.bordered)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func aboardRow(_ ride: Ride) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: trip.boardedBy?.symbol ?? "clock")
+                .foregroundStyle(trip.boardedBy == .schedule ? Color.secondary : Color.green)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Text("On the \(ride.board.clockTime)")
+                    RouteBadgeView(route: ride.badge)
+                }
+                .font(.subheadline.weight(.semibold))
+                Text(trip.boardedBy?.explanation ?? "")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            if trip.boardedBy == .schedule || trip.boardedBy == .movement || trip.boardedBy == .riderAboard {
+                Button("Confirm") {
+                    planner.board(ride, segment: trip.currentSegment, rideIndex: trip.ridingIndex(at: now))
+                }
+                .buttonStyle(.bordered)
+            }
+            Button("Change", action: pickTrain)
+                .buttonStyle(.borderless)
+        }
+        .accessibilityElement(children: .contain)
+    }
+}
+
+extension BoardingEvidence {
+    var symbol: String {
+        switch self {
+        case .schedule: "clock"
+        case .movement: "figure.walk.motion"
+        case .riderAboard: "hand.raised.fill"
+        case .location: "location.fill"
+        case .rider: "checkmark.circle.fill"
+        }
+    }
+
+    var explanation: String {
+        switch self {
+        case .schedule: "Assumed from the schedule. Confirm it so times follow your train."
+        case .movement: "You moved off from the station as it was due. Confirm it so times follow your train."
+        case .riderAboard: "You said you're aboard. Your location will pick out the train, or confirm it here."
+        case .location: "Matched to your location. Times follow this train."
+        case .rider: "Confirmed by you. Times follow this train."
+        }
+    }
+}
+
+/// Every train going the rider's way around now, to say which one they're on.
+struct TrainPickerView: View {
+    let planner: TripPlannerModel
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var choices: (segment: Int, rideIndex: Int, planned: Ride, trains: [Ride])?
+    @State private var isLoading = true
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let choices {
+                    Section {
+                        ForEach(choices.trains, id: \.trip) { ride in
+                            Button {
+                                planner.board(ride, segment: choices.segment, rideIndex: choices.rideIndex)
+                                dismiss()
+                            } label: {
+                                TrainChoiceRow(ride: ride, isPlanned: ride.trip == choices.planned.trip)
+                            }
+                            .tint(.primary)
+                        }
+                    } header: {
+                        Text("From \(choices.planned.boardStopName) toward \(choices.planned.alightStopName)")
+                    } footer: {
+                        Text("Arrival times, and everything after this train, will follow the one you pick.")
+                    }
+                } else if !isLoading {
+                    ContentUnavailableView("No Trains Found", systemImage: "tram",
+                                           description: Text("There's no schedule for this part of the trip to pick a train from."))
+                }
+            }
+            .overlay {
+                if isLoading { ProgressView() }
+            }
+            .navigationTitle("Which Train?")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+            .task {
+                let found = await planner.trainChoices()
+                choices = found.flatMap { $0.trains.isEmpty ? nil : $0 }
+                isLoading = false
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
+private struct TrainChoiceRow: View {
+    let ride: Ride
+    let isPlanned: Bool
+
+    var body: some View {
+        let hasLeft = ride.board <= .now
+        HStack(spacing: 10) {
+            RouteBadgeView(route: ride.badge, size: .regular)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(ride.board.clockTime)
+                        .font(.headline)
+                        .monospacedDigit()
+                    if isPlanned {
+                        Text("Planned")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text("\(ride.headsign.map { "to \($0) · " } ?? "")arrives \(ride.alight.clockTime)")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            Text(hasLeft ? "left \(Date.now.timeIntervalSince(ride.board).shortDuration) ago" : ride.isRealtime ? ride.liveStatus : "scheduled")
+                .font(.footnote)
+                .foregroundStyle(ride.isLate ? Color.warningText : Color.secondary)
+        }
+        .accessibilityElement(children: .combine)
     }
 }

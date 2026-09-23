@@ -243,3 +243,38 @@ private struct Fixture {
         #expect(await library.searchStops(matching: "times").count == 1)
     }
 }
+
+@Test func everyFeedCreditsExactlyOneAgency() {
+    for feed in FeedCatalog.feeds {
+        #expect(DataSources.all.filter { $0.feedIDs.contains(feed.id) }.count == 1, "\(feed.id)")
+    }
+    #expect(DataSources.source(forFeed: "mbta")?.credit.contains("MassDOT") == true)
+}
+
+@Suite struct BuiltInFeedTests {
+    @Test(arguments: FeedCatalog.feeds.filter(\.isBuiltIn).map(\.id))
+    func importsAndRunsAroundTheClock(feedID: String) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("builtin-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let files = BuiltInFeeds.files(for: feedID)
+        #expect(!files.isEmpty)
+        let library = FeedLibrary(directory: directory)
+        let info = try await library.install(feedID: feedID, files: files)
+        #expect(info.version == BuiltInFeeds.version)
+        #expect(info.routeCount > 0)
+        #expect(!info.isExpired())
+        let data = try #require(await library.timetableData(for: [ServiceDay(date: 20260921, weekday: 0, offsetSeconds: 0)], feedIDs: [feedID]).first)
+        #expect(data.trips.count > 50)
+    }
+
+    @Test func everyRunCallsOnlyAtItsOwnStopsAndMovesForward() {
+        for link in BuiltInFeeds.links {
+            let stops = Set(link.stops.map(\.id))
+            for run in link.runs {
+                #expect(run.calls.allSatisfy { stops.contains($0.stop) }, "\(link.routeID)")
+                #expect(zip(run.calls, run.calls.dropFirst()).allSatisfy { $0.minutes < $1.minutes }, "\(link.routeID)")
+                #expect(Set(run.calls.map(\.stop)).count == run.calls.count, "\(link.routeID) visits a stop twice")
+            }
+        }
+    }
+}

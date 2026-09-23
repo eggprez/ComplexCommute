@@ -18,7 +18,7 @@ public struct Journey: Sendable {
     public struct Ride: Sendable {
         let pattern: Int
         public internal(set) var trip: Int
-        let boardPosition: Int
+        var boardPosition: Int
         let alightPosition: Int
         /// Walk from the previous ride's exit (or the origin) to this ride's boarding stop.
         public internal(set) var walkBefore: Walk
@@ -179,7 +179,7 @@ public struct RaptorRouter: Sendable {
             guard arrival < bestArrival else { continue }
             bestArrival = arrival
             if let journey = reconstruct(round: round, exit: exit, parents: parents, access: access) {
-                journeys.append(departingLate(journey))
+                journeys.append(departingLate(stayingAboard(journey)))
             }
         }
         return journeys
@@ -225,6 +225,35 @@ public struct RaptorRouter: Sendable {
                 round -= 1
             }
         }
+    }
+
+    /// Where two lines share track before they part, never ride the first train along just to step off and
+    /// wait for the one behind it: that train came through the boarding station too, no sooner than the
+    /// one taken, so the rider waits for it there and sits down once.
+    func stayingAboard(_ journey: Journey) -> Journey {
+        var journey = journey
+        var index = 0
+        while index + 1 < journey.rides.count {
+            let (first, second) = (journey.rides[index], journey.rides[index + 1])
+            let (boarded, onward) = (timetable.patterns[first.pattern], timetable.patterns[second.pattern])
+            let station = timetable.stops[boarded.stops[first.boardPosition]].station
+            let leaves = boarded.departure(trip: first.trip, position: first.boardPosition)
+
+            let earlier = (0..<second.boardPosition).last { position in
+                onward.canBoard[position] && timetable.stops[onward.stops[position]].station == station
+                    && onward.departure(trip: second.trip, position: position) >= leaves
+            }
+            if let earlier {
+                journey.rides[index + 1].boardPosition = earlier
+                journey.rides[index + 1].walkBefore = first.walkBefore
+                journey.rides.remove(at: index)
+                // The ride before now connects to a different train; look at that pair again.
+                index = max(0, index - 1)
+            } else {
+                index += 1
+            }
+        }
+        return journey
     }
 
     /// RAPTOR boards the first possible vehicle, which can mean a long wait at a connection. Working

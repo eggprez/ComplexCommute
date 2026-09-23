@@ -2,6 +2,7 @@ import CommuteCore
 import GTFSKit
 import MapKit
 import SwiftUI
+import TransitRouting
 
 struct TripMapView: View {
     let planner: TripPlannerModel
@@ -9,8 +10,11 @@ struct TripMapView: View {
     let router: SheetRouter
 
     @State private var position: MapCameraPosition = .userLocation(fallback: .automatic)
-    /// Last direction of travel, kept while stopped, when GPS reports no course.
-    @State private var heading = 0.0
+    /// Every train going the way of the ride the rider is on or heading for, where it should be now.
+    @State private var vehicles: [VehicleEstimate] = []
+
+    /// How often trains are moved along. Live predictions refresh about every 30 seconds.
+    static let vehicleRefresh: Duration = .seconds(10)
 
     var body: some View {
         GeometryReader { proxy in
@@ -58,26 +62,44 @@ struct TripMapView: View {
                         }
                     }
                 }
+
+                let tracked = planner.trackedRide
+                ForEach(vehicles) { vehicle in
+                    let isMine = vehicle.trip == tracked?.trip && planner.active?.hasBoarded == true
+                    Annotation("", coordinate: (tracked.flatMap { $0.path.snapping(vehicle.coordinate, within: 150) } ?? vehicle.coordinate).clCoordinate,
+                               anchor: .center) {
+                        VehicleMarkView(vehicle: vehicle, isMine: isMine)
+                    }
+                    .annotationTitles(.hidden)
+                }
             }
-            // On the road the map is for the road: traffic on, shops and sights off.
-            .mapStyle(planner.isNavigating && planner.guidedLeg?.mode == .drive
-                      ? .standard(elevation: .flat, pointsOfInterest: .excludingAll, showsTraffic: true) : .standard)
             .mapControls {
                 MapUserLocationButton()
                 MapCompass()
             }
             // Keep fitted content clear of the sheet.
             .safeAreaPadding(.bottom, sheetIsCollapsed ? 88 : proxy.size.height * 0.45)
-            .safeAreaInset(edge: .top) {
-                if let leg = planner.guidedLeg, let progress = planner.guidance, planner.isNavigating {
-                    GuidanceBanner(leg: leg, progress: progress, voice: planner.voice)
-                        .transition(.move(edge: .top).combined(with: .opacity))
+            // Street names run under the clock and battery; fade the map behind them so the status bar stays legible.
+            .overlay(alignment: .top) {
+                LinearGradient(colors: [Color(.systemBackground).opacity(0.85), Color(.systemBackground).opacity(0)],
+                               startPoint: .top, endPoint: .bottom)
+                    .frame(height: proxy.safeAreaInsets.top + 16)
+                    .ignoresSafeArea(edges: .top)
+                    .allowsHitTesting(false)
+            }
+            .onChange(of: planner.displayedItinerary?.id) { fitTrip() }
+            .task(id: planner.trackedRide?.trip) {
+                guard let ride = planner.trackedRide else {
+                    vehicles = []
+                    return
+                }
+                while !Task.isCancelled {
+                    let found = await planner.vehicles(along: ride)
+                    guard !Task.isCancelled else { return }
+                    withAnimation(.linear(duration: 1)) { vehicles = found }
+                    try? await Task.sleep(for: Self.vehicleRefresh)
                 }
             }
-            .animation(.snappy, value: planner.isNavigating)
-            .onChange(of: planner.displayedItinerary?.id) { fitTrip() }
-            .onChange(of: planner.isNavigating) { fitTrip() }
-            .onChange(of: planner.location.location) { followTraveller() }
             .onChange(of: planner.template.waypoints) { fitTrip() }
         }
         .ignoresSafeArea(.keyboard)
@@ -94,24 +116,7 @@ struct TripMapView: View {
         }
     }
 
-    /// Navigating a drive or walk: stay on the traveller, looking the way they are heading, until they pan away.
-    /// (The location button brings the camera back.) Placed by hand because the built-in follow mode ignores the sheet.
-    private func followTraveller(force: Bool = false) {
-        guard planner.isNavigating, force || !position.positionedByUser, let location = planner.location.location else { return }
-        if location.course >= 0, location.speed > 0.5 {
-            heading = location.course
-        }
-        let isDriving = planner.guidedLeg?.mode == .drive
-        // Tilted enough to see the road ahead, but not so far that buildings stand in front of the route line.
-        let camera = MapCamera(centerCoordinate: location.coordinate, distance: isDriving ? 900 : 450, heading: heading, pitch: 30)
-        withAnimation(.linear(duration: 1)) { position = .camera(camera) }
-    }
-
     private func fitTrip() {
-        guard !planner.isNavigating else {
-            followTraveller(force: true)
-            return
-        }
         let fixed = planner.template.waypoints.filter { $0.kind != .currentLocation }.map(\.coordinate)
         let route = planner.displayedItinerary?.legs.flatMap { $0.option.geometry + $0.option.rides.flatMap(\.path) } ?? []
         let coordinates = fixed + route
@@ -158,9 +163,9 @@ struct StationMark: Identifiable {
 }
 
 extension TripMapView {
-    /// Changing within a couple of blocks (platforms of one complex are often that far apart) reads as one
-    /// transfer point rather than an exit and a separate boarding.
-    static let sameStationMeters = 250.0
+    /// Changing between stations in the same place (a five-minute walk, like Farragut North to Farragut West) reads
+    /// as one transfer point rather than an exit and a separate boarding.
+    static let sameStationMeters = Timetable.samePlaceMeters
 
     /// The darker edge Maps gives a route line so it reads over any terrain.
     static func casing(for color: Color) -> Color {
@@ -238,5 +243,39 @@ private struct StationMarkView: View {
                 .frame(width: 16, height: 16)
                 .shadow(radius: 1.5)
         }
+    }
+}
+
+/// A train on the map: its line's color, the rider's own one ringed. Faded when only the schedule says where it is.
+private struct VehicleMarkView: View {
+    let vehicle: VehicleEstimate
+    let isMine: Bool
+
+    var body: some View {
+        let color = Color(hex: vehicle.route.colorHex) ?? TravelMode.transit.tint
+        let size: CGFloat = isMine ? 30 : 22
+        Image(systemName: vehicle.route.type == 3 ? "bus.fill" : "tram.fill")
+            .font(.system(size: size * 0.5, weight: .bold))
+            .foregroundStyle(Color(hex: vehicle.route.textColorHex) ?? Color.readable(on: vehicle.route.colorHex) ?? .white)
+            .frame(width: size, height: size)
+            .background(color, in: .circle)
+            .overlay {
+                Circle().stroke(.white, lineWidth: isMine ? 3 : 1.5)
+            }
+            .overlay {
+                if isMine {
+                    Circle().stroke(color, lineWidth: 2).padding(-5)
+                }
+            }
+            .shadow(radius: 1.5)
+            .opacity(vehicle.isRealtime || isMine ? 1 : 0.6)
+            .accessibilityElement()
+            .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var accessibilityLabel: String {
+        let train = "\(vehicle.route.name) train\(vehicle.headsign.map { " to \($0)" } ?? "")"
+        let whereabouts = vehicle.isAtStop ? "at \(vehicle.lastStop)" : "next stop \(vehicle.nextStop) at \(vehicle.nextStopTime.clockTime)"
+        return "\(isMine ? "Your train, " : "")\(train), \(whereabouts)\(vehicle.isRealtime ? "" : ", scheduled position")"
     }
 }

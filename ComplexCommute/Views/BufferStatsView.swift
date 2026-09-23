@@ -31,7 +31,7 @@ struct BufferStatsView: View {
                     LabeledContent("Tightest", value: measure(stats.shortestTimeInHand))
                     if stats.missCount > 0 {
                         LabeledContent("Missed", value: "\(stats.missCount)")
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(Color.warningText)
                     }
                 } header: {
                     Text("Overall")
@@ -129,11 +129,12 @@ private struct GroupRow: View {
                 }
                 if group.stats.missCount > 0 {
                     Label("\(group.stats.missCount)", systemImage: "figure.wave")
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(Color.warningText)
                 }
             }
             .font(.caption)
             .foregroundStyle(.secondary)
+            .labelStyle(.compact)
         }
         .accessibilityElement(children: .combine)
     }
@@ -190,12 +191,13 @@ private struct RecordRow: View {
             Spacer()
             if record.wasMissed {
                 Label("Missed", systemImage: "figure.wave")
+                    .labelStyle(.compact)
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(Color.warningText)
             } else {
                 Text(BufferStatsView.measure(record.timeInHand))
                     .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(record.timeInHand < 60 ? Color.orange : Color.primary)
+                    .foregroundStyle(record.timeInHand < 60 ? Color.warningText : Color.primary)
             }
         }
         .accessibilityElement(children: .combine)

@@ -88,6 +88,19 @@ private extension Timetable {
         #expect(timetable.departures(feedID: "test", stopID: "D", from: start, within: 3_600, limit: 10).isEmpty)
     }
 
+    @Test func listsOnlyVehiclesThatStopWhereTheRiderIsGoing() {
+        let timetable = Self.network()
+        let start = Date(timeIntervalSince1970: TimeInterval(eight + 60))
+        // The express runs A to D without stopping at C, so only locals go "toward" C; both lines go to D.
+        let toC = timetable.departures(feedID: "test", stopID: "A", toward: ("test", "C"), from: start, within: 1_800, limit: 10)
+        #expect(toC.map { "\($0.route.name) @\(Int($0.time.timeIntervalSince1970) - eight)" } == ["Local @600", "Local @1200", "Local @1800"])
+        let toD = timetable.departures(feedID: "test", stopID: "A", toward: ("test", "D"), from: start, within: 1_800, limit: 10)
+        #expect(toD.map(\.route.name) == ["Local", "Express", "Local", "Local"])
+        // Nothing from B goes back to A, and a station nobody serves has no departures toward it.
+        #expect(timetable.departures(feedID: "test", stopID: "B", toward: ("test", "A"), from: start, within: 3_600, limit: 10).isEmpty)
+        #expect(timetable.departures(feedID: "test", stopID: "A", toward: ("test", "nowhere"), from: start, within: 3_600, limit: 10).isEmpty)
+    }
+
     @Test func takesTheNextDirectTrain() {
         let timetable = Self.network()
         let journeys = RaptorRouter(timetable: timetable).journeys(
@@ -175,6 +188,53 @@ private extension Timetable {
         #expect(journeys.map(timetable.describe) == [["Feeder A>B @900", "Trunk B>C @1500"]])
     }
 
+    /// Red and Blue share X-W-Y, then part: Red to P, Blue to Z. Red comes first, Blue three minutes behind it.
+    private static func sharedTrunk() -> Timetable {
+        var feed = FeedBuilder()
+        for id in ["O", "X", "W", "Y", "P", "Z"] { feed.stop(id, latitude: 40 + Double(feed.data.stops.count)) }
+        feed.line("Feeder", starts: [eight], stops: [("O", 0), ("X", 300)])
+        feed.line("Red", starts: every(600, from: eight + 600, count: 4), stops: [("X", 0), ("W", 200), ("Y", 400), ("P", 900)])
+        feed.line("Blue", starts: every(600, from: eight + 780, count: 4), stops: [("X", 0), ("W", 200), ("Y", 400), ("Z", 900)])
+        return Timetable(feeds: [feed.data])
+    }
+
+    @Test func waitsForTheThroughTrainRatherThanRidingTheOneAheadOfItToWhereTheyPart() {
+        let timetable = Self.sharedTrunk()
+        let router = RaptorRouter(timetable: timetable)
+        let journeys = router.journeys(from: [StopAccess(stop: timetable.stop("X"))], to: [StopAccess(stop: timetable.stop("Z"))], departure: eight + 500)
+        #expect(journeys.map(timetable.describe) == [["Blue X>Z @780"]])
+
+        // The same holds for a change further into the trip: off the feeder, onto Blue, not Red-then-Blue.
+        let fromAfar = router.journeys(from: [StopAccess(stop: timetable.stop("O"))], to: [StopAccess(stop: timetable.stop("Z"))], departure: eight)
+        #expect(fromAfar.map(timetable.describe) == [["Feeder O>X @0", "Blue X>Z @780"]])
+    }
+
+    @Test func aChangeOntoTheTrainBehindIsFoldedIntoWaitingForIt() throws {
+        let timetable = Self.sharedTrunk()
+        let router = RaptorRouter(timetable: timetable)
+        func pattern(_ name: String) throws -> Int {
+            try #require(timetable.patterns.firstIndex { timetable.routes[$0.route].name == name })
+        }
+        let feeder = Journey.Ride(pattern: try pattern("Feeder"), trip: 0, boardPosition: 0, alightPosition: 1, walkBefore: Journey.Walk(seconds: 120, meters: 150))
+        let red = Journey.Ride(pattern: try pattern("Red"), trip: 0, boardPosition: 0, alightPosition: 2, walkBefore: Journey.Walk())
+        let blue = Journey.Ride(pattern: try pattern("Blue"), trip: 0, boardPosition: 2, alightPosition: 3, walkBefore: Journey.Walk())
+
+        let folded = router.stayingAboard(Journey(rides: [feeder, red, blue], walkAfter: Journey.Walk()))
+        #expect(timetable.describe(folded) == ["Feeder O>X @0", "Blue X>Z @780"])
+
+        // The walk to the first train becomes the walk to the one waited for.
+        let direct = router.stayingAboard(Journey(rides: [Journey.Ride(pattern: red.pattern, trip: 0, boardPosition: 0, alightPosition: 2, walkBefore: feeder.walkBefore), blue],
+                                                  walkAfter: Journey.Walk()))
+        #expect(timetable.describe(direct) == ["Blue X>Z @780"])
+        #expect(direct.rides.first?.walkBefore.seconds == 120)
+
+        // A Blue that came through before the Red being ridden is a real connection (Red overtook it), and stays.
+        let earlierBlue = Journey.Ride(pattern: blue.pattern, trip: 0, boardPosition: 2, alightPosition: 3, walkBefore: Journey.Walk())
+        let laterRed = Journey.Ride(pattern: red.pattern, trip: 1, boardPosition: 0, alightPosition: 2, walkBefore: Journey.Walk())
+        let kept = router.stayingAboard(Journey(rides: [laterRed, earlierBlue], walkAfter: Journey.Walk()))
+        #expect(kept.rides.count == 2)
+    }
+
     @Test func offersMoreRidesOnlyWhenTheyArriveSooner() {
         var feed = FeedBuilder()
         for id in ["A", "B", "C"] { feed.stop(id, latitude: 40 + Double(feed.data.stops.count)) }
@@ -227,6 +287,96 @@ private extension Timetable {
         // Rail arrives 8:15; ~133 m walk ≈ 133 s + 60 s margin -> ready ~8:18:13; next subway 8:20.
         #expect(journeys.map(timetable.describe) == [["Rail R1>R2 @0", "Sub HubN>End @1200"]])
         #expect(journeys[0].rides[1].walkBefore.meters > 100)
+    }
+
+    /// Farragut North and Farragut West: two stations ~200 m apart, with a street corner of bus stops between them.
+    private static func farragut() -> Timetable {
+        var metro = FeedBuilder(feedID: "metro")
+        metro.stop("North", latitude: 38.9031, longitude: -77.0397)
+        metro.stop("NorthP", latitude: 38.9031, longitude: -77.0397, parent: "North")
+        metro.stop("West", latitude: 38.9013, longitude: -77.0405)
+        metro.stop("WestP1", latitude: 38.9013, longitude: -77.0405, parent: "West")
+        metro.stop("WestP2", latitude: 38.9013, longitude: -77.0405, parent: "West")
+        metro.stop("Far", latitude: 38.9031, longitude: -77.0320) // ~670 m east: not the same place
+        for id in ["Red1", "Blue1", "Blue2", "Far1"] { metro.stop(id, latitude: 39 + Double(metro.data.stops.count) / 10) }
+        metro.line("Red", starts: every(600, from: eight, count: 6), stops: [("Red1", 0), ("NorthP", 600)])
+        metro.line("Blue", starts: every(600, from: eight, count: 6), stops: [("WestP1", 0), ("Blue1", 600)])
+        metro.line("Blue back", starts: every(600, from: eight, count: 6), stops: [("Blue2", 0), ("WestP2", 600)])
+        metro.line("Far", starts: every(600, from: eight, count: 6), stops: [("Far", 0), ("Far1", 600)])
+
+        // A dozen bus stops, all nearer Farragut North than Farragut West is, and all on one route.
+        var bus = FeedBuilder(feedID: "bus")
+        for index in 0..<12 { bus.stop("B\(index)", latitude: 38.9031 + Double(index) * 0.0001, longitude: -77.0395) }
+        bus.data.routes.append(RouteBadge(name: "Bus", type: 3))
+        let calls = (0..<12).map { FeedTimetableData.StopTime(stop: $0, arrival: eight + $0 * 60, departure: eight + $0 * 60) }
+        bus.data.stopTimes = calls
+        bus.data.trips = [.init(id: "bus", serviceDate: 20260921, route: 0, headsign: nil, stopTimes: 0..<calls.count)]
+        return Timetable(feeds: [metro.data, bus.data])
+    }
+
+    @Test func aCrowdOfBusStopsCannotHideTheStationAcrossTheStreet() {
+        let timetable = Self.farragut()
+        let north = timetable.stop("NorthP")
+        let linked = timetable.footpaths[north].map { timetable.stops[$0.to].id }
+        // Both Farragut West platforms, and of the bus stops only the one nearest: the rest lead nowhere new.
+        #expect(linked.contains("WestP1") && linked.contains("WestP2"))
+        #expect(linked.filter { $0.hasPrefix("B") }.count == 1)
+
+        let journeys = RaptorRouter(timetable: timetable).journeys(
+            from: [StopAccess(stop: timetable.stop("Red1"))], to: [StopAccess(stop: timetable.stop("Blue1"))], departure: eight)
+        #expect(journeys.map(timetable.describe).first == ["Red Red1>NorthP @0", "Blue WestP1>Blue1 @1200"])
+    }
+
+    @Test func aStationAlsoMeansTheStationsAFiveMinuteWalkAway() {
+        let timetable = Self.farragut()
+        let place = timetable.samePlace(feedID: "metro", stopID: "North")
+        #expect(place.map { timetable.stops[$0.stop].id } == ["NorthP", "WestP1", "WestP2"])
+        #expect(place[0].meters == 0)
+        #expect(place[1].meters > 150 && place[1].meters < Timetable.samePlaceMeters)
+
+        let neighbors = timetable.stationsInSamePlace(feedID: "metro", stopID: "North")
+        #expect(neighbors.map(\.station.id) == ["West"])
+        #expect(timetable.stationsInSamePlace(feedID: "metro", stopID: "Far").isEmpty)
+    }
+
+    @Test func aStopAlsoMeansTheOtherLinesAShortWalkAway() {
+        // LaGuardia Terminal B: the Q90 and Q70 stop at separate curbs 30 m apart; another Q90 stop is further along.
+        var bus = FeedBuilder(feedID: "bus")
+        bus.stop("Q90-B", latitude: 40.7730, longitude: -73.8710)
+        bus.stop("Q70-B", latitude: 40.7733, longitude: -73.8710)
+        bus.stop("Q90-C", latitude: 40.7736, longitude: -73.8710)
+        bus.stop("Q72-Far", latitude: 40.7800, longitude: -73.8710) // ~780 m: not a short walk
+        for id in ["Q90-End", "Woodside", "Q72-End"] { bus.stop(id, latitude: 41 + Double(bus.data.stops.count) / 10) }
+        bus.line("Q90", starts: [eight], stops: [("Q90-B", 0), ("Q90-C", 60), ("Q90-End", 1200)])
+        bus.line("Q70", starts: [eight], stops: [("Q70-B", 0), ("Woodside", 600)])
+        bus.line("Q72", starts: [eight], stops: [("Q72-Far", 0), ("Q72-End", 600)])
+        bus.data.routes = bus.data.routes.map { RouteBadge(name: $0.name, type: 3) }
+        let timetable = Timetable(feeds: [bus.data])
+
+        let points = timetable.boardingPoints(feedID: "bus", stopID: "Q90-B")
+        // The Q70's curb, but not the Q90's own next stop (nothing new) or the Q72 (too far).
+        #expect(points.map { timetable.stops[$0.stop].id } == ["Q90-B", "Q70-B"])
+        #expect(points[1].meters > 20 && points[1].meters < 50)
+        // Station boards still only look for other stations.
+        #expect(timetable.samePlace(feedID: "bus", stopID: "Q90-B").map { timetable.stops[$0.stop].id } == ["Q90-B"])
+    }
+
+    @Test func namesTheAgencysFreeTransferBetweenSeparateStations() {
+        var metro = FeedBuilder(feedID: "wmata-rail")
+        metro.stop("STN_A02", latitude: 38.9031, longitude: -77.0397)
+        metro.stop("PF_A02_C", latitude: 38.9031, longitude: -77.0397, parent: "STN_A02")
+        metro.stop("STN_C03", latitude: 38.9013, longitude: -77.0405)
+        metro.stop("PF_C03_1", latitude: 38.9013, longitude: -77.0405, parent: "STN_C03")
+        metro.stop("STN_C02", latitude: 38.9013, longitude: -77.0335)
+        metro.stop("PF_C02_1", latitude: 38.9013, longitude: -77.0335, parent: "STN_C02")
+        metro.line("Red", starts: [eight], stops: [("PF_A02_C", 0), ("PF_C02_1", 600)])
+        let timetable = Timetable(feeds: [metro.data])
+        let (north, west, mcpherson) = (timetable.stop("PF_A02_C"), timetable.stop("PF_C03_1"), timetable.stop("PF_C02_1"))
+
+        #expect(timetable.freeTransfer(from: north, to: west)?.label == "Farragut Crossing: free with SmarTrip within 30 min")
+        #expect(timetable.freeTransfer(from: west, to: north)?.name == "Farragut Crossing")
+        #expect(timetable.freeTransfer(from: north, to: mcpherson) == nil)
+        #expect(timetable.freeTransfer(from: north, to: north) == nil)
     }
 
     @Test func separatesOvertakingTripsIntoLanes() {
@@ -340,4 +490,24 @@ private extension Timetable {
         #expect(fromB.board == 1000)
         #expect(fromB.arrive == 1300)
     }
+}
+
+@Test func loganShuttlesTakeTheBlueLineToTheTerminalsDayAndNight() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("logan-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let feedID = "boston-airport-links"
+    let library = FeedLibrary(directory: directory)
+    _ = try await library.install(feedID: feedID, files: BuiltInFeeds.files(for: feedID))
+    let day = ServiceDay(date: 20260921, weekday: 0, offsetSeconds: 0)
+    let timetable = Timetable(feeds: await library.timetableData(for: [day], feedIDs: [feedID]))
+
+    func next(at hour: Double) -> [String] {
+        timetable.departures(feedID: feedID, stopID: "bos-blue", toward: (feedID, "bos-a"),
+                             from: Date(timeIntervalSince1970: hour * 3600), within: 900, limit: 20).map(\.route.name)
+    }
+    // By day the 22 and the 88; late at night the 55 stands in for the 22. The 33 never goes to Terminal A.
+    #expect(Set(next(at: 10)) == ["22", "88"])
+    #expect(Set(next(at: 23)) == ["55", "88"])
+    #expect(timetable.departures(feedID: feedID, stopID: "bos-blue", toward: (feedID, "bos-e"),
+                                 from: Date(timeIntervalSince1970: 10 * 3600), within: 900, limit: 20).contains { $0.route.name == "33" })
 }

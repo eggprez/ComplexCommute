@@ -27,6 +27,13 @@ public actor FeedLibrary {
         return try await finishInstall(feedID: feedID)
     }
 
+    /// Installs a feed the app carries itself (see `BuiltInFeeds`), replacing any installed copy.
+    public nonisolated func install(feedID: String, files: [String: String]) async throws -> FeedInfo {
+        let url = await prepareInstall(feedID: feedID)
+        try GTFSImporter.importFeed(files: files, to: url, feedID: feedID)
+        return try await finishInstall(feedID: feedID)
+    }
+
     private func prepareInstall(feedID: String) -> URL {
         scanIfNeeded()
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

@@ -4,6 +4,8 @@ import SwiftUI
 import WidgetKit
 
 /// The trip in progress, wherever the app isn't: Lock Screen, Dynamic Island, and the Watch's Smart Stack.
+/// Everywhere, the Arrive By bar comes first and biggest; the next instruction and the departures from a
+/// change are what's under it.
 struct TripLiveActivity: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: TripActivityAttributes.self) { context in
@@ -18,24 +20,43 @@ struct TripLiveActivity: Widget {
                         .padding(.leading, 4)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    Text(glance.progress.map { "by \($0.target.clockTime)" } ?? glance.destination)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .padding(.trailing, 4)
+                    Group {
+                        if let progress = glance.progress {
+                            Text("\(progress.shortDelta) · by \(progress.target.clockTime)")
+                                .foregroundStyle(tint)
+                        } else {
+                            Text(glance.destination)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .padding(.trailing, 4)
                 }
                 DynamicIslandExpandedRegion(.bottom) {
                     VStack(alignment: .leading, spacing: 8) {
                         if let progress = glance.progress {
-                            ArriveByTrack(progress: progress, height: 10)
+                            ArriveByTrack(progress: progress, height: 10, labels: .none)
                         }
-                        InstructionRow(instruction: glance.instruction)
+                        InstructionRow(instruction: glance.instruction, showsDetail: glance.connections == nil)
+                        if let board = glance.connections {
+                            ConnectionBoardRow(board: board, badgeHeight: 16, showsStation: false)
+                        }
+                        TripActionsRow(glance: glance)
                     }
                     .padding(.horizontal, 4)
                 }
             } compactLeading: {
-                InstructionIcon(instruction: glance.instruction, size: 20)
-                    .foregroundStyle(tint)
+                // The bar in miniature; the step's icon only when there's no arrival time to measure against.
+                if let progress = glance.progress {
+                    ArriveByTrack(progress: progress, height: 5, labels: .none)
+                        .frame(width: 40)
+                        .padding(.leading, 2)
+                } else {
+                    InstructionIcon(instruction: glance.instruction, size: 20)
+                        .foregroundStyle(tint)
+                }
             } compactTrailing: {
                 if let progress = glance.progress {
                     Text(progress.shortDelta)
@@ -66,7 +87,8 @@ private struct TripActivityView: View {
     var body: some View {
         switch family {
         case .small:
-            small
+            WristActivityView(glance: glance, isStale: isStale)
+                .activityBackgroundTint(glance.progress.map { $0.standing.tint.opacity(0.22) })
         default:
             lockScreen
                 .activityBackgroundTint(glance.progress.map { $0.standing.tint.opacity(0.16) })
@@ -78,66 +100,37 @@ private struct TripActivityView: View {
             VStack(alignment: .leading, spacing: 7) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     StandingLabel(glance: glance)
-                        .font(.subheadline.weight(.semibold))
+                        .font(glance.progress == nil ? .system(.title3, design: .rounded, weight: .bold) : .headline)
                     Spacer(minLength: 0)
                     Group {
                         if isStale, !glance.isFinished {
                             Text("Open Commute to update")
+                                .foregroundStyle(.secondary)
                         } else if let progress = glance.progress {
                             Text("\(progress.deltaDescription) · by \(progress.target.clockTime)")
+                                .foregroundStyle(progress.standing.tint)
                         } else {
                             Text(glance.destination)
+                                .foregroundStyle(.secondary)
                         }
                     }
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                    .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
                 }
                 if let progress = glance.progress {
-                    ArriveByTrack(progress: progress)
+                    ArriveByTrack(progress: progress, height: 14)
                 }
             }
-            InstructionRow(instruction: glance.instruction)
+            // Room is tight on the Lock Screen: the departures stand in for the instruction's detail, which
+            // they say more usefully ("then Q" becomes when each Q goes).
+            InstructionRow(instruction: glance.instruction, showsDetail: glance.connections == nil)
+            if let board = glance.connections {
+                ConnectionBoardRow(board: board)
+            }
+            TripActionsRow(glance: glance)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
-        .opacity(isStale && !glance.isFinished ? 0.6 : 1)
-    }
-
-    /// The Watch's Smart Stack: the bar, and one line for what comes next.
-    private var small: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 4) {
-                StandingLabel(glance: glance)
-                    .font(.caption.weight(.semibold))
-                Spacer(minLength: 0)
-                if let progress = glance.progress {
-                    Text(progress.shortDelta)
-                        .font(.caption.weight(.semibold))
-                        .monospacedDigit()
-                        .foregroundStyle(progress.standing.tint)
-                        .accessibilityLabel(progress.deltaDescription)
-                }
-            }
-            if let progress = glance.progress {
-                ArriveByTrack(progress: progress, height: 8)
-            }
-            HStack(spacing: 5) {
-                InstructionIcon(instruction: glance.instruction, size: 18)
-                Text(glance.instruction.title)
-                    .font(.footnote.weight(.semibold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-            }
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(glance.instruction.spokenTitle)
-            DeadlineText(instruction: glance.instruction)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
         .opacity(isStale && !glance.isFinished ? 0.6 : 1)
     }
 }
@@ -158,6 +151,36 @@ private struct StandingLabel: View {
     }
 }
 
+/// The manual backup to motion and geofences: say you're at the station or on the train, or answer the
+/// app's question about which train, straight from the Lock Screen.
+private struct TripActionsRow: View {
+    let glance: TripGlance
+
+    var body: some View {
+        if !glance.actions.isEmpty, !glance.isFinished {
+            HStack(spacing: 8) {
+                if let prompt = glance.prompt {
+                    Text(prompt)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+                Spacer(minLength: 0)
+                ForEach(glance.actions, id: \.self) { action in
+                    Button(intent: TripActionIntent(action)) {
+                        Label(action.title, systemImage: action.symbol)
+                            .font(.footnote.weight(.semibold))
+                            .lineLimit(1)
+                    }
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
+                    .tint(action == .missed || action == .rejectTrain ? .secondary : .accentColor)
+                }
+            }
+        }
+    }
+}
+
 private struct TintedIconLabelStyle: LabelStyle {
     let tint: Color
 
@@ -171,20 +194,21 @@ private struct TintedIconLabelStyle: LabelStyle {
 
 private struct InstructionRow: View {
     let instruction: TripInstruction
+    var showsDetail = true
 
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
-            InstructionIcon(instruction: instruction, size: 30)
-            VStack(alignment: .leading, spacing: 2) {
+            InstructionIcon(instruction: instruction, size: 26)
+            VStack(alignment: .leading, spacing: 1) {
                 Text(instruction.title)
-                    .font(.headline)
+                    .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
                     .accessibilityLabel(instruction.spokenTitle)
                 DeadlineText(instruction: instruction)
                     .font(.footnote)
                     .lineLimit(1)
-                if let detail = instruction.detail {
+                if showsDetail, let detail = instruction.detail {
                     Text(detail)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -206,6 +230,15 @@ private struct InstructionRow: View {
     TripGlance(destination: "Office",
                instruction: TripInstruction(kind: .travel, mode: .drive, title: "Drive to Metropark", detail: "Then NEC 8:42 AM · tight", deadline: .now + 600),
                arrival: .now + 3_600, arriveBy: .now + 3_100)
+    TripGlance(destination: "Office",
+               instruction: TripInstruction(kind: .ride, mode: .transit, title: "Exit at Canal St", detail: "2 stops · then Q",
+                                            route: RouteLabel(name: "6", colorHex: "00933C", textColorHex: "FFFFFF"), deadline: .now + 240),
+               arrival: .now + 1_500, arriveBy: .now + 1_560,
+               connections: ConnectionBoard(station: "Canal St", toward: "57 St", departures: [
+                   .init(route: RouteLabel(name: "N", colorHex: "FCCC0A", textColorHex: "000000"), time: .now + 360, isRealtime: true),
+                   .init(route: RouteLabel(name: "Q", colorHex: "FCCC0A", textColorHex: "000000"), time: .now + 540, isRealtime: true, isPlanned: true),
+                   .init(route: RouteLabel(name: "Q", colorHex: "FCCC0A", textColorHex: "000000"), time: .now + 1_020),
+               ]))
     TripGlance(destination: "Office",
                instruction: TripInstruction(kind: .ride, mode: .transit, title: "Exit at 57 St", detail: "3 stops · then walk to Office",
                                             route: RouteLabel(name: "Q", colorHex: "FCCC0A", textColorHex: "000000"), deadline: .now + 540),

@@ -51,16 +51,38 @@ public struct TripTemplate: Codable, Hashable, Sendable {
 
     public private(set) var waypoints: [Waypoint]
     public private(set) var modes: [TravelMode]
+    /// Transit services (feed ids) the rider doesn't want to ride on this trip, e.g. buses or a pricier
+    /// commuter railroad. Transit legs are routed as if these schedules weren't installed.
+    public var excludedFeedIDs: Set<String>
 
     public init() {
         waypoints = []
         modes = []
+        excludedFeedIDs = []
     }
 
-    public init(waypoints: [Waypoint], modes: [TravelMode]) {
+    public init(waypoints: [Waypoint], modes: [TravelMode], excludedFeedIDs: Set<String> = []) {
         precondition(modes.count == max(0, waypoints.count - 1), "need exactly one mode between each pair of waypoints")
         self.waypoints = waypoints
         self.modes = modes
+        self.excludedFeedIDs = excludedFeedIDs
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case waypoints, modes, excludedFeedIDs
+    }
+
+    /// Commutes saved before services could be turned off have no exclusions.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        waypoints = try container.decode([Waypoint].self, forKey: .waypoints)
+        modes = try container.decode([TravelMode].self, forKey: .modes)
+        excludedFeedIDs = try container.decodeIfPresent(Set<String>.self, forKey: .excludedFeedIDs) ?? []
+    }
+
+    /// The part of this trip from waypoint `index` on, keeping the rider's choice of services.
+    public func suffix(from index: Int) -> TripTemplate {
+        TripTemplate(waypoints: Array(waypoints[index...]), modes: Array(modes[index...]), excludedFeedIDs: excludedFeedIDs)
     }
 
     public var isPlannable: Bool { waypoints.count >= 2 }

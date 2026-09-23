@@ -50,10 +50,13 @@ public actor TransitPlanner {
     /// - Parameter bufferSeconds: time to allow between reaching a station (from a drive, a walk or another vehicle)
     ///   and the vehicle leaving, covering parking, fares, stairs and a train that pulls out early.
     ///   A rider `isWaitingAtOrigin` is past the first of those already; changes of vehicle keep theirs.
+    /// - Parameter excludedFeedIDs: services the rider won't ride, left out as if they weren't installed.
     public func options(from origin: Waypoint, to destination: Waypoint, departingAt departure: Date,
-                        bufferSeconds: Int = TransitPlanner.defaultBufferSeconds, isWaitingAtOrigin: Bool = false) async -> [LegOption] {
+                        bufferSeconds: Int = TransitPlanner.defaultBufferSeconds, isWaitingAtOrigin: Bool = false,
+                        excludedFeedIDs: Set<String> = []) async -> [LegOption] {
         let accessBufferSeconds = isWaitingAtOrigin ? 0 : bufferSeconds
-        guard let (scheduled, midnight, key) = await timetable(for: departure, near: [origin.coordinate, destination.coordinate]) else { return [] }
+        guard let (scheduled, midnight, key) = await timetable(for: departure, near: [origin.coordinate, destination.coordinate],
+                                                               excluding: excludedFeedIDs) else { return [] }
         let snapshot = abs(departure.timeIntervalSinceNow) < Self.realtimeHorizon ? await realtime?.snapshot(for: key.feedIDs) : nil
         let timetable = snapshot.map { liveTimetable(scheduled, key: key, snapshot: $0) } ?? scheduled
         let access = stops(for: origin, in: timetable, bufferSeconds: accessBufferSeconds)
@@ -84,11 +87,83 @@ public actor TransitPlanner {
     }
 
     /// What leaves `station` next, across all of its platforms, soonest first. Live where predictions exist.
-    public func departures(from station: StationRef, after date: Date = .now, within horizon: TimeInterval = 2 * 3_600, limit: Int = 400) async -> [StopDeparture] {
-        guard let (scheduled, _, key) = await timetable(for: date, near: [station.coordinate]) else { return [] }
+    /// - Parameter toward: only vehicles that go on to stop there, on whichever line.
+    public func departures(from station: StationRef, toward: StationRef? = nil, after date: Date = .now,
+                           within horizon: TimeInterval = 2 * 3_600, limit: Int = 400) async -> [StopDeparture] {
+        guard let (scheduled, _, key) = await timetable(for: date, near: [station.coordinate], acceptingMore: true) else { return [] }
         let snapshot = abs(date.timeIntervalSinceNow) < Self.realtimeHorizon ? await realtime?.snapshot(for: key.feedIDs) : nil
         let timetable = snapshot.map { liveTimetable(scheduled, key: key, snapshot: $0) } ?? scheduled
-        return timetable.departures(feedID: station.feedID, stopID: station.stopID, from: date, within: horizon, limit: limit)
+        return timetable.departures(feedID: station.feedID, stopID: station.stopID, toward: toward.map { ($0.feedID, $0.stopID) },
+                                    from: date, within: horizon, limit: limit)
+    }
+
+    /// Stations within a five-minute walk of `station`, nearest first, with the walk to each.
+    public func stationsInSamePlace(as station: StationRef, on date: Date = .now) async -> [(station: StationRef, walk: TimeInterval)] {
+        guard let (timetable, _, _) = await timetable(for: date, near: [station.coordinate]) else { return [] }
+        return timetable.stationsInSamePlace(feedID: station.feedID, stopID: station.stopID).map { entry in
+            (StationRef(feedID: entry.station.feedID, stopID: entry.station.id, name: entry.station.name, coordinate: entry.station.coordinate),
+             TimeInterval(Timetable.walkSeconds(forMeters: entry.meters)))
+        }
+    }
+
+    // MARK: Following a train
+
+    /// The network for following `ride`, live where predictions exist, with every way of going its way.
+    private func runs(for ride: Ride, at date: Date) async -> (Timetable, Date, [Timetable.Run])? {
+        guard let board = ride.stops.first?.station, let alight = ride.stops.last?.station,
+              let (scheduled, midnight, key) = await timetable(for: date, near: [board.coordinate, alight.coordinate], acceptingMore: true)
+        else { return nil }
+        let snapshot = abs(date.timeIntervalSinceNow) < Self.realtimeHorizon ? await realtime?.snapshot(for: key.feedIDs) : nil
+        let timetable = snapshot.map { liveTimetable(scheduled, key: key, snapshot: $0) } ?? scheduled
+        let runs = timetable.runs(from: (board.feedID, board.stopID), to: (alight.feedID, alight.stopID))
+        return runs.isEmpty ? nil : (timetable, midnight, runs)
+    }
+
+    /// The same vehicle as `ride`, with its latest times.
+    public func live(_ ride: Ride, at date: Date = .now) async -> Ride? {
+        guard let trip = ride.trip, let (timetable, midnight, runs) = await runs(for: ride, at: date),
+              let (run, index) = timetable.locate(trip, in: runs) else { return nil }
+        return await self.ride(pattern: run.pattern, trip: index, board: run.board, alight: run.alight, in: timetable, midnight: midnight,
+                               walkBefore: ride.walkBefore, freeTransfer: ride.freeTransfer)
+    }
+
+    /// The train the rider's recent location fixes keep pace with, among everything going the way of any of `rides`.
+    public func matchTrain(for rides: [WatchedRide], fixes: [LocationFix], at date: Date = .now) async -> TrainMatch? {
+        var best: (match: Timetable.TripFit, watched: WatchedRide, timetable: Timetable, midnight: Date)?
+        for watched in rides {
+            guard let (timetable, midnight, runs) = await runs(for: watched.ride, at: date),
+                  let fit = timetable.fit(fixes, to: runs) else { continue }
+            if best.map({ fit.offset < $0.match.offset }) ?? true { best = (fit, watched, timetable, midnight) }
+        }
+        guard let best else { return nil }
+        let ride = await self.ride(pattern: best.match.run.pattern, trip: best.match.trip, board: best.match.run.board,
+                                   alight: best.match.run.alight, in: best.timetable, midnight: best.midnight,
+                                   walkBefore: best.watched.ride.walkBefore, freeTransfer: best.watched.ride.freeTransfer)
+        return TrainMatch(ride: ride, rideIndex: best.watched.index, offset: best.match.offset, isConfident: best.match.isConfident)
+    }
+
+    /// Trains going `ride`'s way that leave its boarding station around now, for the rider to say which one they're on.
+    public func trains(like ride: Ride, around date: Date = .now, before: TimeInterval = 20 * 60, after: TimeInterval = 20 * 60) async -> [Ride] {
+        guard let (timetable, midnight, runs) = await runs(for: ride, at: date) else { return [] }
+        let now = Int(date.timeIntervalSince(midnight))
+        var seen = Set<TripRef>()
+        var found: [Ride] = []
+        for run in runs {
+            let pattern = timetable.patterns[run.pattern]
+            for trip in 0..<pattern.tripCount {
+                let leaves = pattern.departure(trip: trip, position: run.board)
+                guard leaves >= now - Int(before), leaves <= now + Int(after), seen.insert(pattern.trips[trip]).inserted else { continue }
+                found.append(await self.ride(pattern: run.pattern, trip: trip, board: run.board, alight: run.alight, in: timetable,
+                                             midnight: midnight, walkBefore: ride.walkBefore, freeTransfer: ride.freeTransfer))
+            }
+        }
+        return found.sorted { $0.board < $1.board }
+    }
+
+    /// Every vehicle going `ride`'s way, where it should be right now.
+    public func vehicles(along ride: Ride, at date: Date = .now) async -> [VehicleEstimate] {
+        guard let (timetable, midnight, runs) = await runs(for: ride, at: date) else { return [] }
+        return timetable.vehicles(on: runs, at: Int(date.timeIntervalSince(midnight)))
     }
 
     // MARK: Timetable
@@ -103,7 +178,10 @@ public actor TransitPlanner {
         return live
     }
 
-    private func timetable(for date: Date, near coordinates: [Coordinate]) async -> (Timetable, Date, CacheKey)? {
+    /// - Parameter acceptingMore: a network already built with other feeds besides will do. Boards only read it, and
+    ///   rebuilding for them would throw away the one the trip in progress is being re-planned with.
+    private func timetable(for date: Date, near coordinates: [Coordinate], excluding excludedFeedIDs: Set<String> = [],
+                           acceptingMore: Bool = false) async -> (Timetable, Date, CacheKey)? {
         let midnight = calendar.startOfDay(for: date)
         let revision = await library.revision
 
@@ -118,10 +196,14 @@ public actor TransitPlanner {
 
         // Yesterday's trips that run past midnight, and tomorrow's early ones so late-night plans can finish.
         let days = [serviceDay(offsetDays: -1, endingAfter: 86_400), today, serviceDay(offsetDays: 1, startingBefore: 8 * 3_600)]
-        let feedIDs = await library.feedIDs(near: coordinates)
+        let feedIDs = await library.feedIDs(near: coordinates).filter { !excludedFeedIDs.contains($0) }
         let key = CacheKey(serviceDate: today.date, libraryRevision: revision, feedIDs: feedIDs)
         if let cache, cache.key == key {
             return (cache.timetable, cache.midnight, key)
+        }
+        if acceptingMore, let cache, cache.key.serviceDate == key.serviceDate, cache.key.libraryRevision == key.libraryRevision,
+           Set(key.feedIDs).isSubset(of: cache.key.feedIDs) {
+            return (cache.timetable, cache.midnight, cache.key)
         }
         let feeds = await library.timetableData(for: days, feedIDs: feedIDs)
         guard !feeds.isEmpty else { return nil }
@@ -133,10 +215,12 @@ public actor TransitPlanner {
     }
 
     private func stops(for waypoint: Waypoint, in timetable: Timetable, bufferSeconds: Int) -> [StopAccess] {
+        // A station stands for the stations a short walk from it too: Farragut North also means the Blue Line at Farragut West.
+        // Any stop also stands for the other lines a short walk away, so the Q90's curb doesn't hide the Q70's.
         if case .stop(let feedID, let stopID) = waypoint.kind {
-            let platforms = timetable.platforms(feedID: feedID, stopID: stopID)
-            if !platforms.isEmpty {
-                return platforms.map { StopAccess(stop: $0, seconds: bufferSeconds) }
+            let place = timetable.boardingPoints(feedID: feedID, stopID: stopID)
+            if !place.isEmpty {
+                return place.map { StopAccess(stop: $0.stop, seconds: Timetable.walkSeconds(forMeters: $0.meters) + bufferSeconds, meters: $0.meters) }
             }
         }
         return timetable.stops(near: waypoint.coordinate, radiusMeters: Self.accessRadiusMeters, limit: Self.accessStopLimit)
@@ -164,7 +248,6 @@ public actor TransitPlanner {
                            snapshot: RealtimeSnapshot?, accessBufferSeconds: Int) async -> LegOption {
         var rides: [Ride] = []
         var alerts: [ServiceAlert] = []
-        let now = Int(Date.now.timeIntervalSince1970)
         var geometry = [origin.coordinate]
         var walkingMeters = journey.walkAfter.meters
 
@@ -173,29 +256,20 @@ public actor TransitPlanner {
             let walkSeconds = ride.walkBefore.seconds - (index == 0 ? accessBufferSeconds : 0)
             let pattern = timetable.patterns[ride.pattern]
             let route = timetable.routes[pattern.route]
-            let calls = (ride.boardPosition...ride.alightPosition).map { position in
-                let stop = timetable.stops[pattern.stops[position]]
-                let seconds = position == ride.boardPosition ? pattern.departure(trip: ride.trip, position: position) : pattern.arrival(trip: ride.trip, position: position)
-                return RideStop(station: StationRef(feedID: stop.feedID, stopID: stop.id, name: stop.name, coordinate: stop.coordinate),
-                                time: midnight.addingTimeInterval(TimeInterval(seconds)))
-            }
-            let board = midnight.addingTimeInterval(TimeInterval(pattern.departure(trip: ride.trip, position: ride.boardPosition)))
-            let scheduledBoard = midnight.addingTimeInterval(TimeInterval(pattern.scheduledDeparture(trip: ride.trip, position: ride.boardPosition)))
             let source = timetable.routeSources[pattern.route]
-            let path = await path(feedID: source.feedID, shape: pattern.shapes[ride.trip], calls: calls)
-            rides.append(Ride(
-                routeName: route.name, routeColorHex: route.colorHex, routeTextColorHex: route.textColorHex, routeType: route.type,
-                headsign: pattern.headsigns[ride.trip],
-                boardStopName: timetable.stops[pattern.stops[ride.boardPosition]].name,
-                alightStopName: timetable.stops[pattern.stops[ride.alightPosition]].name,
-                scheduledBoard: scheduledBoard, board: board,
-                alight: midnight.addingTimeInterval(TimeInterval(pattern.arrival(trip: ride.trip, position: ride.alightPosition))),
-                isRealtime: pattern.isRealtime[ride.trip], stops: calls, walkBefore: TimeInterval(max(0, walkSeconds)), path: path
-            ))
+            let made = await self.ride(pattern: ride.pattern, trip: ride.trip, board: ride.boardPosition, alight: ride.alightPosition,
+                                       in: timetable, midnight: midnight, walkBefore: TimeInterval(max(0, walkSeconds)),
+                                       freeTransfer: index == 0 ? nil : timetable.freeTransfer(from: timetable.patterns[journey.rides[index - 1].pattern].stops[journey.rides[index - 1].alightPosition],
+                                                                                               to: pattern.stops[ride.boardPosition])?.label)
+            rides.append(made)
+            let calls = made.stops
+            let board = made.board
 
-            // Alerts naming this route; when an alert also names stops, only if the ride touches one of them.
+            // Alerts naming this route and in force when it is ridden (an overnight closure says nothing about
+            // the morning); when an alert also names stops, only if the ride touches one of them.
+            let boardsAt = Int(board.timeIntervalSince1970)
             let riddenStops = Set(pattern.stops[ride.boardPosition...ride.alightPosition].flatMap { [timetable.stops[$0].id, timetable.stops[timetable.stops[$0].station].id] })
-            for alert in snapshot?.feeds[source.feedID]?.alerts ?? [] where alert.isActive(at: now) && alert.routeIDs.contains(source.routeID) {
+            for alert in snapshot?.feeds[source.feedID]?.alerts ?? [] where alert.isActive(at: boardsAt) && alert.routeIDs.contains(source.routeID) {
                 guard alert.stopIDs.isEmpty || !alert.stopIDs.isDisjoint(with: riddenStops) else { continue }
                 if let existing = alerts.firstIndex(where: { $0.id == alert.id }) {
                     if !alerts[existing].routeNames.contains(route.name) { alerts[existing].routeNames.append(route.name) }
@@ -221,6 +295,32 @@ public actor TransitPlanner {
             rides: rides,
             walkAfter: TimeInterval(journey.walkAfter.seconds),
             alerts: alerts
+        )
+    }
+
+    /// One trip of a pattern, ridden from one position to another, as the rider sees it.
+    private func ride(pattern index: Int, trip: Int, board: Int, alight: Int, in timetable: Timetable, midnight: Date,
+                      walkBefore: TimeInterval, freeTransfer: String? = nil) async -> Ride {
+        let pattern = timetable.patterns[index]
+        let route = timetable.routes[pattern.route]
+        let calls = (board...alight).map { position in
+            let stop = timetable.stops[pattern.stops[position]]
+            let seconds = position == board ? pattern.departure(trip: trip, position: position) : pattern.arrival(trip: trip, position: position)
+            return RideStop(station: StationRef(feedID: stop.feedID, stopID: stop.id, name: stop.name, coordinate: stop.coordinate),
+                            time: midnight.addingTimeInterval(TimeInterval(seconds)))
+        }
+        let source = timetable.routeSources[pattern.route]
+        let path = await path(feedID: source.feedID, shape: pattern.shapes[trip], calls: calls)
+        return Ride(
+            routeName: route.name, routeColorHex: route.colorHex, routeTextColorHex: route.textColorHex, routeType: route.type,
+            headsign: pattern.headsigns[trip],
+            boardStopName: timetable.stops[pattern.stops[board]].name,
+            alightStopName: timetable.stops[pattern.stops[alight]].name,
+            scheduledBoard: midnight.addingTimeInterval(TimeInterval(pattern.scheduledDeparture(trip: trip, position: board))),
+            board: midnight.addingTimeInterval(TimeInterval(pattern.departure(trip: trip, position: board))),
+            alight: midnight.addingTimeInterval(TimeInterval(pattern.arrival(trip: trip, position: alight))),
+            isRealtime: pattern.isRealtime[trip], stops: calls, walkBefore: walkBefore, path: path,
+            freeTransfer: freeTransfer, trip: pattern.trips[trip]
         )
     }
 
