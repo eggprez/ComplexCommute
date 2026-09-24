@@ -68,7 +68,7 @@ final class TripActivityController {
         var current = Activity<TripActivityAttributes>.activities.first { $0.activityState == .active || $0.activityState == .stale }
         if current == nil {
             guard !glance.isFinished, ActivityAuthorizationInfo().areActivitiesEnabled else { return false }
-            // Refused when the app isn't in front (a trip started from the Watch); `show` tries again.
+            // Refused when the app isn't in front (a trip picked back up in the background); `show` tries again.
             current = try? Activity.request(attributes: TripActivityAttributes(destination: glance.destination), content: content)
         }
         guard let current else { return false }

@@ -45,10 +45,20 @@ public enum GTFSImporter {
     /// cancelled update never damages the feed that is already installed.
     public static func importFeed(zip zipURL: URL, to databaseURL: URL, feedID: String,
                                   progress: (ImportProgress) -> Void = { _ in }) throws {
+        try importFeed(from: ZipArchive(url: zipURL), to: databaseURL, feedID: feedID, progress: progress)
+    }
+
+    /// Imports a feed written out in full, file name to CSV text: one the app carries rather than downloads.
+    public static func importFeed(files: [String: String], to databaseURL: URL, feedID: String) throws {
+        try importFeed(from: InMemoryFiles(files: files), to: databaseURL, feedID: feedID, progress: { _ in })
+    }
+
+    private static func importFeed(from archive: some GTFSFiles, to databaseURL: URL, feedID: String,
+                                   progress: (ImportProgress) -> Void) throws {
         let temporaryURL = databaseURL.appendingPathExtension("importing")
         try? FileManager.default.removeItem(at: temporaryURL)
         do {
-            try build(zip: zipURL, at: temporaryURL, feedID: feedID, progress: progress)
+            try build(archive, at: temporaryURL, feedID: feedID, progress: progress)
             if FileManager.default.fileExists(atPath: databaseURL.path) {
                 _ = try FileManager.default.replaceItemAt(databaseURL, withItemAt: temporaryURL)
             } else {
@@ -60,8 +70,7 @@ public enum GTFSImporter {
         }
     }
 
-    private static func build(zip zipURL: URL, at url: URL, feedID: String, progress: (ImportProgress) -> Void) throws {
-        let archive = try ZipArchive(url: zipURL)
+    private static func build(_ archive: some GTFSFiles, at url: URL, feedID: String, progress: (ImportProgress) -> Void) throws {
         let database = try SQLiteDatabase(url: url)
         // The file is disposable until it's moved into place, so trade durability for speed.
         try database.execute("PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF; PRAGMA page_size = 8192;")
@@ -69,13 +78,13 @@ public enum GTFSImporter {
         try database.execute("BEGIN")
 
         let files = ["routes.txt", "stops.txt", "calendar.txt", "calendar_dates.txt", "shapes.txt", "trips.txt", "stop_times.txt", "transfers.txt", "feed_info.txt"]
-        let totalBytes = max(1, files.reduce(0) { $0 + (archive.entries[$1]?.uncompressedSize ?? 0) })
+        let totalBytes = max(1, files.reduce(0) { $0 + (archive.size(of: $1) ?? 0) })
         var completedBytes = 0
 
         /// Streams one GTFS file through `makeHandler`'s row callback. Returns false if the file is absent.
         @discardableResult
         func load(_ file: String, required: Bool = false, _ makeHandler: (CSVHeader) throws -> (CSVRow) throws -> Void) throws -> Bool {
-            guard let entry = archive.entries[file] else {
+            guard let size = archive.size(of: file) else {
                 if required { throw GTFSImportError.missingFile(file) }
                 return false
             }
@@ -90,7 +99,7 @@ public enum GTFSImporter {
                         handler = try makeHandler(CSVHeader(row))
                     }
                 }
-                try archive.read(file) { chunk in
+                try archive.read(file, chunkSize: 1 << 18) { chunk in
                     try Task.checkCancellation()
                     try parser.parse(chunk, onRow: onRow)
                     bytesRead += chunk.count
@@ -98,7 +107,7 @@ public enum GTFSImporter {
                 }
                 try parser.finish(onRow: onRow)
             }
-            completedBytes += entry.uncompressedSize
+            completedBytes += size
             return true
         }
 
@@ -360,5 +369,36 @@ enum ShapeCoding {
         return stride(from: 0, to: values.count - 1, by: 2).map {
             Coordinate(latitude: Double(values[$0]), longitude: Double(values[$0 + 1]))
         }
+    }
+}
+
+/// Where an import reads a feed's files from.
+protocol GTFSFiles {
+    /// Uncompressed size in bytes, or nil if the feed has no such file.
+    func size(of file: String) -> Int?
+    /// Streams the file's bytes to `body`.
+    @discardableResult
+    func read(_ file: String, chunkSize: Int, _ body: (UnsafeBufferPointer<UInt8>) throws -> Void) throws -> Bool
+}
+
+extension ZipArchive: GTFSFiles {
+    func size(of file: String) -> Int? {
+        entries[file.lowercased()]?.uncompressedSize
+    }
+}
+
+private struct InMemoryFiles: GTFSFiles {
+    let files: [String: String]
+
+    func size(of file: String) -> Int? {
+        files[file]?.utf8.count
+    }
+
+    @discardableResult
+    func read(_ file: String, chunkSize: Int, _ body: (UnsafeBufferPointer<UInt8>) throws -> Void) throws -> Bool {
+        guard let text = files[file] else { return false }
+        var bytes = Array(text.utf8)
+        try bytes.withUnsafeMutableBufferPointer { try body(UnsafeBufferPointer($0)) }
+        return true
     }
 }

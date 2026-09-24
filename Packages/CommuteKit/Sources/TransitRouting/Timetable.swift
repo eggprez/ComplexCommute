@@ -68,6 +68,8 @@ public struct Timetable: Sendable {
         /// What the schedule said, for showing delays and keeping a trip's identity stable.
         let scheduledDepartures: [Int32]
         let isRealtime: [Bool]
+        /// Which scheduled trip each is, for finding the same vehicle again once live times have reordered them.
+        let trips: [TripRef]
 
         var tripCount: Int { headsigns.count }
 
@@ -113,7 +115,13 @@ public struct Timetable: Sendable {
     static let defaultTransferSeconds = 120
     /// Stops this close are linked by a walking transfer even across agencies.
     static let walkLinkRadiusMeters = 400.0
-    static let walkLinksPerStop = 8
+
+    /// Stations within a five-minute walk of each other are one place (Farragut North and Farragut West, Penn Station
+    /// and the subway under it): changing between them on the street is always on offer, and picking one as a
+    /// waypoint takes in the others.
+    public static let samePlaceWalkSeconds = 300
+    /// Straight-line distance a five-minute walk covers.
+    public static var samePlaceMeters: Double { Double(samePlaceWalkSeconds) * walkMetersPerSecond / walkDetourFactor }
 
     /// Streets are rarely straight: real walks run about 30% longer than the crow flies.
     static let walkDetourFactor = 1.3
@@ -122,6 +130,11 @@ public struct Timetable: Sendable {
     /// Estimated walking time for a straight-line distance.
     public static func walkSeconds(forMeters meters: Double) -> Int {
         Int((meters * walkDetourFactor / walkMetersPerSecond).rounded())
+    }
+
+    /// GTFS route types that stop at the curb rather than a station: bus (3), trolleybus (11) and the extended bus types.
+    static func isBus(routeType: Int) -> Bool {
+        routeType == 3 || routeType == 11 || (700..<800).contains(routeType)
     }
 
     public init(feeds: [FeedTimetableData], midnight: Date = Date(timeIntervalSince1970: 0)) {
@@ -186,14 +199,32 @@ public struct Timetable: Sendable {
                 }
             }
         }
-        // 3. Anything within a short walk, which is what connects different agencies.
+        // 3. Anything within a short walk, which is what connects different agencies. Neighbors are chosen by what
+        //    they lead to, not by how close they are: every platform of a station in the same place, and the nearest
+        //    stop of each other pattern. A cap on the nearest few let a street corner full of bus stops hide the
+        //    station across it (Penn Station's LIRR concourse from the 1/2/3, Farragut North from Farragut West).
+        var patternsServing: [[Int]] = Array(repeating: [], count: stops.count)
+        var isStation = [Bool](repeating: false, count: stops.count)
+        for (index, key) in groups.keys.enumerated() {
+            let station = !Self.isBus(routeType: routes[key.route].type)
+            for stop in key.stops {
+                patternsServing[stop].append(index)
+                isStation[stop] = isStation[stop] || station
+            }
+        }
         let grid = StopGrid(stops: servedStops.map { ($0, stops[$0].coordinate) }, cellMeters: Self.walkLinkRadiusMeters)
         for stop in servedStops {
-            let nearby = grid.stops(within: Self.walkLinkRadiusMeters, of: stops[stop].coordinate)
-                .filter { $0.stop != stop && links[stop][$0.stop] == nil }
-                .prefix(Self.walkLinksPerStop)
-            for neighbor in nearby {
-                addLink(stop, neighbor.stop, seconds: Self.walkSeconds(forMeters: neighbor.meters), isStreet: true)
+            let own = Set(patternsServing[stop])
+            var nearestOfPattern = Set<Int>()
+            for neighbor in grid.stops(within: Self.walkLinkRadiusMeters, of: stops[stop].coordinate) where neighbor.stop != stop && links[stop][neighbor.stop] == nil {
+                // Nearest first, so the first stop seen of a pattern is where to catch it.
+                var leadsSomewhereNew = isStation[neighbor.stop] && neighbor.meters <= Self.samePlaceMeters
+                for pattern in patternsServing[neighbor.stop] where !own.contains(pattern) {
+                    leadsSomewhereNew = nearestOfPattern.insert(pattern).inserted || leadsSomewhereNew
+                }
+                if leadsSomewhereNew {
+                    addLink(stop, neighbor.stop, seconds: Self.walkSeconds(forMeters: neighbor.meters), isStreet: true)
+                }
             }
         }
 
@@ -232,7 +263,8 @@ public struct Timetable: Sendable {
                 patterns.append(Pattern(
                     route: group.key.route, stops: group.key.stops, canBoard: group.key.canBoard, canAlight: group.key.canAlight,
                     headsigns: lane.map(\.headsign), shapes: lane.map(\.shape), arrivals: lane.flatMap(\.arrivals), departures: lane.flatMap(\.departures),
-                    scheduledDepartures: lane.flatMap { $0.scheduledDepartures ?? $0.departures }, isRealtime: lane.map { $0.scheduledDepartures != nil }
+                    scheduledDepartures: lane.flatMap { $0.scheduledDepartures ?? $0.departures }, isRealtime: lane.map { $0.scheduledDepartures != nil },
+                    trips: lane.map { TripRef(feedID: $0.feedID, tripID: $0.tripID, serviceDate: $0.serviceDate) }
                 ))
             }
         }
@@ -273,17 +305,85 @@ public struct Timetable: Sendable {
         return stops.indices.filter { stops[$0].station == station && !patternsAtStop[$0].isEmpty }
     }
 
+    /// A station together with the stations within a five-minute walk of it, which riders treat as one place: every
+    /// boardable stop, with the straight-line distance from the nearest of the station's own platforms (0 for those).
+    /// Bus stops only count when they are what was picked; a station's neighbors are other stations.
+    public func samePlace(feedID: String, stopID: String) -> [(stop: Int, meters: Double)] {
+        let own = platforms(feedID: feedID, stopID: stopID)
+        guard !own.isEmpty else { return [] }
+        let ownStations = Set(own.map { stops[$0].station })
+        var found = own.map { (stop: $0, meters: 0.0) }
+        for index in stops.indices where !ownStations.contains(stops[index].station) && isStation(index) {
+            let meters = own.map { stops[$0].coordinate.distance(to: stops[index].coordinate) }.min() ?? .infinity
+            if meters <= Self.samePlaceMeters {
+                found.append((index, meters))
+            }
+        }
+        return found.sorted { $0.meters < $1.meters }
+    }
+
+    /// Where a rider who picked this station or stop can get on or off: the same place, plus the nearest stop of each
+    /// other line within the same five-minute walk. Picking the Q90's curb at LaGuardia also means the Q70's.
+    public func boardingPoints(feedID: String, stopID: String) -> [(stop: Int, meters: Double)] {
+        let place = samePlace(feedID: feedID, stopID: stopID)
+        guard !place.isEmpty else { return [] }
+        let own = platforms(feedID: feedID, stopID: stopID)
+        let included = Set(place.map(\.stop))
+        var served = Set(place.flatMap { patternsAtStop[$0.stop].map(\.pattern) })
+        let nearby = stops.indices
+            .filter { !included.contains($0) && !patternsAtStop[$0].isEmpty }
+            .map { index in (stop: index, meters: own.map { stops[$0].coordinate.distance(to: stops[index].coordinate) }.min() ?? .infinity) }
+            .filter { $0.meters <= Self.samePlaceMeters }
+            .sorted { $0.meters < $1.meters }
+        var found = place
+        // Nearest first, so the first stop seen of a pattern is where to catch it.
+        for candidate in nearby {
+            let new = patternsAtStop[candidate.stop].filter { served.insert($0.pattern).inserted }
+            if !new.isEmpty { found.append(candidate) }
+        }
+        return found.sorted { $0.meters < $1.meters }
+    }
+
+    /// The other stations in the same place as this one, nearest first, with the walk to each.
+    public func stationsInSamePlace(feedID: String, stopID: String) -> [(station: Stop, meters: Double)] {
+        var seen = Set(platforms(feedID: feedID, stopID: stopID).map { stops[$0].station })
+        return samePlace(feedID: feedID, stopID: stopID).compactMap { entry in
+            let station = stops[entry.stop].station
+            return seen.insert(station).inserted ? (stops[station], entry.meters) : nil
+        }
+    }
+
+    /// The agency's free transfer for getting off at `alight` and walking to board at `board`, when the two are
+    /// separate stations it has one for (Farragut Crossing).
+    public func freeTransfer(from alight: Int, to board: Int) -> FreeTransfer? {
+        let (from, to) = (stops[stops[alight].station], stops[stops[board].station])
+        guard from.feedID == to.feedID else { return nil }
+        return FreeTransfer.between(feedID: from.feedID, from.id, to.id)
+    }
+
+    /// Served by something other than a bus: a platform rather than a curb.
+    func isStation(_ stop: Int) -> Bool {
+        patternsAtStop[stop].contains { !Self.isBus(routeType: routes[patterns[$0.pattern].route].type) }
+    }
+
     /// What leaves a station next, across all of its platforms, soonest first.
-    public func departures(feedID: String, stopID: String, from date: Date, within horizon: TimeInterval, limit: Int) -> [StopDeparture] {
+    /// - Parameter toward: only vehicles that go on to let riders off at this station, whatever their line.
+    public func departures(feedID: String, stopID: String, toward: (feedID: String, stopID: String)? = nil,
+                           from date: Date, within horizon: TimeInterval, limit: Int) -> [StopDeparture] {
         let earliest = Int(date.timeIntervalSince(midnight))
         let latest = earliest + Int(horizon)
+        let destination = toward.map { Set(platforms(feedID: $0.feedID, stopID: $0.stopID).map { stops[$0].station }) }
+        if let destination, destination.isEmpty { return [] }
 
         var departures: [StopDeparture] = []
         for platform in platforms(feedID: feedID, stopID: stopID) {
             for (patternIndex, position) in patternsAtStop[platform] {
                 let pattern = patterns[patternIndex]
-                guard position < pattern.stops.count - 1, pattern.canBoard[position],
-                      var trip = pattern.earliestTrip(at: position, notBefore: earliest, limit: pattern.tripCount) else { continue }
+                guard position < pattern.stops.count - 1, pattern.canBoard[position] else { continue }
+                if let destination, !pattern.stops.indices.dropFirst(position + 1).contains(where: {
+                    pattern.canAlight[$0] && destination.contains(stops[pattern.stops[$0]].station)
+                }) { continue }
+                guard var trip = pattern.earliestTrip(at: position, notBefore: earliest, limit: pattern.tripCount) else { continue }
                 let lastStop = stops[pattern.stops[pattern.stops.count - 1]].name
                 while trip < pattern.tripCount, pattern.departure(trip: trip, position: position) <= latest {
                     departures.append(StopDeparture(

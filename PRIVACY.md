@@ -15,9 +15,17 @@ about you stays on your iPhone.
   is read by the app on your device and never leaves it. The app does not record location
   history. While a trip is in progress, and only then, the app keeps reading your location with
   the screen locked so the trip on your Lock Screen and Apple Watch stays current; this stops
-  when the trip ends.
+  when the trip ends. During a trip the app also asks iOS to watch the station you're heading
+  for and the end of the leg you're on, so it notices you arriving or leaving even when closed.
+  Those places are removed when the trip moves on or ends.
+- **Your motion.** During a trip only, the app reads whether your iPhone's motion sensor thinks
+  you're walking, driving or on a vehicle, to notice when you park and when your train pulls out.
+  It is used on your device, never stored, and never leaves it.
+- **Directions.** When you ask for turn-by-turn directions, the place you are heading to is handed
+  to the maps app you chose, Apple Maps or Google Maps, which then works under its own privacy
+  policy. Nothing else about your trip goes with it.
 - **The trip in progress.** Kept on your iPhone so it can be picked back up if the app is
-  closed, shown in a Live Activity, and sent directly to your own paired Apple Watch.
+  closed and shown in a Live Activity, which iOS also shows on your own paired Apple Watch.
 - **Your commutes and saved places.** Stored locally on your iPhone using Apple's SwiftData.
   They are not uploaded anywhere.
 - **Agency API keys.** If you add a key to receive realtime arrivals, it is stored in the iOS
@@ -36,6 +44,8 @@ schedules, realtime arrivals, and service alerts:
 - Port Authority Trans-Hudson (PATH)
 - Maryland Transit Administration (MARC)
 - Virginia Railway Express (VRE)
+- Massachusetts Bay Transportation Authority (MBTA)
+- Metropolitan Atlanta Rapid Transit Authority (MARTA)
 
 These requests ask for public timetable and service data. They do not include your identity,
 your location, or your trip. Any API key you have entered is sent only to the agency that

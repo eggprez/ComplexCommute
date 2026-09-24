@@ -5,7 +5,7 @@ import TransitRouting
 struct RootView: View {
     static let collapsed = PresentationDetent.height(88)
     /// Room for the Arrive By bar above the trip's stats, so pulling the sheet down still shows both.
-    static let collapsedWithTarget = PresentationDetent.height(148)
+    static let collapsedWithTarget = PresentationDetent.height(198)
     static let half = PresentationDetent.fraction(0.45)
 
     /// The smallest the sheet goes, which depends on whether there is an arrival time to show.
@@ -32,6 +32,8 @@ struct RootView: View {
                 HomeSheetView(planner: planner, detent: $detent)
                     .presentationDetents([Self.collapsed(withTarget: hasTarget), Self.half, .large], selection: $detent)
                     .presentationBackgroundInteraction(.enabled(upThrough: Self.half))
+                    // Clear glass takes on the map's colors under it, and the sheet is mostly text.
+                    .presentationBackground(Color(.systemGroupedBackground))
                     .interactiveDismissDisabled()
                     .environment(transitData)
                     .environment(router)

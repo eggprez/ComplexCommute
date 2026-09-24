@@ -8,10 +8,11 @@ nonisolated struct CommuteLegResolver: LegResolving {
     let mapKit: MapKitLegResolver
     let transit: TransitPlanner
 
-    func options(from: Waypoint, to: Waypoint, mode: TravelMode, departingAt: Date, isWaitingAtOrigin: Bool) async throws -> [LegOption] {
+    func options(from: Waypoint, to: Waypoint, mode: TravelMode, departingAt: Date, isWaitingAtOrigin: Bool,
+                 excludedFeedIDs: Set<String>) async throws -> [LegOption] {
         if mode == .transit {
             let routed = await transit.options(from: from, to: to, departingAt: departingAt, bufferSeconds: StationBuffer.seconds,
-                                               isWaitingAtOrigin: isWaitingAtOrigin)
+                                               isWaitingAtOrigin: isWaitingAtOrigin, excludedFeedIDs: excludedFeedIDs)
             if !routed.isEmpty {
                 return routed
             }

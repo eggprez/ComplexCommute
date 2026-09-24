@@ -66,10 +66,6 @@ extension MKMapItem {
         address?.shortAddress ?? address?.fullAddress
     }
 
-    var isTransit: Bool {
-        pointOfInterestCategory == .publicTransport
-    }
-
     /// "Coffee Shop" from "MKPOICategoryCoffeeShop"; MapKit offers no display name of its own.
     var categoryName: String? {
         guard let raw = pointOfInterestCategory?.rawValue else { return nil }

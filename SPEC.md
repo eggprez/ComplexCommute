@@ -11,6 +11,8 @@ with Apple Maps for maps/driving/walking and agency GTFS feeds for transit.
 | Usage | Saved recurring commutes **and** ad-hoc planning, both first-class. Commutes **save themselves** as they are built and edited; one-off trips save on request |
 | NYC systems | MTA Subway, MTA Bus, LIRR, Metro-North, NJ Transit (rail + bus), PATH |
 | DC systems | WMATA Metrorail, WMATA Metrobus, MARC, VRE |
+| Boston systems | MBTA (subway, bus, Commuter Rail, ferry) — one feed, realtime without a key (added 2026-09-21) |
+| Atlanta systems | MARTA (rail, bus, Atlanta Streetcar) — one feed; realtime covers buses only (added 2026-09-21) |
 | Architecture | **All on-device** — GTFS static in local SQLite, on-device routing, direct realtime polling. No backend |
 | API keys | **User-supplied**, per agency, in Settings; stored in Keychain; agency is schedule-only/disabled until key added |
 | Platform | iPhone only, **iOS 26+**, SwiftUI, current system design language (Liquid Glass, standard components) |
@@ -26,7 +28,7 @@ with Apple Maps for maps/driving/walking and agency GTFS feeds for transit.
 | Home screen | Full-screen map + resizable bottom sheet (Apple Maps style) |
 | Storage | SwiftData + CloudKit sync for commutes/places; API keys in Keychain (not synced via CloudKit) |
 | Project | XcodeGen (`project.yml`) + local Swift package for logic, unit-tested from CLI |
-| v1 extras | Service alerts, leave-by notifications, a Live Activity and a companion Watch app in v1. Home Screen widgets: later |
+| v1 extras | Service alerts, leave-by notifications and a Live Activity in v1; on Apple Watch, the Live Activity in the Smart Stack rather than a Watch app (decided 2026-09-21). Home Screen widgets: later |
 | Outside the app | Leg-level instructions only on the Lock Screen and the Watch (no turn-by-turn); a trip with no arrive-by shows its arrival time where the bar would be; kept current by background location, not push (decided 2026-09-20) |
 
 ## Key platform constraint
@@ -74,10 +76,15 @@ Packages/CommuteKit/
 - Routing: **RAPTOR** (round-based; naturally yields fewest-transfer vs. earliest-arrival
   Pareto options), footpath transfers from `transfers.txt` + proximity. On real data (subway + PATH)
   the day's timetable builds in ~0.4 s once per service day and a query takes ~10 ms.
+- **Same place** (2026-09-21): stations within a five-minute walk count as one place. They are always linked on
+  foot, a station waypoint takes in its neighbors, and departure boards list theirs too (Farragut North ↔ Farragut West).
+  Proximity links keep the nearest stop of each pattern within 400 m rather than the 8 nearest stops, which let bus
+  stops crowd out stations. Out-of-station transfers per city, and the check to run when adding a city, are in
+  [TRANSFERS.md](TRANSFERS.md) (`Scripts/nearby-stations.py`).
 - Known data issue: PATH's official feed calendar ended 2026-06-01; feeds past their calendar reuse the
   same weekday of their final published week and are flagged in Transit Data.
 - Realtime: GTFS-RT TripUpdates/Alerts where available; WMATA + MTA Bus Time JSON APIs otherwise.
-- Feeds are downloaded per region on demand (user enables NYC and/or DC), refreshed periodically.
+- Feeds are downloaded per region on demand (user enables NYC, DC, Boston and/or Atlanta), refreshed periodically.
 
 ## Agency feed notes
 
@@ -91,6 +98,8 @@ Packages/CommuteKit/
 | WMATA Rail + Bus | GTFS (needs key, `api_key` header) | GTFS-RT + predictions JSON | WMATA key |
 | MARC | GTFS (MTA Maryland) | GTFS-RT | none |
 | VRE | GTFS | limited | none |
+| AirTrain JFK | GTFS from 511NY (not the Port Authority) | none | none |
+| Airport links | **Built in** (`BuiltInFeeds`): AirTrain Newark, Massport Logan shuttles 22/33/55/88, BWI rail station shuttle, ATL SkyTrain — headway-based, generated on the phone | none | none |
 
 Static URLs verified 2026-09-19 and live in `FeedCatalog.swift`. Realtime details get verified in phase 4.
 
@@ -177,7 +186,7 @@ Static URLs verified 2026-09-19 and live in `FeedCatalog.swift`. Realtime detail
 9. ✅ **The trip, wherever the app isn't** (2026-09-20) —
    - `TripGlance` (CommuteCore): the Arrive By standing plus one leg-level `TripInstruction` — leave, drive/walk to,
      board, change (with the walk across), exit (stops left, what follows), arrived — each with the deadline it counts
-     down to. Pure and unit-tested; it is the Live Activity's content state and the heart of what the Watch is sent.
+     down to. Pure and unit-tested; it is the Live Activity's content state.
    - Live Activity (`ComplexCommuteWidgets`): the Arrive By bar and the next instruction on the Lock Screen, in the
      Dynamic Island (line bullet or mode symbol · minutes early/late), and, through `.supplementalActivityFamilies([.small])`,
      in the Watch's Smart Stack. Countdowns are timer text so they tick between updates; five minutes without a word
@@ -186,20 +195,47 @@ Static URLs verified 2026-09-19 and live in `FeedCatalog.swift`. Realtime detail
    - Following a trip no longer depends on a view: `TripPlannerModel` owns the follow loop and takes fixes straight from
      `LocationService`, which holds a `CLBackgroundActivitySession` (background mode `location`, still When In Use)
      for as long as the trip lasts. `AppServices.tripDidChange` is the one place a change fans out to the Live Activity,
-     the Watch and the disk.
+     the disk.
    - Survives being closed: `ActiveTrip` is Codable and `ActiveTripStore` rewrites it whenever what it shows changes.
      Launch picks it back up (unless finished or 30 min past its arrival), re-adopts the Live Activity still on the
      Lock Screen, and opens straight onto the trip.
-   - Watch app (`ComplexCommuteWatch`, companion over WatchConnectivity; `WatchLink.swift` is the whole protocol):
-     the bar, the next instruction, what's still to come, and the rider's side of things — I'm at…, missed this train,
-     switch to a faster option, end the trip — plus starting a saved commute, which the phone plans and sets off on.
-     The latest state rides in the application context, with a message on top when the Watch app is in front.
-   - `Shared/` holds the SwiftUI that has to look the same in all three targets (the bar's track, bullets, mode styling).
-   Known limits: iOS only lets a Live Activity and background location *begin* with the app in front, so a trip started
-   from the Watch with the phone app closed is planned and started but goes stale until the app is opened once (the Watch
-   says so, and the phone raises a notification); spoken turns still stop with the screen locked (needs background audio).
+   - Apple Watch: no Watch app (removed 2026-09-21). iOS mirrors the Live Activity into the Smart Stack, and the
+     `.small` family draws `WristActivityView`.
+   - The Arrive By bar leads every presentation (decided 2026-09-21): first and largest on the Lock Screen, the Watch
+     and the expanded Dynamic Island, a miniature bar in the compact leading slot beside minutes early/late. The next
+     instruction, its countdown and the departures from a change sit under it. Without an arrive-by, the expected
+     arrival takes the bar's place. The Watch has room for the bar and one line under it, so no departures there.
+   - `Shared/` holds the SwiftUI that has to look the same in the app and the widget extension (the bar's track, bullets, mode styling).
+   Known limits: iOS only lets a Live Activity and background location *begin* with the app in front.
 
-10. **Later** — Home Screen widgets, spoken guidance with the screen locked, haptics on the Watch.
+10. ✅ **Leave the turns to the maps apps** (2026-09-20) —
+   - In-app navigation is gone (the maneuver banner, `VoiceGuide`, step lists, the heading-up camera, `RouteStep`/`RouteProgress`,
+     off-route re-routing). A drive, a walk, or the walk to a platform is handed to Apple Maps or Google Maps
+     (`DirectionsApp`, a universal link for Google; tap = the app used last, hold = the other; also under Transit Data ›
+     Directions In). The trip carries on being followed from the background, the Live Activity and the Watch; the 20-second
+     re-plan measures what's left from wherever the rider really is.
+   - Arrive By bar, redrawn: ±30 min (`ArriveByProgress.scale`), painted with its bands (`span(of:)`), a dotted line on the
+     target, "−30 min"/"+30 min" at the ends, and a ball that takes the colour of the band it is in. In the app it is a card
+     of its own at the head of the trip. The same track, without end labels, on the Dynamic Island and the Watch.
+   - `RaptorRouter.stayingAboard`: where two lines share stops before parting, a change onto the train *behind* the one
+     boarded is folded into waiting for that train where the rider got on. (RAPTOR's fewer-rides tie-break already avoids this
+     in the cases tested; the fold guarantees it.)
+
+11. ✅ **Changes and airports** (2026-09-21) —
+   - Next departures at a change: within `ActiveTrip.changeLookahead` (5 min) of boarding — getting off for another
+     vehicle, reaching a station by road or on foot, a street crossing like Farragut North → West (inside a transit leg or
+     as its own walk leg), or waiting on the platform — `upcomingChange` names the station and where the next vehicle is
+     ridden to. `AppServices` looks up `TransitPlanner.departures(from:toward:)` (every line that stops there, not just the
+     planned one; reusing the trip's timetable) every 30 s, and `TripGlance.connections` carries the next three still
+     catchable (after the walk across) to the Lock Screen, Dynamic Island and Watch: planned one bold, live times green.
+   - Airports: DCA/IAD (Metrorail), MARTA Airport, SL1 and LGA's Q70/M60 were already in agency feeds. AirTrain JFK is
+     downloaded from 511NY. Links with no published schedule are `BuiltInFeeds`: written out as GTFS on the phone,
+     installed with their city, rebuilt when `BuiltInFeeds.version` changes, stops placed on the stations they meet so
+     walking links join them to the rest. Loops are laid out as station→terminals and terminals→station halves.
+   Known limits: built-in times are estimates on headways; AirTrain Newark's 2026 weekday bus replacement (5 AM–3 PM,
+   through mid-Nov) and Terminal A's shuttle from the P2 station aren't modelled.
+
+12. **Later** — Home Screen widgets.
 
 ## Design guidelines
 

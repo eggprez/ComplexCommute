@@ -13,7 +13,8 @@ private struct FakeResolver: LegResolving {
     var headway: TimeInterval = 600
     var unroutable: Set<TravelMode> = []
 
-    func options(from: Waypoint, to: Waypoint, mode: TravelMode, departingAt: Date, isWaitingAtOrigin: Bool) async throws -> [LegOption] {
+    func options(from: Waypoint, to: Waypoint, mode: TravelMode, departingAt: Date, isWaitingAtOrigin: Bool,
+                 excludedFeedIDs: Set<String>) async throws -> [LegOption] {
         guard !unroutable.contains(mode) else { return [] }
         switch mode {
         case .drive:
@@ -53,8 +54,27 @@ private struct FakeResolver: LegResolving {
     @Test func roundTripsThroughJSON() throws {
         var template = TripTemplate(waypoints: [.currentLocation(), waypoint("Station")], modes: [.drive])
         template.append(Waypoint(name: "Stop", coordinate: Coordinate(latitude: 1, longitude: 2), kind: .stop(feedID: "mta", stopID: "127")), mode: .transit)
+        template.excludedFeedIDs = ["njt-bus"]
         let decoded = try JSONDecoder().decode(TripTemplate.self, from: JSONEncoder().encode(template))
         #expect(decoded == template)
+    }
+
+    @Test func commutesSavedBeforeServiceChoicesUseEveryService() throws {
+        var json = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(
+            TripTemplate(waypoints: [waypoint("A"), waypoint("B")], modes: [.transit], excludedFeedIDs: ["path"]))) as? [String: Any])
+        json["excludedFeedIDs"] = nil
+        let decoded = try JSONDecoder().decode(TripTemplate.self, from: JSONSerialization.data(withJSONObject: json))
+        #expect(decoded.excludedFeedIDs.isEmpty)
+        #expect(decoded.waypoints.map(\.name) == ["A", "B"])
+    }
+
+    @Test func theRestOfATripKeepsItsServiceChoices() {
+        let template = TripTemplate(waypoints: [waypoint("A"), waypoint("B"), waypoint("C")], modes: [.walk, .transit],
+                                    excludedFeedIDs: ["mta-lirr"])
+        let rest = template.suffix(from: 1)
+        #expect(rest.waypoints.map(\.name) == ["B", "C"])
+        #expect(rest.modes == [.transit])
+        #expect(rest.excludedFeedIDs == ["mta-lirr"])
     }
 }
 
@@ -107,37 +127,6 @@ private struct FakeResolver: LegResolving {
         let itineraries = try await ChainPlanner(resolver: FakeResolver()).plan(template, departingAt: t0)
         let tags = ChainPlanner.tags(for: itineraries)
         #expect(tags[itineraries[0].id] == [.fastest])
-    }
-}
-
-@Suite struct RouteProgressTests {
-    /// North 1.1 km to a left turn, then west about 850 m to the destination.
-    private static let steps = [
-        RouteStep(instruction: "", distanceMeters: 0, geometry: [Coordinate(latitude: 40, longitude: -74)]),
-        RouteStep(instruction: "Turn left onto Main St", distanceMeters: 1_113,
-                  geometry: [Coordinate(latitude: 40, longitude: -74), Coordinate(latitude: 40.01, longitude: -74)]),
-        RouteStep(instruction: "Arrive at the destination", distanceMeters: 853,
-                  geometry: [Coordinate(latitude: 40.01, longitude: -74), Coordinate(latitude: 40.01, longitude: -74.01)]),
-    ]
-
-    @Test func skipsTheEmptyStartStepAndMeasuresToTheTurn() throws {
-        let progress = try #require(RouteProgress(steps: Self.steps, location: Coordinate(latitude: 40.005, longitude: -74.0001)))
-        #expect(progress.stepIndex == 1)
-        #expect(abs(progress.metersToManeuver - 556) < 5)
-        #expect(abs(progress.metersRemaining - 1_409) < 10)
-        #expect(progress.metersOffRoute < 12)
-    }
-
-    @Test func movesOnOnceTheTurnIsReached() throws {
-        let progress = try #require(RouteProgress(steps: Self.steps, location: Coordinate(latitude: 40.00995, longitude: -74)))
-        #expect(progress.stepIndex == 2)
-        #expect(abs(progress.metersToManeuver - 858) < 10)
-    }
-
-    @Test func reportsBeingOffRoute() throws {
-        let progress = try #require(RouteProgress(steps: Self.steps, location: Coordinate(latitude: 40.005, longitude: -73.997)))
-        #expect(progress.metersOffRoute > 200)
-        #expect(RouteProgress(steps: [], location: Coordinate(latitude: 40, longitude: -74)) == nil)
     }
 }
 

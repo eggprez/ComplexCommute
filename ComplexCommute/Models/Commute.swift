@@ -31,10 +31,6 @@ final class Commute {
         set { arriveByMinutes = newValue?.minutes }
     }
 
-    /// How the Watch names this commute when it asks for it to be started. Not stored, so nothing about
-    /// the synced model changes: the moment it was made is as good as unique.
-    var watchID: String { String(createdAt.timeIntervalSinceReferenceDate.bitPattern) }
-
     /// "Home to Office", or "To Office" for commutes that start wherever the rider is.
     static func defaultName(for template: TripTemplate) -> String {
         guard let first = template.waypoints.first, let last = template.waypoints.last, template.isPlannable else { return "New Commute" }

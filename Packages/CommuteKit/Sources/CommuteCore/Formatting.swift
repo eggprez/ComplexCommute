@@ -28,3 +28,10 @@ extension ArriveByProgress {
         }
     }
 }
+
+extension Double {
+    /// Metres as the road signs would put it: "400 ft", "1.2 mi".
+    public var roadDistance: String {
+        Measurement(value: self, unit: UnitLength.meters).formatted(.measurement(width: .abbreviated, usage: .road))
+    }
+}

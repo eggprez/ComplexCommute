@@ -46,6 +46,11 @@ public struct Ride: Codable, Hashable, Sendable {
     public var stops: [RideStop]
     /// Walking time from the previous ride (or the leg's start) to the boarding stop.
     public var walkBefore: TimeInterval
+    /// Set when reaching this ride means leaving one station and entering another under the agency's free
+    /// transfer: "Farragut Crossing: free with SmarTrip within 30 min".
+    public var freeTransfer: String?
+    /// The scheduled trip this is, so the very same vehicle can be looked up again for live times.
+    public var trip: TripRef?
 
     /// Where the vehicle actually runs between boarding and exit: the agency's published shape when it has one,
     /// otherwise straight lines from stop to stop.
@@ -58,7 +63,10 @@ public struct Ride: Codable, Hashable, Sendable {
 
     public init(routeName: String, routeColorHex: String? = nil, routeTextColorHex: String? = nil, routeType: Int = 1,
                 headsign: String? = nil, boardStopName: String, alightStopName: String, scheduledBoard: Date, board: Date,
-                alight: Date, isRealtime: Bool = false, stops: [RideStop] = [], walkBefore: TimeInterval = 0, path: [Coordinate]? = nil) {
+                alight: Date, isRealtime: Bool = false, stops: [RideStop] = [], walkBefore: TimeInterval = 0, path: [Coordinate]? = nil,
+                freeTransfer: String? = nil, trip: TripRef? = nil) {
+        self.freeTransfer = freeTransfer
+        self.trip = trip
         self.routeName = routeName
         self.routeColorHex = routeColorHex
         self.routeTextColorHex = routeTextColorHex
@@ -108,14 +116,12 @@ public struct LegOption: Codable, Hashable, Sendable {
     public var walkAfter: TimeInterval
     public var alerts: [ServiceAlert]
     public var summary: String?
-    /// Turn-by-turn maneuvers for drive and walk legs.
-    public var steps: [RouteStep]
     /// True when times are a coarse estimate rather than a concrete schedule.
     public var isEstimate: Bool
 
     public init(mode: TravelMode, departure: Date, arrival: Date, distanceMeters: Double? = nil, walkingMeters: Double = 0,
                 geometry: [Coordinate] = [], rides: [Ride] = [], walkAfter: TimeInterval = 0, alerts: [ServiceAlert] = [],
-                summary: String? = nil, steps: [RouteStep] = [], isEstimate: Bool = false) {
+                summary: String? = nil, isEstimate: Bool = false) {
         self.mode = mode
         self.departure = departure
         self.arrival = arrival
@@ -126,7 +132,6 @@ public struct LegOption: Codable, Hashable, Sendable {
         self.walkAfter = walkAfter
         self.alerts = alerts
         self.summary = summary
-        self.steps = steps
         self.isEstimate = isEstimate
     }
 

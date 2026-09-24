@@ -1,8 +1,11 @@
+import CommuteCore
 import Foundation
 
 public enum TransitRegion: String, CaseIterable, Identifiable, Sendable {
     case nyc
     case dc
+    case boston
+    case atlanta
 
     public var id: String { rawValue }
 
@@ -10,7 +13,25 @@ public enum TransitRegion: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .nyc: "New York City"
         case .dc: "Washington, DC"
+        case .boston: "Boston"
+        case .atlanta: "Atlanta"
         }
+    }
+
+    /// Roughly the middle of the city's network, for telling which city a trip is in.
+    public var center: Coordinate {
+        switch self {
+        case .nyc: Coordinate(latitude: 40.75, longitude: -73.99)
+        case .dc: Coordinate(latitude: 38.90, longitude: -77.03)
+        case .boston: Coordinate(latitude: 42.36, longitude: -71.06)
+        case .atlanta: Coordinate(latitude: 33.75, longitude: -84.39)
+        }
+    }
+
+    /// The cities a trip through `coordinates` could use. Far enough to take in the commuter railroads'
+    /// outer ends, near enough that neighboring cities don't overlap.
+    public static func near(_ coordinates: [Coordinate], radiusMeters: Double = 150_000) -> [TransitRegion] {
+        allCases.filter { region in coordinates.contains { $0.distance(to: region.center) <= radiusMeters } }
     }
 }
 
@@ -84,10 +105,11 @@ public struct FeedDescriptor: Identifiable, Hashable, Sendable {
     public let name: String
     public let detail: String
     public let region: TransitRegion
-    public let staticURL: URL
+    /// Nil for a feed the app carries itself (`BuiltInFeeds`), built on the phone instead of downloaded.
+    public let staticURL: URL?
     public let auth: Auth
     /// Zip size in MB when last checked (2026-09); the imported database is several times larger.
-    public let downloadMB: Double?
+    public let downloadMB: Double
     /// Realtime uses the same credentials as the schedule.
     public var realtime: RealtimeSource?
     /// How long an installed copy is used before the app fetches a newer one on its own.
@@ -97,8 +119,11 @@ public struct FeedDescriptor: Identifiable, Hashable, Sendable {
         if case .header(_, let key) = auth { key } else { nil }
     }
 
-    public func request(apiKey: String?) -> URLRequest {
-        request(for: staticURL, apiKey: apiKey)
+    public var isBuiltIn: Bool { staticURL == nil }
+
+    /// Nil for a built-in feed, which has nothing to download.
+    public func request(apiKey: String?) -> URLRequest? {
+        staticURL.map { request(for: $0, apiKey: apiKey) }
     }
 
     public func request(for url: URL, apiKey: String?) -> URLRequest {
@@ -111,7 +136,7 @@ public struct FeedDescriptor: Identifiable, Hashable, Sendable {
 }
 
 public enum FeedCatalog {
-    public static let feeds: [FeedDescriptor] = nyc + dc
+    public static let feeds: [FeedDescriptor] = nyc + dc + boston + atlanta
 
     public static func feeds(in region: TransitRegion) -> [FeedDescriptor] {
         feeds.filter { $0.region == region }
@@ -119,6 +144,16 @@ public enum FeedCatalog {
 
     public static func feed(id: String) -> FeedDescriptor? {
         feeds.first { $0.id == id }
+    }
+
+    /// Everything a city's download fetches, in MB. Cities are installed whole, never a service at a time.
+    public static func downloadMB(for region: TransitRegion) -> Double {
+        feeds(in: region).reduce(0) { $0 + $1.downloadMB }
+    }
+
+    /// Keys a city needs before it can be downloaded.
+    public static func requiredKeys(for region: TransitRegion) -> [APIKeyID] {
+        Array(Set(feeds(in: region).compactMap(\.requiredKey))).sorted { $0.rawValue < $1.rawValue }
     }
 
     private static let mtaRealtime = "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/"
@@ -159,22 +194,49 @@ public enum FeedCatalog {
         mta("mta-bus-queens", "Queens Buses", "MTA New York City Transit", file: "gtfs_q", mb: 6.8, realtime: busRealtime),
         mta("mta-bus-staten-island", "Staten Island Buses", "MTA New York City Transit", file: "gtfs_si", mb: 7.5, realtime: busRealtime),
         mta("mta-bus-company", "MTA Bus Company", "Express and former private-line routes", file: "gtfs_busco", mb: 9.6, realtime: busRealtime),
+        // Published by 511NY rather than the Port Authority. LaGuardia's Q70 and M60 are in the MTA bus feeds.
+        FeedDescriptor(id: "airtrain-jfk", name: "AirTrain JFK", detail: "Port Authority, via 511NY", region: .nyc,
+                       staticURL: URL(string: "https://s3.amazonaws.com/datatools-511ny/public/AirTrain_JFK.zip")!, auth: .none, downloadMB: 0.1),
+        BuiltInFeeds.descriptor(.nyc, name: "AirTrain Newark", detail: "Built in: publishes no schedule"),
     ]
 
     private static let dc: [FeedDescriptor] = [
         FeedDescriptor(id: "wmata-rail", name: "Metrorail", detail: "WMATA", region: .dc,
                        staticURL: URL(string: "https://api.wmata.com/gtfs/rail-gtfs-static.zip")!,
-                       auth: .header(name: "api_key", key: .wmata), downloadMB: nil,
+                       // Estimated: WMATA only serves the file with a key, so it hasn't been measured.
+                       auth: .header(name: "api_key", key: .wmata), downloadMB: 3,
                        realtime: RealtimeSource(tripUpdates: ["https://api.wmata.com/gtfs/rail-gtfsrt-tripupdates.pb"],
                                                 alerts: ["https://api.wmata.com/gtfs/rail-gtfsrt-alerts.pb"])),
         FeedDescriptor(id: "wmata-bus", name: "Metrobus", detail: "WMATA", region: .dc,
                        staticURL: URL(string: "https://api.wmata.com/gtfs/bus-gtfs-static.zip")!,
-                       auth: .header(name: "api_key", key: .wmata), downloadMB: nil,
+                       // Estimated, as for Metrorail.
+                       auth: .header(name: "api_key", key: .wmata), downloadMB: 30,
                        realtime: RealtimeSource(tripUpdates: ["https://api.wmata.com/gtfs/bus-gtfsrt-tripupdates.pb"],
                                                 alerts: ["https://api.wmata.com/gtfs/bus-gtfsrt-alerts.pb"], maxAge: 60)),
         FeedDescriptor(id: "marc", name: "MARC Train", detail: "Maryland commuter rail", region: .dc,
                        staticURL: URL(string: "https://mdotmta-gtfs.s3.amazonaws.com/mdotmta_gtfs_marc.zip")!, auth: .none, downloadMB: 0.2),
         FeedDescriptor(id: "vre", name: "Virginia Railway Express", detail: "Virginia commuter rail", region: .dc,
                        staticURL: URL(string: "https://gtfs.vre.org/containercdngtfsupload/google_transit.zip")!, auth: .none, downloadMB: 0.1),
+        // National and Dulles are Metrorail stations; BWI is a bus ride from its MARC/Amtrak station.
+        BuiltInFeeds.descriptor(.dc, name: "BWI Rail Station Shuttle", detail: "Built in: publishes no schedule"),
+    ]
+
+    private static let boston: [FeedDescriptor] = [
+        // One feed covers the subway, buses, commuter rail and ferries.
+        FeedDescriptor(id: "mbta", name: "MBTA", detail: "Subway, bus, Commuter Rail and ferry", region: .boston,
+                       staticURL: URL(string: "https://cdn.mbta.com/MBTA_GTFS.zip")!, auth: .none, downloadMB: 24.9,
+                       realtime: RealtimeSource(tripUpdates: ["https://cdn.mbta.com/realtime/TripUpdates.pb"],
+                                                alerts: ["https://cdn.mbta.com/realtime/Alerts.pb"])),
+        // SL1 to the terminals is in the MBTA feed; the free shuttles from the Blue Line are Massport's.
+        BuiltInFeeds.descriptor(.boston, name: "Logan Shuttles", detail: "Built in: Massport's free Blue Line shuttles"),
+    ]
+
+    private static let atlanta: [FeedDescriptor] = [
+        // Rail, bus and the Atlanta Streetcar share one feed. Its realtime feed only carries buses.
+        FeedDescriptor(id: "marta", name: "MARTA", detail: "Rail, bus and Atlanta Streetcar", region: .atlanta,
+                       staticURL: URL(string: "https://itsmarta.com/google_transit_feed/google_transit.zip")!, auth: .none, downloadMB: 18.6,
+                       realtime: RealtimeSource(tripUpdates: ["https://gtfs-rt.itsmarta.com/TMGTFSRealTimeWebService/tripupdate/tripupdates.pb"],
+                                                alerts: ["https://gtfs-rt.itsmarta.com/TMGTFSRealTimeWebService/alert/alerts.pb"], maxAge: 60)),
+        BuiltInFeeds.descriptor(.atlanta, name: "ATL SkyTrain", detail: "Built in: Airport to Gateway Center and Rental Car Center"),
     ]
 }

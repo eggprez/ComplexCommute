@@ -38,7 +38,8 @@ private func itinerary(train: TimeInterval = 900, route: String = "A", delay: Ti
     }
 
     @Test func replansTheDriveFromTheCurrentLocationAndStopsDelayingOnceMoving() throws {
-        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary()))
+        // Leaving in 50 minutes: early enough that sitting at home doesn't count as setting out.
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary(train: 3_600, driveStart: 3_000)))
         trip.update(location: home.coordinate, now: t0)
         let waiting = try #require(trip.replanRequest(location: home.coordinate, now: t0))
         #expect(waiting.firstSegment == 0)
@@ -53,6 +54,77 @@ private func itinerary(train: TimeInterval = 900, route: String = "A", delay: Ti
         let driving = try #require(trip.replanRequest(location: onTheRoad, now: t0 + 400))
         #expect(!driving.canDelayDeparture)
         #expect(driving.template.waypoints.first?.coordinate == onTheRoad)
+    }
+
+    @Test func wellAheadOfTimeOnlyGettingClearOfTheStartCountsAsSettingOut() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary(train: 3_600, driveStart: 3_000)))
+        trip.update(location: home.coordinate, now: t0)
+        #expect(trip.canMarkLeaving)
+
+        // 0.1 mi down the street: still just pottering about.
+        trip.update(location: home.coordinate.offset(northMeters: 160), now: t0 + 60)
+        #expect(!trip.isMoving)
+
+        // 0.2 mi: on the way.
+        trip.update(location: home.coordinate.offset(northMeters: 320), now: t0 + 120)
+        #expect(trip.isMoving)
+        #expect(!trip.canMarkLeaving)
+    }
+
+    @Test func withinTwentyMinutesOfLeavingTheTripIsTakenAsStarted() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary(train: 3_600, driveStart: 3_000)))
+        trip.update(location: home.coordinate, now: t0)
+        #expect(!trip.isMoving)
+
+        // Twenty-one minutes out, still at home: waiting.
+        trip.update(location: home.coordinate, now: t0 + 3_000 - 21 * 60)
+        #expect(!trip.isMoving)
+
+        // Twenty minutes out: no need to walk anywhere first.
+        trip.update(location: home.coordinate, now: t0 + 3_000 - 20 * 60)
+        #expect(trip.isMoving)
+        #expect(try #require(trip.replanRequest(location: home.coordinate, now: t0 + 1_800)).canDelayDeparture == false)
+    }
+
+    @Test func sayingImLeavingStartsTheTripFromNow() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary(train: 3_600, driveStart: 3_000)))
+        trip.update(location: home.coordinate, now: t0)
+        trip.markLeaving()
+        #expect(trip.isMoving)
+        let request = try #require(trip.replanRequest(location: home.coordinate, now: t0 + 10))
+        #expect(request.departure == t0 + 10)
+        #expect(!request.canDelayDeparture)
+    }
+
+    @Test func leavingEarlyIsOnlyOfferedBeforeADriveOrWalk() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary(train: 3_600, driveStart: 3_000)))
+        trip.markArrived(now: t0)
+        #expect(trip.currentLeg?.mode == .transit)
+        #expect(!trip.canMarkLeaving)
+    }
+
+    @Test func aTripStartedHoursAheadReplansFromItsOwnTimeNotTheClock() throws {
+        // Started at night for a morning train: re-planning from midnight would swap it for the night buses.
+        let morning: TimeInterval = 8 * 3_600
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary(train: morning + 900, driveStart: morning + 300)))
+        trip.update(location: home.coordinate, now: t0)
+        let athome = try #require(trip.replanRequest(location: home.coordinate, now: t0))
+        #expect(athome.departure == t0 + morning + 300 - ActiveTrip.replanLookahead)
+        #expect(athome.canDelayDeparture)
+
+        // Once the rider sets out, what's left starts now.
+        let onTheRoad = Coordinate(latitude: 40.71, longitude: -74.08)
+        trip.update(location: onTheRoad, now: t0 + 60)
+        #expect(try #require(trip.replanRequest(location: onTheRoad, now: t0 + 60)).departure == t0 + 60)
+    }
+
+    @Test func waitingAtTheStationHoursAheadReplansFromTheTrainsTime() throws {
+        let morning: TimeInterval = 8 * 3_600
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary(train: morning + 900, driveStart: morning + 300)))
+        trip.update(location: stationA.coordinate, now: t0)
+        #expect(trip.currentSegment == 1)
+        let waiting = try #require(trip.replanRequest(location: stationA.coordinate, now: t0))
+        #expect(waiting.departure == t0 + morning + 900 - ActiveTrip.replanLookahead)
     }
 
     @Test func advancesByProximityAndAssumesBoardingWhenTheTrainLeaves() throws {
@@ -401,5 +473,11 @@ extension ActiveTrip.Notice: Equatable {
 extension ActiveTrip.ReplanRequest: Equatable {
     public static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.template == rhs.template && lhs.departure == rhs.departure && lhs.firstSegment == rhs.firstSegment
+    }
+}
+
+private extension Coordinate {
+    func offset(northMeters: Double) -> Coordinate {
+        Coordinate(latitude: latitude + northMeters / 111_320, longitude: longitude)
     }
 }

@@ -38,8 +38,10 @@ struct HomeSheetView: View {
                         picking = .destination
                     } label: {
                         Label("Where to?", systemImage: "magnifyingglass")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Color.secondary)
                     }
+                    // Reads as a search field, not an accent-colored action.
+                    .tint(Color.secondary)
                 }
 
                 Section("Commutes") {
@@ -59,14 +61,14 @@ struct HomeSheetView: View {
                     }
 
                     Button("New Commute", systemImage: "plus") {
-                        open(TripTemplate(waypoints: [.currentLocation()], modes: []), autosaves: true)
+                        open(TripTemplate(waypoints: [.currentLocation()], modes: [], excludedFeedIDs: ServiceChoice.lastExcluded), autosaves: true)
                     }
                 }
 
                 Section("Places") {
                     ForEach(places) { place in
                         Button {
-                            open(TripTemplate(waypoints: [.currentLocation(), place.waypoint], modes: [.transit]))
+                            open(TripTemplate(waypoints: [.currentLocation(), place.waypoint], modes: [.transit], excludedFeedIDs: ServiceChoice.lastExcluded))
                         } label: {
                             Label {
                                 Text(place.name)
@@ -88,6 +90,8 @@ struct HomeSheetView: View {
                     }
                 }
             }
+            // Rows otherwise show through the title bar as they scroll under it.
+            .scrollEdgeEffectStyle(.hard, for: .top)
             .navigationTitle("Commute")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -100,10 +104,8 @@ struct HomeSheetView: View {
                 case .trip(let commute, let autosaves):
                     TripView(planner: planner, commute: commute, autosaves: autosaves, restoreSheet: { detent = RootView.half }, onStart: {
                         path.append(.activeTrip)
-                        // Navigation happens on the map; don't leave it buried under a full-height sheet.
-                        // Setting off by car, a driver wants the road and the numbers, nothing else.
-                        detent = planner.isNavigating && planner.guidedLeg?.mode == .drive
-                            ? RootView.collapsed(withTarget: planner.active?.arriveBy != nil) : RootView.half
+                        // The trip is on the map; don't leave it buried under a full-height sheet.
+                        detent = RootView.half
                     })
                 case .activeTrip:
                     ActiveTripView(planner: planner, onEdit: {
@@ -119,7 +121,7 @@ struct HomeSheetView: View {
                 }
             }
         }
-        // A trip can begin without this screen's say-so: picked back up at launch, or started from the Watch.
+        // A trip can begin without this screen's say-so: picked back up at launch.
         .onChange(of: planner.active != nil, initial: true) { _, isActive in
             if isActive, !path.contains(.activeTrip) { path = [.activeTrip] }
         }
@@ -175,7 +177,7 @@ struct HomeSheetView: View {
         picked = nil
         switch purpose {
         case .destination:
-            open(TripTemplate(waypoints: [.currentLocation(), waypoint], modes: [.transit]))
+            open(TripTemplate(waypoints: [.currentLocation(), waypoint], modes: [.transit], excludedFeedIDs: ServiceChoice.lastExcluded))
         case .newPlace:
             placeName = waypoint.name
             placeBeingNamed = waypoint
@@ -192,9 +194,13 @@ private struct CommuteRow: View {
                 Text(commute.name)
                     .font(.headline)
                 if let arriveBy = commute.nextArriveBy {
-                    Label(arriveBy.formatted(date: .omitted, time: .shortened), systemImage: "target")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    // Not a Label: in a List row its icon is pushed out to the row's icon column.
+                    HStack(spacing: 3) {
+                        Image(systemName: "target")
+                        Text("by \(arriveBy.formatted(date: .omitted, time: .shortened))")
+                    }
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
                 }
             }
             chain
@@ -207,7 +213,7 @@ private struct CommuteRow: View {
 
     private var chain: Text {
         let template = commute.template
-        guard let first = template.waypoints.first else { return Text("Empty") }
+        guard let first = template.waypoints.first else { return Text("No stops yet") }
         return template.segments.reduce(Text(first.name)) { text, segment in
             Text("\(text) \(Image(systemName: segment.mode.symbol)) \(segment.to.name)")
         }

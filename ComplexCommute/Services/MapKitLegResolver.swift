@@ -2,7 +2,7 @@ import CommuteCore
 import CoreLocation
 import MapKit
 
-/// Resolves drive and walk legs, with their turn-by-turn steps, from MapKit directions. MapKit exposes no transit steps, only an ETA,
+/// Resolves drive and walk legs from MapKit directions. MapKit exposes no transit steps, only an ETA,
 /// so transit legs are a coarse estimate until the GTFS router replaces them.
 nonisolated struct MapKitLegResolver: LegResolving {
     private let cache: RouteCache
@@ -12,8 +12,10 @@ nonisolated struct MapKitLegResolver: LegResolving {
         cache = RouteCache()
     }
 
+    /// MapKit's transit estimate can't be told which services to leave out.
     @MainActor
-    func options(from: Waypoint, to: Waypoint, mode: TravelMode, departingAt: Date, isWaitingAtOrigin: Bool = false) async throws -> [LegOption] {
+    func options(from: Waypoint, to: Waypoint, mode: TravelMode, departingAt: Date, isWaitingAtOrigin: Bool = false,
+                 excludedFeedIDs: Set<String> = []) async throws -> [LegOption] {
         if let cached = cache.option(from: from.coordinate, to: to.coordinate, mode: mode, departingAt: departingAt) {
             return [cached]
         }
@@ -35,8 +37,7 @@ nonisolated struct MapKitLegResolver: LegResolving {
                 distanceMeters: route.distance,
                 walkingMeters: mode == .walk ? route.distance : 0,
                 geometry: route.polyline.coordinates,
-                summary: route.name.isEmpty ? nil : route.name,
-                steps: route.steps.map { RouteStep(instruction: $0.instructions, distanceMeters: $0.distance, geometry: $0.polyline.coordinates) }
+                summary: route.name.isEmpty ? nil : route.name
             )
         case .transit:
             request.transportType = .transit
@@ -50,19 +51,24 @@ nonisolated struct MapKitLegResolver: LegResolving {
                 isEstimate: true
             )
         }
-        cache.store(option, from: from.coordinate, to: to.coordinate)
+        cache.store(option, from: from.coordinate, to: to.coordinate, departingAt: departingAt)
         return [option]
     }
 }
 
 /// MapKit throttles directions requests, and live re-planning asks for the same legs repeatedly.
 /// Walking time doesn't depend on when you leave; driving is reused briefly, then refreshed for traffic.
+/// Setting the request's departure date is what gets MapKit to price in traffic, live or predicted, so a
+/// drive is only reused for departures in the same quarter hour: an arrive-by plan made the night before
+/// has to ask about rush hour, not borrow tonight's empty roads.
 @MainActor
 private final class RouteCache {
     private struct Key: Hashable {
         var from: Coordinate
         var to: Coordinate
         var mode: TravelMode
+        /// Which quarter hour a drive sets out in; nil for walks.
+        var slot: Int?
     }
 
     private struct Entry {
@@ -74,7 +80,7 @@ private final class RouteCache {
 
     func option(from: Coordinate, to: Coordinate, mode: TravelMode, departingAt: Date) -> LegOption? {
         guard let lifetime = lifetime(for: mode),
-              let entry = entries[Key(from: from.rounded, to: to.rounded, mode: mode)],
+              let entry = entries[key(from: from, to: to, mode: mode, departingAt: departingAt)],
               Date.now.timeIntervalSince(entry.storedAt) < lifetime else { return nil }
         var option = entry.option
         option.arrival = departingAt.addingTimeInterval(option.duration)
@@ -82,10 +88,17 @@ private final class RouteCache {
         return option
     }
 
-    func store(_ option: LegOption, from: Coordinate, to: Coordinate) {
+    func store(_ option: LegOption, from: Coordinate, to: Coordinate, departingAt: Date) {
         guard lifetime(for: option.mode) != nil else { return }
-        entries[Key(from: from.rounded, to: to.rounded, mode: option.mode)] = Entry(option: option, storedAt: .now)
+        entries[key(from: from, to: to, mode: option.mode, departingAt: departingAt)] = Entry(option: option, storedAt: .now)
     }
+
+    private func key(from: Coordinate, to: Coordinate, mode: TravelMode, departingAt: Date) -> Key {
+        Key(from: from.rounded, to: to.rounded, mode: mode,
+            slot: mode == .drive ? Int(departingAt.timeIntervalSince1970 / Self.trafficSlot) : nil)
+    }
+
+    private static let trafficSlot: TimeInterval = 15 * 60
 
     private func lifetime(for mode: TravelMode) -> TimeInterval? {
         switch mode {

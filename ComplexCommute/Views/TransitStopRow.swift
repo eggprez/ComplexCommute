@@ -62,7 +62,7 @@ struct RouteBadgeView: View {
         Text(route.name)
             .font(size.font)
             .lineLimit(1)
-            .foregroundStyle(Color(hex: route.textColorHex) ?? (route.colorHex == nil ? Color.primary : Color.white))
+            .foregroundStyle(Color(hex: route.textColorHex) ?? Color.readable(on: route.colorHex) ?? Color.primary)
             .padding(.horizontal, route.name.count <= 2 ? 0 : size.height * 0.3)
             .frame(minWidth: size.height, minHeight: size.height)
             .background(fill, in: .rect(cornerRadius: route.name.count <= 2 ? size.height / 2 : size.height * 0.28))
