@@ -27,11 +27,13 @@ private func line() -> Timetable {
     return Timetable(feeds: [data])
 }
 
-/// Where the line is `meters` north of A, at `seconds` after 8:00.
-private func fix(_ meters: Double, at seconds: Int, accuracy: Double = 30) -> LocationFix {
+/// Where the line is `meters` north of A, at `seconds` after 8:00, going at `speed` (a train's, unless said).
+private func fix(_ meters: Double, at seconds: Int, accuracy: Double = 30, speed: Double? = 12) -> LocationFix {
     LocationFix(coordinate: Coordinate(latitude: 40 + meters / 111_320, longitude: -74),
-                time: Date(timeIntervalSince1970: TimeInterval(eight + seconds)), accuracy: accuracy)
+                time: Date(timeIntervalSince1970: TimeInterval(eight + seconds)), accuracy: accuracy, speed: speed)
 }
+
+private func at(_ seconds: Int) -> Date { Date(timeIntervalSince1970: TimeInterval(eight + seconds)) }
 
 @Suite struct TrainLocatorTests {
     @Test func findsEveryWayOfGoingTheRidersWay() {
@@ -65,6 +67,35 @@ private func fix(_ meters: Double, at seconds: Int, accuracy: Double = 30) -> Lo
         let fitted = try #require(timetable.fit([fix(500, at: 360)], to: timetable.runs(from: ("f", "A"), to: ("f", "E"))))
         #expect(timetable.patterns[fitted.run.pattern].trips[fitted.trip].tripID == "local-300")
         #expect(!fitted.isConfident)
+    }
+
+    @Test func walkingBesideTheTracksSaysNothing() {
+        let timetable = line()
+        let runs = timetable.runs(from: ("f", "A"), to: ("f", "E"))
+        // 1.4 m/s past B just as the 8:05 local does: it fits, but nobody walks onto a moving train.
+        #expect(timetable.fit([fix(1_000, at: 420, speed: 1.4), fix(1_080, at: 480, speed: 1.4)], to: runs) == nil)
+        // No speed from GPS: the distance between fixes says walking just as well.
+        #expect(timetable.fit([fix(1_000, at: 420, speed: nil), fix(1_060, at: 460, speed: nil)], to: runs) == nil)
+        // And the same without GPS speed at a train's pace gets through.
+        #expect(timetable.fit([fix(500, at: 360, speed: nil), fix(1_500, at: 480, speed: nil)], to: runs) != nil)
+    }
+
+    @Test func leavingTheStationTellsTheTrainByTheFirstFix() throws {
+        let timetable = line()
+        let runs = timetable.runs(from: ("f", "A"), to: ("f", "E"))
+        // Left A at 8:05:20 (the geofence lags the doors), one fix just short of B.
+        let fitted = try #require(timetable.fit([fix(800, at: 400)], to: runs, leftStation: at(320)))
+        #expect(timetable.patterns[fitted.run.pattern].trips[fitted.trip].tripID == "local-300")
+        #expect(fitted.isConfident)
+        #expect(fitted.leftStation)
+
+        // Seen on the platform on the fixes alone does just as well.
+        let fromFixes = try #require(timetable.fit([fix(0, at: 290, speed: 0), fix(800, at: 400)], to: runs))
+        #expect(timetable.patterns[fromFixes.run.pattern].trips[fromFixes.trip].tripID == "local-300")
+        #expect(fromFixes.isConfident)
+
+        // Leaving without then moving like a train is just leaving.
+        #expect(timetable.fit([fix(300, at: 400, speed: 1.3)], to: runs, leftStation: at(320)) == nil)
     }
 
     @Test func standingOnThePlatformOrOffTheLineSaysNothing() {

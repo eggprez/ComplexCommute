@@ -111,7 +111,14 @@ struct WristActivityView: View {
                     .accessibilityLabel(instruction.spokenTitle)
                 Spacer(minLength: 2)
                 if let deadline = instruction.deadline {
-                    Text(timerInterval: min(.now, deadline)...deadline, countsDown: true)
+                    // No room for "in 12 minutes": the time itself, until seconds start to matter.
+                    Group {
+                        if instruction.countsSeconds {
+                            Text(timerInterval: min(.now, deadline)...deadline, countsDown: true)
+                        } else {
+                            Text(deadline.clockTime)
+                        }
+                    }
                         .font(.system(.footnote, design: .rounded, weight: .semibold))
                         .monospacedDigit()
                         .multilineTextAlignment(.trailing)

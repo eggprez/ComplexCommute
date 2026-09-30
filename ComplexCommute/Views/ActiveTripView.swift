@@ -421,11 +421,7 @@ struct TrainCheckSection: View {
     let pickTrain: () -> Void
 
     var body: some View {
-        if let suggestion = trip.suggestedTrain {
-            suggestionRow(suggestion.ride)
-        } else if trip.isAskingAboutTrain {
-            movingRow
-        } else if let leg = trip.currentLeg {
+        if let leg = trip.currentLeg {
             if leg.mode == .transit, trip.hasBoarded, let ride = trip.currentRide(at: now), now >= ride.board {
                 aboardRow(ride)
             } else if leg.mode == .transit {
@@ -435,58 +431,6 @@ struct TrainCheckSection: View {
                 Button("I'm Already on the Train", systemImage: "tram.fill", action: pickTrain)
             }
         }
-    }
-
-    private func suggestionRow(_ ride: Ride) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                RouteBadgeView(route: ride.badge, size: .regular)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("On the \(ride.board.clockTime)\(ride.headsign.map { " to \($0)" } ?? "")?")
-                        .font(.headline)
-                    Text("Your location matches this train. Arrive \(ride.alightStopName) \(ride.alight.clockTime).")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            HStack {
-                Button("Yes") { withAnimation { planner.acceptSuggestedTrain() } }
-                    .buttonStyle(.borderedProminent)
-                Button("Different Train") {
-                    planner.rejectSuggestedTrain()
-                    pickTrain()
-                }
-                .buttonStyle(.bordered)
-                Button("Not Yet") { planner.rejectSuggestedTrain() }
-                    .buttonStyle(.borderless)
-            }
-        }
-        .padding(.vertical, 4)
-    }
-
-    /// Motion or leaving the station says the rider is on a train, but the planned one wasn't due.
-    private var movingRow: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("On a Train?")
-                        .font(.headline)
-                    Text("You've started moving from the station, but your planned train isn't due yet.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-            } icon: {
-                Image(systemName: "figure.walk.motion")
-                    .foregroundStyle(.orange)
-            }
-            HStack {
-                Button("Which Train?", action: pickTrain)
-                    .buttonStyle(.borderedProminent)
-                Button("Not Yet") { planner.dismissTrainQuestion() }
-                    .buttonStyle(.bordered)
-            }
-        }
-        .padding(.vertical, 4)
     }
 
     private func aboardRow(_ ride: Ride) -> some View {
@@ -505,7 +449,7 @@ struct TrainCheckSection: View {
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
-            if trip.boardedBy == .schedule || trip.boardedBy == .movement || trip.boardedBy == .riderAboard {
+            if trip.boardedBy == .schedule || trip.boardedBy == .likely || trip.boardedBy == .riderAboard {
                 Button("Confirm") {
                     planner.board(ride, segment: trip.currentSegment, rideIndex: trip.ridingIndex(at: now))
                 }
@@ -522,7 +466,7 @@ extension BoardingEvidence {
     var symbol: String {
         switch self {
         case .schedule: "clock"
-        case .movement: "figure.walk.motion"
+        case .likely: "location"
         case .riderAboard: "hand.raised.fill"
         case .location: "location.fill"
         case .rider: "checkmark.circle.fill"
@@ -532,7 +476,7 @@ extension BoardingEvidence {
     var explanation: String {
         switch self {
         case .schedule: "Assumed from the schedule. Confirm it so times follow your train."
-        case .movement: "You moved off from the station as it was due. Confirm it so times follow your train."
+        case .likely: "Your location fits this train best so far. Still checking at each stop."
         case .riderAboard: "You said you're aboard. Your location will pick out the train, or confirm it here."
         case .location: "Matched to your location. Times follow this train."
         case .rider: "Confirmed by you. Times follow this train."

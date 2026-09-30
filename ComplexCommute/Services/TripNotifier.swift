@@ -18,7 +18,6 @@ final class TripNotifier {
     private enum ID {
         static let leaveNow = "leave-now"
         static let fasterOption = "faster-option"
-        static let whichTrain = "which-train"
     }
 
     var isAuthorized: Bool { authorization == .authorized || authorization == .provisional }
@@ -49,17 +48,6 @@ final class TripNotifier {
         content.sound = .default
         content.interruptionLevel = .timeSensitive
         center.add(UNNotificationRequest(identifier: ID.fasterOption, content: content, trigger: nil))
-    }
-
-    /// The location fits a train, but not clearly enough to act on: ask, since the phone is likely in a pocket.
-    func askAboutTrain(_ ride: Ride) {
-        guard isAuthorized else { return }
-        let content = UNMutableNotificationContent()
-        content.title = "On the \(ride.routeName)?"
-        content.body = "Looks like you're on the \(ride.board.formatted(date: .omitted, time: .shortened)) \(ride.routeName)"
-            + "\(ride.headsign.map { " toward \($0)" } ?? ""). Open Commute to confirm so arrival times follow your train."
-        content.interruptionLevel = .timeSensitive
-        center.add(UNNotificationRequest(identifier: ID.whichTrain, content: content, trigger: nil))
     }
 
     /// Forgets what has been announced, so the next trip starts fresh.

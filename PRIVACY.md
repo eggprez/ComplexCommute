@@ -18,9 +18,6 @@ about you stays on your iPhone.
   when the trip ends. During a trip the app also asks iOS to watch the station you're heading
   for and the end of the leg you're on, so it notices you arriving or leaving even when closed.
   Those places are removed when the trip moves on or ends.
-- **Your motion.** During a trip only, the app reads whether your iPhone's motion sensor thinks
-  you're walking, driving or on a vehicle, to notice when you park and when your train pulls out.
-  It is used on your device, never stored, and never leaves it.
 - **Directions.** When you ask for turn-by-turn directions, the place you are heading to is handed
   to the maps app you chose, Apple Maps or Google Maps, which then works under its own privacy
   policy. Nothing else about your trip goes with it.

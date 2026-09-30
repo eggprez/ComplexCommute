@@ -10,9 +10,6 @@ private let stationB = Waypoint(name: "Station B", coordinate: Coordinate(latitu
 private let platformB = StationRef(feedID: "f", stopID: "B", name: "Station B", coordinate: stationB.coordinate)
 private let office = Waypoint(name: "Office", coordinate: Coordinate(latitude: 40.755, longitude: -73.985))
 
-/// A car park 700 m from the platform: too far for the platform radius, near enough to have parked for it.
-private let carPark = Coordinate(latitude: 40.72 - 700 / 111_320, longitude: -74.05)
-
 /// `first` to Station A 10 min from +5, the 8 train at +15 (20 min), walk 5 min.
 private func trip(first: TravelMode = .drive) throws -> ActiveTrip {
     let ride = Ride(routeName: "A", boardStopName: "Station A", alightStopName: "Station B", scheduledBoard: t0 + 900, board: t0 + 900,
@@ -28,54 +25,6 @@ private func trip(first: TravelMode = .drive) throws -> ActiveTrip {
 }
 
 @Suite struct ModeSensingTests {
-    @Test func walkingAwayFromTheCarNearTheStationEndsTheDrive() throws {
-        var trip = try trip()
-        trip.update(location: home.coordinate, now: t0 + 300)
-        trip.update(motion: .automotive, location: home.coordinate, now: t0 + 400)
-        let moved1 = trip.update(location: carPark, now: t0 + 800)
-        #expect(!moved1)
-        let moved2 = trip.update(motion: .walking, location: carPark, now: t0 + 820)
-        #expect(moved2)
-        #expect(trip.currentLeg?.mode == .transit)
-    }
-
-    @Test func walkingSomewhereElseOnTheWayDoesNot() throws {
-        var trip = try trip()
-        trip.update(motion: .automotive, location: home.coordinate, now: t0 + 400)
-        // A coffee stop halfway there.
-        trip.update(motion: .walking, location: Coordinate(latitude: 40.71, longitude: -74.075), now: t0 + 600)
-        #expect(trip.currentSegment == 0)
-    }
-
-    @Test func movingOffFromThePlatformWhenTheTrainIsDueIsBoarding() throws {
-        var trip = try trip()
-        trip.update(location: home.coordinate, now: t0 + 300)
-        trip.update(location: platformA.coordinate, now: t0 + 840)
-        #expect(trip.currentSegment == 1)
-        trip.update(motion: .stationary, location: platformA.coordinate, now: t0 + 850)
-        trip.update(motion: .automotive, location: nil, now: t0 + 880)
-        #expect(trip.hasBoarded)
-        #expect(trip.boardedBy == .movement)
-        #expect(trip.actions(at: t0 + 900).actions.isEmpty)
-    }
-
-    @Test func movingOffLongBeforeThePlannedTrainAsksWhichTrain() throws {
-        var trip = try trip()
-        trip.update(location: home.coordinate, now: t0 + 100)
-        trip.update(location: platformA.coordinate, now: t0 + 300)
-        trip.update(motion: .automotive, location: nil, now: t0 + 400)
-        #expect(!trip.hasBoarded)
-        #expect(trip.isAskingAboutTrain)
-        let asked = trip.actions(at: t0 + 400)
-        #expect(asked.prompt == "On a train?")
-        #expect(asked.actions == [.aboard, .rejectTrain])
-
-        trip.markAboard(now: t0 + 420)
-        #expect(trip.hasBoarded)
-        #expect(trip.boardedBy == .riderAboard)
-        #expect(!trip.isAskingAboutTrain)
-    }
-
     @Test func theGeofencesFollowTheTrip() throws {
         var trip = try trip()
         #expect(trip.placesToWatch.map(\.id) == ["board.1", "end.0"])
@@ -84,14 +33,17 @@ private func trip(first: TravelMode = .drive) throws -> ActiveTrip {
         #expect(trip.currentSegment == 1)
         #expect(trip.placesToWatch.map(\.id) == ["board.1", "end.1"])
 
-        // Leaving on foot: still waiting.
-        trip.update(motion: .walking, location: nil, now: t0 + 850)
+        // Leaving the station isn't boarding by itself: it's only when, for the matcher to weigh.
         trip.crossed("board.1", entered: false, now: t0 + 860)
         #expect(!trip.hasBoarded)
-
+        #expect(trip.leftStationAt == t0 + 860)
         trip.crossed("board.1", entered: true, now: t0 + 870)
-        trip.update(motion: .automotive, location: nil, now: t0 + 890)
-        trip.crossed("board.1", entered: false, now: t0 + 900)
+        #expect(trip.leftStationAt == nil)
+        trip.crossed("board.1", entered: false, now: t0 + 910)
+        #expect(trip.leftStationAt == t0 + 910)
+
+        trip.apply(TrainMatch(ride: trip.currentLeg!.option.rides[0], rideIndex: 0, offset: 10, isConfident: true, leftStation: true),
+                   segment: 1, now: t0 + 960)
         #expect(trip.hasBoarded)
         #expect(trip.placesToWatch.map(\.id) == ["end.1"])
 
@@ -106,27 +58,7 @@ private func trip(first: TravelMode = .drive) throws -> ActiveTrip {
         #expect(!moved6)
     }
 
-    @Test func steppingOffTheTrainAtTheFarEndEndsTheRide() throws {
-        var trip = try trip()
-        trip.crossed("board.1", entered: true, now: t0 + 800)
-        trip.update(motion: .automotive, location: nil, now: t0 + 900)
-        #expect(trip.hasBoarded)
-        let moved7 = trip.update(motion: .walking, location: stationB.coordinate, now: t0 + 2_080)
-        #expect(moved7)
-        #expect(trip.currentLeg?.mode == .walk)
-    }
-
-    @Test func aWalkThatBecomesATrainRideCatchesUp() throws {
-        var trip = try trip(first: .walk)
-        trip.update(location: home.coordinate, now: t0 + 300)
-        trip.update(motion: .walking, location: home.coordinate, now: t0 + 310)
-        let moved8 = trip.update(motion: .automotive, location: Coordinate(latitude: 40.72 - 300 / 111_320, longitude: -74.05), now: t0 + 880)
-        #expect(moved8)
-        #expect(trip.currentLeg?.mode == .transit)
-        #expect(trip.hasBoarded)
-    }
-
-    @Test func theLockScreenOffersWhatFitsTheMoment() throws {
+    @Test func theDynamicIslandOffersWhatFitsTheMoment() throws {
         var trip = try trip()
         trip.update(location: home.coordinate, now: t0 + 300)
         trip.update(location: Coordinate(latitude: 40.71, longitude: -74.08), now: t0 + 400)
@@ -135,5 +67,17 @@ private func trip(first: TravelMode = .drive) throws -> ActiveTrip {
         #expect(trip.currentSegment == 1)
         #expect(trip.boardedBy == .riderAboard)
         #expect(trip.glance(at: t0 + 950).actions.isEmpty)
+    }
+
+    @Test func secondsAreCountedOnlyRightBeforeATrainLeaves() throws {
+        var trip = try trip()
+        trip.update(location: home.coordinate, now: t0 + 300)
+        trip.update(location: Coordinate(latitude: 40.71, longitude: -74.08), now: t0 + 400)
+        #expect(trip.glance(at: t0 + 400).instruction.kind == .travel)
+        #expect(!trip.glance(at: t0 + 400).instruction.countsSeconds)
+        trip.markArrived(now: t0 + 700)
+        #expect(trip.glance(at: t0 + 700).instruction.kind == .board)
+        #expect(!trip.glance(at: t0 + 700).instruction.countsSeconds)
+        #expect(trip.glance(at: t0 + 790).instruction.countsSeconds)
     }
 }

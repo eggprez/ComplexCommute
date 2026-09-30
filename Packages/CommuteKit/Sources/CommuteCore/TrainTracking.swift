@@ -14,17 +14,43 @@ public struct TripRef: Codable, Hashable, Sendable {
     }
 }
 
-/// A location fix as the train matcher needs it: where, when, and how sure.
+/// A location fix as the train matcher needs it: where, when, how sure, and how fast.
 public struct LocationFix: Codable, Hashable, Sendable {
     public var coordinate: Coordinate
     public var time: Date
     /// Horizontal accuracy in meters.
     public var accuracy: Double
+    /// Meters per second, as GPS measured it; nil where it couldn't say (underground, a first fix).
+    public var speed: Double?
 
-    public init(coordinate: Coordinate, time: Date, accuracy: Double) {
+    public init(coordinate: Coordinate, time: Date, accuracy: Double, speed: Double? = nil) {
         self.coordinate = coordinate
         self.time = time
         self.accuracy = accuracy
+        self.speed = speed
+    }
+
+    /// Faster than anyone walks or runs (11 mph): below this the rider is on foot, whatever line they are beside.
+    public static let vehicleSpeed = 5.0
+}
+
+extension Array where Element == LocationFix {
+    /// The fixes taken moving faster than a run: GPS's own speed where it gave one, otherwise the distance from a
+    /// neighbouring fix, less what either could be out by. Walking beside the tracks never gets through.
+    public func movingLikeAVehicle() -> [LocationFix] {
+        let ordered = sorted { $0.time < $1.time }
+        return ordered.indices.filter { index in
+            let fix = ordered[index]
+            if let speed = fix.speed { return speed >= LocationFix.vehicleSpeed }
+            return [index - 1, index + 1].contains { other in
+                guard ordered.indices.contains(other) else { return false }
+                let seconds = abs(ordered[other].time.timeIntervalSince(fix.time))
+                guard seconds >= 20 else { return false }
+                let meters = fix.coordinate.distance(to: ordered[other].coordinate) - fix.accuracy - ordered[other].accuracy
+                return meters / seconds >= LocationFix.vehicleSpeed
+            }
+        }
+        .map { ordered[$0] }
     }
 }
 
@@ -32,26 +58,19 @@ public struct LocationFix: Codable, Hashable, Sendable {
 public enum BoardingEvidence: String, Codable, Sendable {
     /// The train's departure time passed with nothing to say otherwise.
     case schedule
-    /// The phone started moving like a vehicle as the rider left the station, around when the train was due.
-    case movement
     /// The rider said they're aboard, without saying which train: location can still tell which.
     case riderAboard
+    /// Moving along the line faster than on foot, and this train fits best so far. Checked again at every fix.
+    case likely
     /// Location fixes along the line kept pace with this train and no other.
     case location
     /// The rider picked this train.
     case rider
-}
 
-/// What the phone's motion coprocessor says the rider is doing. A train reads as `automotive`, like a car.
-public enum Motion: String, Codable, Sendable {
-    case stationary
-    case walking
-    case running
-    case cycling
-    case automotive
-    case unknown
-
-    var isOnFoot: Bool { self == .walking || self == .running }
+    /// A trip saved by an earlier version may name a reason there is no longer: it is only as good as the schedule.
+    public init(from decoder: any Decoder) throws {
+        self = Self(rawValue: try decoder.singleValueContainer().decode(String.self)) ?? .schedule
+    }
 }
 
 /// A place worth a geofence while the trip is at this point: the platform the next train leaves from, and
@@ -77,18 +96,12 @@ public enum TripAction: String, Codable, CaseIterable, Sendable {
     case aboard
     /// The train left without them.
     case missed
-    /// Yes to the train the app asked about.
-    case confirmTrain
-    /// No, or not yet.
-    case rejectTrain
 
     public var title: String {
         switch self {
         case .arrived: "At Station"
         case .aboard: "On Train"
         case .missed: "Missed It"
-        case .confirmTrain: "Yes"
-        case .rejectTrain: "No"
         }
     }
 
@@ -97,8 +110,6 @@ public enum TripAction: String, Codable, CaseIterable, Sendable {
         case .arrived: "mappin.and.ellipse"
         case .aboard: "tram.fill"
         case .missed: "figure.wave"
-        case .confirmTrain: "checkmark"
-        case .rejectTrain: "xmark"
         }
     }
 }
@@ -122,27 +133,17 @@ public struct TrainMatch: Hashable, Sendable {
     public var rideIndex: Int
     /// Average seconds between where the fixes put the rider and where this train was at those moments.
     public var offset: TimeInterval
-    /// Clear of every other train, over enough fixes to act on without asking.
+    /// Clear of every other train, over enough fixes to be sure of.
     public var isConfident: Bool
+    /// The rider was seen leaving the boarding station, not just passing along the line somewhere near it.
+    public var leftStation: Bool
 
-    public init(ride: Ride, rideIndex: Int, offset: TimeInterval, isConfident: Bool) {
+    public init(ride: Ride, rideIndex: Int, offset: TimeInterval, isConfident: Bool, leftStation: Bool = false) {
         self.ride = ride
         self.rideIndex = rideIndex
         self.offset = offset
         self.isConfident = isConfident
-    }
-}
-
-/// A train the app thinks the rider may be on, waiting for them to say yes or no.
-public struct TrainSuggestion: Codable, Hashable, Sendable {
-    public var ride: Ride
-    public var segment: Int
-    public var rideIndex: Int
-
-    public init(ride: Ride, segment: Int, rideIndex: Int) {
-        self.ride = ride
-        self.segment = segment
-        self.rideIndex = rideIndex
+        self.leftStation = leftStation
     }
 }
 

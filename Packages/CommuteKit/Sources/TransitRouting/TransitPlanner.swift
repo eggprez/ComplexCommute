@@ -128,18 +128,20 @@ public actor TransitPlanner {
     }
 
     /// The train the rider's recent location fixes keep pace with, among everything going the way of any of `rides`.
-    public func matchTrain(for rides: [WatchedRide], fixes: [LocationFix], at date: Date = .now) async -> TrainMatch? {
+    public func matchTrain(for rides: [WatchedRide], fixes: [LocationFix], leftStation: Date? = nil, at date: Date = .now) async -> TrainMatch? {
         var best: (match: Timetable.TripFit, watched: WatchedRide, timetable: Timetable, midnight: Date)?
         for watched in rides {
             guard let (timetable, midnight, runs) = await runs(for: watched.ride, at: date),
-                  let fit = timetable.fit(fixes, to: runs) else { continue }
+                  // The geofence is round the platform the first of them leaves from; later changes have none.
+                  let fit = timetable.fit(fixes, to: runs, leftStation: watched == rides.first ? leftStation : nil) else { continue }
             if best.map({ fit.offset < $0.match.offset }) ?? true { best = (fit, watched, timetable, midnight) }
         }
         guard let best else { return nil }
         let ride = await self.ride(pattern: best.match.run.pattern, trip: best.match.trip, board: best.match.run.board,
                                    alight: best.match.run.alight, in: best.timetable, midnight: best.midnight,
                                    walkBefore: best.watched.ride.walkBefore, freeTransfer: best.watched.ride.freeTransfer)
-        return TrainMatch(ride: ride, rideIndex: best.watched.index, offset: best.match.offset, isConfident: best.match.isConfident)
+        return TrainMatch(ride: ride, rideIndex: best.watched.index, offset: best.match.offset, isConfident: best.match.isConfident,
+                          leftStation: best.match.leftStation)
     }
 
     /// Trains going `ride`'s way that leave its boarding station around now, for the rider to say which one they're on.

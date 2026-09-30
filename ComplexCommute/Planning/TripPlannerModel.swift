@@ -209,15 +209,7 @@ final class TripPlannerModel {
         active?.follow(itinerary)
     }
 
-    // MARK: Motion, geofences and the Lock Screen
-
-    /// The motion sensor changed its mind about what the rider is doing.
-    func motionDidChange(_ motion: Motion) {
-        guard active != nil else { return }
-        let movedOn = active?.update(motion: motion, location: location.coordinate, now: .now) == true
-        storeRecords()
-        if movedOn { Task { await refreshActiveTrip() } }
-    }
+    // MARK: Geofences and the Lock Screen
 
     /// A station geofence was crossed, possibly with the app woken just to hear it.
     func crossed(_ id: String, entered: Bool, at date: Date) {
@@ -234,10 +226,6 @@ final class TripPlannerModel {
         Task { await refreshActiveTrip() }
     }
 
-    func dismissTrainQuestion() {
-        active?.dismissTrainQuestion()
-    }
-
     /// A button on the Live Activity.
     func perform(_ action: TripAction) {
         switch action {
@@ -249,24 +237,10 @@ final class TripPlannerModel {
         case .missed:
             markMissed()
             Task { await refreshActiveTrip() }
-        case .confirmTrain:
-            if active?.suggestedTrain != nil { acceptSuggestedTrain() } else { markAboard() }
-        case .rejectTrain:
-            if active?.suggestedTrain != nil { rejectSuggestedTrain() } else { dismissTrainQuestion() }
         }
     }
 
     // MARK: Which train
-
-    /// The rider says yes to the train the location suggested.
-    func acceptSuggestedTrain() {
-        active?.acceptSuggestedTrain()
-        Task { await refreshActiveTrip() }
-    }
-
-    func rejectSuggestedTrain() {
-        active?.rejectSuggestedTrain()
-    }
 
     /// The rider picked the train they're on themselves.
     func board(_ ride: Ride, segment: Int, rideIndex: Int) {
@@ -304,13 +278,13 @@ final class TripPlannerModel {
         recentFixes.removeAll { now.timeIntervalSince($0.time) > Self.fixMemory }
         guard !recentFixes.isEmpty else { return }
         lastTrainCheck = now
-        guard let match = await trains.matchTrain(for: watch.rides, fixes: recentFixes, at: now), !Task.isCancelled else { return }
-        let before = active?.suggestedTrain
+        guard let match = await trains.matchTrain(for: watch.rides, fixes: recentFixes, leftStation: active?.leftStationAt, at: now),
+              !Task.isCancelled else { return }
+        let before = active?.currentLeg?.option.rides
         active?.apply(match, segment: watch.segment, now: now)
         storeRecords()
-        if let suggestion = active?.suggestedTrain, suggestion != before {
-            notifier.askAboutTrain(suggestion.ride)
-        }
+        // Now on a different train than was shown: everything after it moves with it.
+        if active?.currentLeg?.option.rides != before { await refreshActiveTrip() }
     }
 
     /// Fresh times for the train the rider is on: the one thing that decides when everything after it happens.

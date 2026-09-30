@@ -16,7 +16,6 @@ final class AppServices {
     let notifier: TripNotifier
     let container: ModelContainer
     let liveActivity = TripActivityController()
-    let motion = MotionService()
     let stations = StationWatcher()
 
     private let tripStore = ActiveTripStore()
@@ -54,7 +53,6 @@ final class AppServices {
         }
 
         location.onUpdate = { [planner] in planner.locationDidChange() }
-        motion.onUpdate = { [planner] in planner.motionDidChange($0) }
         stations.onCrossing = { [planner] id, entered, date in planner.crossed(id, entered: entered, at: date) }
         TripActionRouter.handler = { [planner] in planner.perform($0) }
         // Before the trip is picked back up: a geofence crossing may be why the app was launched at all.
@@ -84,7 +82,6 @@ final class AppServices {
         liveActivity.show(glance, force: force)
         let isUnderway = trip.map { !$0.isFinished } ?? false
         location.keepRunningInBackground(isUnderway, renew: force)
-        if isUnderway { motion.start() } else { motion.stop() }
         stations.watch(isUnderway ? trip?.placesToWatch ?? [] : [])
 
         guard state != stored else { return }

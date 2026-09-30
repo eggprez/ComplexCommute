@@ -53,7 +53,6 @@ targets:
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
         INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
-        INFOPLIST_KEY_NSMotionUsageDescription: Motion is used during a trip to notice when you park and start walking, and when your train pulls out, so the trip moves on without you tapping anything.
         INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription: While a trip is in progress, your location lets Commute notice when you reach or leave a station, even with the app closed, so your trip and Lock Screen stay current.
         INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: Your location is used as the starting point of trips and to keep route options up to date while you travel, including on the Lock Screen while a trip is in progress.
 

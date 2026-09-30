@@ -44,15 +44,23 @@ public struct TripInstruction: Codable, Hashable, Sendable {
     public var route: RouteLabel?
     /// The moment this step is counting down to: setting off, the doors closing, the stop coming up.
     public var deadline: Date?
+    /// A train to catch is about to leave: count down the seconds. Otherwise whole minutes are plenty,
+    /// and a countdown ticking every second on the way to a station 20 minutes off is just noise.
+    public var countsSeconds: Bool
 
-    public init(kind: Kind, mode: TravelMode? = nil, title: String, detail: String? = nil, route: RouteLabel? = nil, deadline: Date? = nil) {
+    public init(kind: Kind, mode: TravelMode? = nil, title: String, detail: String? = nil, route: RouteLabel? = nil, deadline: Date? = nil,
+                countsSeconds: Bool = false) {
         self.kind = kind
         self.mode = mode
         self.title = title
         self.detail = detail
         self.route = route
         self.deadline = deadline
+        self.countsSeconds = countsSeconds
     }
+
+    /// Seconds are counted down only this close to a departure the rider has to make.
+    public static let secondsCountdown: TimeInterval = 2 * 60
 
     /// The whole step in words, for VoiceOver and for anywhere too small for a badge.
     public var spokenTitle: String {
@@ -111,14 +119,11 @@ public struct TripGlance: Codable, Hashable, Sendable {
     /// The next vehicles from the change the rider is coming up on (see `ActiveTrip.upcomingChange`).
     /// The trip can't know these by itself: the app looks them up and fills them in.
     public var connections: ConnectionBoard?
-    /// A question for the rider ("On the 8:14 A?"), answered with `actions`.
-    public var prompt: String?
     /// Buttons for telling the trip what happened without opening the app.
     public var actions: [TripAction]
 
     public init(destination: String, instruction: TripInstruction, arrival: Date, arriveBy: Date? = nil, isFinished: Bool = false,
-                connections: ConnectionBoard? = nil, prompt: String? = nil, actions: [TripAction] = []) {
-        self.prompt = prompt
+                connections: ConnectionBoard? = nil, actions: [TripAction] = []) {
         self.actions = actions
         self.destination = destination
         self.instruction = instruction
@@ -163,9 +168,8 @@ extension ActiveTrip {
             // otherwise unchanged doesn't count as new every second.
             projected = Date(timeIntervalSinceReferenceDate: (now.timeIntervalSinceReferenceDate / 60).rounded(.up) * 60)
         }
-        let (prompt, actions) = actions(at: now)
         return TripGlance(destination: template.waypoints.last?.name ?? "", instruction: instruction(at: now),
-                          arrival: projected, arriveBy: arriveBy, isFinished: isFinished, prompt: prompt, actions: actions)
+                          arrival: projected, arriveBy: arriveBy, isFinished: isFinished, actions: actions(at: now))
     }
 
     public func instruction(at now: Date) -> TripInstruction {
@@ -202,7 +206,8 @@ extension ActiveTrip {
         let detail = [isChange ? walk : nil, free, toward, status].compactMap(\.self).joined(separator: " · ")
         return TripInstruction(kind: isChange ? .change : .board, mode: .transit,
                                title: "\(isChange ? "Change" : "Board") at \(ride.boardStopName)",
-                               detail: detail.isEmpty ? nil : detail, route: ride.label, deadline: ride.board)
+                               detail: detail.isEmpty ? nil : detail, route: ride.label, deadline: ride.board,
+                               countsSeconds: ride.board.timeIntervalSince(now) <= TripInstruction.secondsCountdown)
     }
 
     /// How close to a change of vehicles the rider has to be before the Lock Screen lists what leaves there.

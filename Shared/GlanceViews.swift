@@ -172,16 +172,34 @@ struct InstructionIcon: View {
     }
 }
 
-/// "Departs 8:42 · 3:10", ticking on its own: a Live Activity is only redrawn when the app says so,
-/// and a countdown that waited for that would be wrong most of the time.
+/// "Arrive 8:30 · in 12 minutes", or "Departs 8:42 · 1:10" with a train about to leave, updating on its own:
+/// a Live Activity is only redrawn when the app says so, and a countdown that waited for that would be wrong
+/// most of the time. The app switches to seconds as the train gets close (`TripInstruction.countsSeconds`).
 struct DeadlineText: View {
     let instruction: TripInstruction
 
     var body: some View {
         if let deadline = instruction.deadline, let label = instruction.deadlineLabel {
-            Text("\(label) \(Text(timerInterval: min(.now, deadline)...deadline, countsDown: true))")
+            Text("\(label) \(Countdown(to: deadline, countsSeconds: instruction.countsSeconds).text)")
                 .monospacedDigit()
         }
+    }
+}
+
+/// Time left until `deadline`, ticking by itself: in seconds right before a departure, otherwise in minutes.
+struct Countdown {
+    let deadline: Date
+    let countsSeconds: Bool
+
+    init(to deadline: Date, countsSeconds: Bool) {
+        self.deadline = deadline
+        self.countsSeconds = countsSeconds
+    }
+
+    var text: Text {
+        countsSeconds
+            ? Text(timerInterval: min(.now, deadline)...deadline, countsDown: true)
+            : Text(.currentDate, format: .reference(to: deadline, allowedFields: [.hour, .minute]))
     }
 }
 
@@ -192,13 +210,17 @@ struct ConnectionBoardRow: View {
     var badgeHeight: CGFloat = 18
     /// Leave out the station, where the instruction beside it already names it.
     var showsStation = true
+    /// Just the times, where there's no room for a line saying what they are.
+    var showsHeading = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(showsStation ? "Next to \(board.toward) from \(board.station)" : "Next to \(board.toward)")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+            if showsHeading {
+                Text(showsStation ? "Next to \(board.toward) from \(board.station)" : "Next to \(board.toward)")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             // As many as fit on one line: three on the Lock Screen, maybe two on a wrist.
             ViewThatFits(in: .horizontal) {
                 ForEach((1...max(1, board.departures.count)).reversed(), id: \.self) { count in
