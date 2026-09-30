@@ -140,8 +140,14 @@ public actor TransitPlanner {
         let ride = await self.ride(pattern: best.match.run.pattern, trip: best.match.trip, board: best.match.run.board,
                                    alight: best.match.run.alight, in: best.timetable, midnight: best.midnight,
                                    walkBefore: best.watched.ride.walkBefore, freeTransfer: best.watched.ride.freeTransfer)
+        var rival: Ride?
+        if let other = best.match.rival {
+            rival = await self.ride(pattern: other.run.pattern, trip: other.trip, board: other.run.board, alight: other.run.alight,
+                                    in: best.timetable, midnight: best.midnight,
+                                    walkBefore: best.watched.ride.walkBefore, freeTransfer: best.watched.ride.freeTransfer)
+        }
         return TrainMatch(ride: ride, rideIndex: best.watched.index, offset: best.match.offset, isConfident: best.match.isConfident,
-                          leftStation: best.match.leftStation)
+                          leftStation: best.match.leftStation, rival: rival)
     }
 
     /// Trains going `ride`'s way that leave its boarding station around now, for the rider to say which one they're on.

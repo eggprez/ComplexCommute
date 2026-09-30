@@ -44,7 +44,11 @@ final class TripPlannerModel {
     private(set) var lastUpdated: Date?
     /// The trip being travelled, once the rider taps Start.
     private(set) var active: ActiveTrip? {
-        didSet { onTripChange?() }
+        didSet {
+            // Answered, settled by the location, or the ride is over: however it went, the question is done with.
+            if oldValue?.trainQuestion != nil, active?.trainQuestion == nil { notifier.withdrawWhichTrain() }
+            onTripChange?()
+        }
     }
 
     let location: LocationService
@@ -242,6 +246,13 @@ final class TripPlannerModel {
 
     // MARK: Which train
 
+    /// The rider answered which of two trains they're on, in the app or from the notification.
+    func answerTrainQuestion(_ option: Int) {
+        active?.answerTrainQuestion(option)
+        storeRecords()
+        Task { await refreshActiveTrip() }
+    }
+
     /// The rider picked the train they're on themselves.
     func board(_ ride: Ride, segment: Int, rideIndex: Int) {
         active?.board(ride, segment: segment, rideIndex: rideIndex, evidence: .rider)
@@ -281,8 +292,12 @@ final class TripPlannerModel {
         guard let match = await trains.matchTrain(for: watch.rides, fixes: recentFixes, leftStation: active?.leftStationAt, at: now),
               !Task.isCancelled else { return }
         let before = active?.currentLeg?.option.rides
+        let asked = active?.trainQuestion
         active?.apply(match, segment: watch.segment, now: now)
         storeRecords()
+        if let question = active?.trainQuestion, question != asked {
+            notifier.askWhichTrain(question.options)
+        }
         // Now on a different train than was shown: everything after it moves with it.
         if active?.currentLeg?.option.rides != before { await refreshActiveTrip() }
     }
@@ -322,7 +337,7 @@ final class TripPlannerModel {
             }
         }
         let wasMoving = active?.isMoving ?? false
-        let movedOn = active?.update(location: location.coordinate, now: .now) == true
+        let movedOn = active?.update(fix: location.fix, now: .now) == true
         // Setting out ahead of time changes when the rest of the trip happens, so it's worth a re-plan too.
         guard movedOn || active?.isMoving != wasMoving else { return }
         storeRecords()
@@ -330,7 +345,7 @@ final class TripPlannerModel {
     }
 
     func refreshActiveTrip() async {
-        active?.update(location: location.coordinate, now: .now)
+        active?.update(fix: location.fix, now: .now)
         storeRecords()
         if trainCheck == nil { await checkTrain() }
         await refreshBoardedRide()

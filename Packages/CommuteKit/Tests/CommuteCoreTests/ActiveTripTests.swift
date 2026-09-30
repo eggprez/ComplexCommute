@@ -156,7 +156,10 @@ private func itinerary(train: TimeInterval = 900, route: String = "A", delay: Ti
         let surfaced = Coordinate(latitude: 40.7535, longitude: -73.99) // ~390 m from Station B's pin
         let moved3 = trip.update(location: surfaced, now: t0 + 1500)
         #expect(!moved3)
-        let moved4 = trip.update(location: surfaced, now: t0 + 2050)
+        // A minute out the train can be passing right under there: still not off it.
+        let early = trip.update(location: surfaced, now: t0 + 2050)
+        #expect(!early)
+        let moved4 = trip.update(location: surfaced, now: t0 + 2110)
         #expect(moved4)
         #expect(trip.currentLeg?.mode == .walk)
     }

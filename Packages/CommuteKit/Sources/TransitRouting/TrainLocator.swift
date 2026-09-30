@@ -35,6 +35,8 @@ extension Timetable {
         let isConfident: Bool
         /// The fit starts from the rider leaving the boarding station, not from somewhere along the line.
         let leftStation: Bool
+        /// A different train that still fits as well, after long enough that it should have fallen away.
+        var rival: (run: Run, trip: Int)?
     }
 
     /// Off the platform by this much before a fix says anything about which train the rider is on: standing on it
@@ -50,6 +52,8 @@ extension Timetable {
     static let atStationMeters = 300.0
     /// Leaving the station's geofence lags the doors closing: the train has to pull clear of it first.
     static let pullOutSeconds = 60.0
+    /// Riding this long (a stop or two) without the fixes telling two trains apart, they won't: time to ask.
+    static let undecidedSeconds = 150.0
 
     /// Every pattern that picks up at `board`'s station and goes on to let off at `alight`'s, whatever the line.
     func runs(from board: (feedID: String, stopID: String), to alight: (feedID: String, stopID: String)) -> [Run] {
@@ -153,8 +157,10 @@ extension Timetable {
         let travelled = (ordered.last?.along ?? 0) - (ordered.first?.along ?? 0)
         let isConfident = ordered.count >= 2 && span >= 45 && travelled >= 300 && best.mean <= Self.confidentFitSeconds
             && rival.map { $0.mean >= best.mean + Self.rivalMarginSeconds } ?? true
+        let isUndecided = !isConfident && span >= Self.undecidedSeconds && best.mean <= Self.confidentFitSeconds
         return TripFit(run: best.run, trip: best.trip, offset: best.mean, isConfident: isConfident,
-                       leftStation: ordered.first?.along == 0)
+                       leftStation: ordered.first?.along == 0,
+                       rival: isUndecided ? rival.flatMap { $0.mean <= Self.confidentFitSeconds ? ($0.run, $0.trip) : nil } : nil)
     }
 
     /// Where `coordinate` lies along the straight lines between `points`, if it is on them at all:

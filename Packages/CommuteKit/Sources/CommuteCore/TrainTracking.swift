@@ -137,13 +137,31 @@ public struct TrainMatch: Hashable, Sendable {
     public var isConfident: Bool
     /// The rider was seen leaving the boarding station, not just passing along the line somewhere near it.
     public var leftStation: Bool
+    /// Another train that has fitted just as well for long enough that the fixes won't tell them apart:
+    /// back to back, or a local and an express that haven't split yet.
+    public var rival: Ride?
 
-    public init(ride: Ride, rideIndex: Int, offset: TimeInterval, isConfident: Bool, leftStation: Bool = false) {
+    public init(ride: Ride, rideIndex: Int, offset: TimeInterval, isConfident: Bool, leftStation: Bool = false, rival: Ride? = nil) {
         self.ride = ride
         self.rideIndex = rideIndex
         self.offset = offset
         self.isConfident = isConfident
         self.leftStation = leftStation
+        self.rival = rival
+    }
+}
+
+/// Which of two trains the rider is on, when their location can't say.
+public struct TrainQuestion: Codable, Hashable, Sendable {
+    /// Soonest first.
+    public var options: [Ride]
+    public var segment: Int
+    public var rideIndex: Int
+
+    public init(options: [Ride], segment: Int, rideIndex: Int) {
+        self.options = options
+        self.segment = segment
+        self.rideIndex = rideIndex
     }
 }
 

@@ -12,12 +12,24 @@ final class TripNotifier {
     private(set) var authorization: UNAuthorizationStatus = .notDetermined
     /// The alternative last notified about, so one faster train isn't announced over and over.
     private var announced: Itinerary.ID?
+    /// The rider picked a train from the "which train?" notification, by its place in the question.
+    @ObservationIgnored var onTrainAnswer: ((Int) -> Void)? {
+        didSet { responder.onTrainAnswer = onTrainAnswer }
+    }
 
     private let center = UNUserNotificationCenter.current()
+    /// Must be the center's delegate before launch finishes, or an answer that woke the app is lost.
+    @ObservationIgnored private let responder = NotificationResponder()
+
+    init() {
+        center.delegate = responder
+    }
 
     private enum ID {
         static let leaveNow = "leave-now"
         static let fasterOption = "faster-option"
+        static let whichTrain = "which-train"
+        static func train(_ option: Int) -> String { "train.\(option)" }
     }
 
     var isAuthorized: Bool { authorization == .authorized || authorization == .provisional }
@@ -50,6 +62,38 @@ final class TripNotifier {
         center.add(UNNotificationRequest(identifier: ID.fasterOption, content: content, trigger: nil))
     }
 
+    /// Two trains fit the rider's location about equally: ask which, with a button for each, so it's answered
+    /// from the Lock Screen without opening the app. Asked at most once a ride.
+    func askWhichTrain(_ options: [Ride]) {
+        guard isAuthorized, options.count >= 2 else { return }
+        let actions = options.enumerated().map { index, ride in
+            UNNotificationAction(identifier: ID.train(index), title: Self.name(ride, among: options), options: [])
+        }
+        center.setNotificationCategories([UNNotificationCategory(identifier: ID.whichTrain, actions: actions, intentIdentifiers: [])])
+
+        let content = UNMutableNotificationContent()
+        content.title = "Which Train?"
+        content.body = "Can't tell whether you're on the \(options.map { Self.name($0, among: options) }.joined(separator: " or the ")). "
+            + "Pick one so arrival times follow your train."
+        content.categoryIdentifier = ID.whichTrain
+        content.interruptionLevel = .timeSensitive
+        center.add(UNNotificationRequest(identifier: ID.whichTrain, content: content, trigger: nil))
+    }
+
+    /// The question is answered, or the location settled it: take it off the Lock Screen.
+    func withdrawWhichTrain() {
+        center.removeDeliveredNotifications(withIdentifiers: [ID.whichTrain])
+    }
+
+    /// "4:13 PM R", or with where it's going when that's what tells them apart (a local and an express).
+    private static func name(_ ride: Ride, among options: [Ride]) -> String {
+        let time = ride.board.formatted(date: .omitted, time: .shortened)
+        let sameName = options.allSatisfy { $0.routeName == ride.routeName }
+        let sameTime = options.allSatisfy { abs($0.board.timeIntervalSince(ride.board)) < 60 }
+        if sameTime, let headsign = ride.headsign { return "\(ride.routeName) to \(headsign)" }
+        return sameName || ride.routeName.isEmpty ? "\(time) \(ride.routeName)" : "\(ride.routeName) at \(time)"
+    }
+
     /// Forgets what has been announced, so the next trip starts fresh.
     func reset() {
         announced = nil
@@ -73,5 +117,17 @@ final class TripNotifier {
 
     func cancelLeaveNow() {
         center.removePendingNotificationRequests(withIdentifiers: [ID.leaveNow])
+    }
+}
+
+/// Hears the rider's answer to a notification. Nothing is presented while the app is in front: the trip screen
+/// asks there itself.
+private final class NotificationResponder: NSObject, UNUserNotificationCenterDelegate {
+    var onTrainAnswer: ((Int) -> Void)?
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        let action = response.actionIdentifier
+        guard action.hasPrefix("train."), let option = Int(action.dropFirst("train.".count)) else { return }
+        await MainActor.run { onTrainAnswer?(option) }
     }
 }

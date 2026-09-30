@@ -55,6 +55,7 @@ final class AppServices {
         location.onUpdate = { [planner] in planner.locationDidChange() }
         stations.onCrossing = { [planner] id, entered, date in planner.crossed(id, entered: entered, at: date) }
         TripActionRouter.handler = { [planner] in planner.perform($0) }
+        notifier.onTrainAnswer = { [planner] in planner.answerTrainQuestion($0) }
         // Before the trip is picked back up: a geofence crossing may be why the app was launched at all.
         stations.start()
         planner.recordConnections = { [weak self] in self?.keep($0) }

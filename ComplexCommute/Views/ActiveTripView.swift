@@ -421,7 +421,9 @@ struct TrainCheckSection: View {
     let pickTrain: () -> Void
 
     var body: some View {
-        if let leg = trip.currentLeg {
+        if let question = trip.trainQuestion {
+            questionRow(question)
+        } else if let leg = trip.currentLeg {
             if leg.mode == .transit, trip.hasBoarded, let ride = trip.currentRide(at: now), now >= ride.board {
                 aboardRow(ride)
             } else if leg.mode == .transit {
@@ -431,6 +433,32 @@ struct TrainCheckSection: View {
                 Button("I'm Already on the Train", systemImage: "tram.fill", action: pickTrain)
             }
         }
+    }
+
+    /// Two trains still fit alike: back to back, or a local and an express that haven't split yet.
+    private func questionRow(_ question: TrainQuestion) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Which Train Are You On?")
+                .font(.headline)
+            Text("Your location fits both. Pick one so times follow your train.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            HStack {
+                ForEach(Array(question.options.enumerated()), id: \.offset) { index, ride in
+                    Button {
+                        withAnimation { planner.answerTrainQuestion(index) }
+                    } label: {
+                        HStack(spacing: 4) {
+                            RouteBadgeView(route: ride.badge)
+                            Text(ride.board.clockTime)
+                            if let headsign = ride.headsign { Text(headsign).foregroundStyle(.secondary).lineLimit(1) }
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+        }
+        .padding(.vertical, 4)
     }
 
     private func aboardRow(_ ride: Ride) -> some View {
