@@ -44,6 +44,8 @@ public struct RaptorRouter: Sendable {
     /// The rider's buffer at every change of vehicles: the least time between stepping off one and the next leaving,
     /// and the slack added on top of a street walk to another station.
     public var changeSeconds = 60
+    /// Lines (indices into the timetable's routes) to plan without, for finding the best way that isn't on them.
+    public var bannedRoutes: Set<Int> = []
 
     /// Time a connection over `seconds` of footpath needs. An in-station time is already the agency's minimum for
     /// the connection, so the buffer only raises it; a street walk is just the walking, so the buffer comes on top.
@@ -119,7 +121,7 @@ public struct RaptorRouter: Sendable {
             // Patterns through any improved stop, scanned from the first such stop.
             var queue: [Int] = []
             for stop in marked {
-                for (pattern, position) in timetable.patternsAtStop[stop] {
+                for (pattern, position) in timetable.patternsAtStop[stop] where !bannedRoutes.contains(timetable.patterns[pattern].route) {
                     if queuedPosition[pattern] < 0 {
                         queue.append(pattern)
                         queuedPosition[pattern] = position

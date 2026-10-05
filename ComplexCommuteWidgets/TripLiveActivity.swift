@@ -44,7 +44,7 @@ struct TripLiveActivity: Widget {
                             ArriveByTrack(progress: progress, height: decision == nil ? 10 : 6, labels: .none)
                         }
                         if let decision {
-                            CompactInstructionRow(instruction: glance.instruction)
+                            if decision.isAssumed { AssumedRow() } else { CompactInstructionRow(instruction: glance.instruction) }
                             BranchButtons(decision: decision)
                         } else {
                             InstructionRow(instruction: glance.instruction, showsDetail: glance.connections == nil || showsActions)
@@ -138,7 +138,7 @@ private struct TripActivityView: View {
                 }
             }
             if let decision {
-                CompactInstructionRow(instruction: glance.instruction)
+                if decision.isAssumed { AssumedRow() } else { CompactInstructionRow(instruction: glance.instruction) }
                 BranchButtons(decision: decision)
             } else {
                 // The departures stand in for the instruction's detail, which they say more usefully
@@ -234,6 +234,16 @@ private struct InstructionRow: View {
     }
 }
 
+/// Shown aboard by the clock alone: say so where the step would be, so the buttons under it read as the question they are.
+private struct AssumedRow: View {
+    var body: some View {
+        Label("Going by the clock. Which are you on?", systemImage: "clock.badge.questionmark")
+            .font(.subheadline.weight(.semibold))
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
+    }
+}
+
 /// The step on one line, where the ways onward need the room under it.
 private struct CompactInstructionRow: View {
     let instruction: TripInstruction
@@ -279,7 +289,8 @@ private struct BranchButtons: View {
                             }
                         }
                         // No green for a live time here: the card behind is tinted green as often as not.
-                        Text("\(option.departs.clockTime) → \(option.arrival.clockTime)")
+                        Text(!decision.isAssumed ? "\(option.departs.clockTime) → \(option.arrival.clockTime)"
+                             : option.id == decision.options.first?.id ? "Yes, on this" : "On this instead")
                             .font(.caption.weight(.semibold))
                             .monospacedDigit()
                             .lineLimit(1)
@@ -291,7 +302,9 @@ private struct BranchButtons: View {
                     .background(Color.primary.opacity(0.12), in: .rect(cornerRadius: 10))
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Take \(option.routes.map(\.name).joined(separator: ", then ")) from \(decision.station). Leaves \(option.departs.clockTime), arrives \(option.arrival.clockTime).")
+                .accessibilityLabel(decision.isAssumed
+                    ? "I'm on the \(option.routes.first?.name ?? "") from \(decision.station)"
+                    : "Take \(option.routes.map(\.name).joined(separator: ", then ")) from \(decision.station). Leaves \(option.departs.clockTime), arrives \(option.arrival.clockTime).")
             }
         }
     }

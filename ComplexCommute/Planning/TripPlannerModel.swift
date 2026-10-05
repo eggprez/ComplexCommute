@@ -403,12 +403,19 @@ final class TripPlannerModel {
         if trainCheck == nil { await checkTrain() }
         await refreshBoardedRide()
         guard let request = active?.replanRequest(location: location.coordinate, now: .now) else { return }
+        // Aboard with a change to come: is staying on past the stop to get off at any better?
+        let stayOn = request.keptRides.isEmpty ? nil : active?.stayOnRequest(now: .now)
         isPlanning = true
         defer { isPlanning = false }
         let planned = try? await planner.plan(request.template, departingAt: request.departure, canDelayDeparture: request.canDelayDeparture,
                                               isWaitingAtOrigin: request.isWaitingAtOrigin)
+        var staying: [Itinerary] = []
+        if planned != nil, let stayOn {
+            staying = (try? await planner.plan(stayOn.template, departingAt: stayOn.departure, canDelayDeparture: false,
+                                               isWaitingAtOrigin: true)) ?? []
+        }
         guard !Task.isCancelled, let planned else { return }
-        active?.apply(planned, for: request)
+        active?.apply(planned, for: request, stayingOn: staying)
         announceNotice()
         lastUpdated = .now
     }

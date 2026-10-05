@@ -467,7 +467,9 @@ struct TrainCheckSection: View {
             let catching = riding == nil ? (leg.mode == .transit ? trip.currentRide(at: now) : trip.connection?.ride)?.vehicle : nil
             if riding != nil || branches.count > 1 || catching != nil {
                 VStack(alignment: .leading, spacing: 12) {
-                    if let riding {
+                    if let riding, let assumption = trip.assumption {
+                        assumedRow(riding, other: assumption.other)
+                    } else if let riding {
                         aboardRow(riding)
                     }
                     if branches.count > 1 {
@@ -483,12 +485,63 @@ struct TrainCheckSection: View {
         }
     }
 
+    /// Shown aboard by the clock alone, with no location to back it: every way of putting that right, up front.
+    private func assumedRow(_ ride: Ride, other: TripBranch?) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Going by the Clock", systemImage: "clock.badge.questionmark")
+                .font(.headline)
+                .foregroundStyle(Color.warningText)
+            HStack(spacing: 4) {
+                Text("There's no location to go on, so you're taken to be on the \(ride.board.clockTime)")
+                RouteBadgeView(route: ride.badge)
+            }
+            .font(.subheadline)
+            HStack {
+                Button {
+                    planner.choose(ActiveTrip.assumedPrefix + ActiveTrip.key(for: ride))
+                } label: {
+                    Label("Yes, I'm on It", systemImage: "checkmark")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                if let other {
+                    Button {
+                        withAnimation { planner.choose(ActiveTrip.assumedPrefix + other.id) }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("On the")
+                            RouteBadgeView(route: other.ride.badge)
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+            HStack {
+                Button {
+                    planner.markMissed()
+                    Task { await planner.refreshActiveTrip() }
+                } label: {
+                    Text("Still Waiting")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                Button(action: pickTrain) {
+                    Text("Another \(ride.vehicle.title)…")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
     /// The two best ways on from the next boarding, side by side until one is taken: tapped here, or boarded.
     private func branchRows(_ branches: [TripBranch], isAboard: Bool) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(isAboard ? "Next, from \(branches[0].ride.boardStopName)" : "Your Choice at \(branches[0].ride.boardStopName)")
                 .font(.headline)
-            Text("Tap the one you take. Both stay here with their latest times until you do, or until you're seen aboard one.")
+            Text("Tap the one you take. Both stay here, each with its line's next departure, until you do or you're seen aboard one.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             ForEach(branches) { branch in

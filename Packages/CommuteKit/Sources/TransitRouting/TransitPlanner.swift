@@ -34,6 +34,9 @@ public actor TransitPlanner {
     static let departuresToTry = 3
     /// An option with an extra ride must save at least this much to be worth showing.
     static let worthwhileSavingPerRide: TimeInterval = 180
+    /// When every option starts on the same line, the best way that starts on another is offered too, as long as
+    /// it gets there no more than this much later: the other branch for the rider to pick between.
+    static let otherLineAllowance: TimeInterval = 30 * 60
 
     /// Predictions only reach an hour or two ahead; beyond that the schedule is all anyone knows.
     static let realtimeHorizon: TimeInterval = 2 * 3_600
@@ -67,12 +70,15 @@ public actor TransitPlanner {
         router.changeSeconds = max(Self.minimumChangeSeconds, bufferSeconds)
         var options: [LegOption] = []
         var seen = Set<String>()
-        var clock = Int(departure.timeIntervalSince(midnight))
+        let start = Int(departure.timeIntervalSince(midnight))
+        var clock = start
+        var firstLines = Set<Int>()
 
         for _ in 0..<Self.departuresToTry {
             let journeys = router.journeys(from: access, to: egress, departure: clock)
             var found: [LegOption] = []
             for journey in journeys {
+                if let first = journey.rides.first { firstLines.insert(timetable.patterns[first.pattern].route) }
                 found.append(await legOption(for: journey, in: timetable, midnight: midnight, from: origin, to: destination, snapshot: snapshot,
                                              accessBufferSeconds: accessBufferSeconds))
             }
@@ -82,7 +88,20 @@ public actor TransitPlanner {
             }
             clock = Int(soonest.timeIntervalSince(midnight)) + 60
         }
-        let useful = options.filter { option in !options.contains { Self.makesPointless(option, $0) } }
+        var useful = options.filter { option in !options.contains { Self.makesPointless(option, $0) } }
+        // Every way found boards the same line first: look once more without it, so there is a second branch to
+        // offer (the M60 beside the Q70) even when it wouldn't have made the list on its merits.
+        if firstLines.count == 1, let soonest = useful.map(\.arrival).min() {
+            router.bannedRoutes = firstLines
+            var others: [LegOption] = []
+            for journey in router.journeys(from: access, to: egress, departure: start) {
+                others.append(await legOption(for: journey, in: timetable, midnight: midnight, from: origin, to: destination, snapshot: snapshot,
+                                              accessBufferSeconds: accessBufferSeconds))
+            }
+            if let other = others.min(by: { $0.arrival < $1.arrival }), other.arrival.timeIntervalSince(soonest) <= Self.otherLineAllowance {
+                useful.append(other)
+            }
+        }
         return useful.sorted { $0.arrival < $1.arrival }
     }
 

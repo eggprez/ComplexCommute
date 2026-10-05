@@ -132,10 +132,14 @@ public struct DecisionGlance: Codable, Hashable, Sendable {
     /// Where the boarding is: "LaGuardia Terminal B".
     public var station: String
     public var options: [BranchGlance]
+    /// Not a choice ahead but a check on one the clock made: the rider is shown on the first of these with
+    /// nothing seen to back it, and can say so or say it was the other.
+    public var isAssumed: Bool
 
-    public init(station: String, options: [BranchGlance]) {
+    public init(station: String, options: [BranchGlance], isAssumed: Bool = false) {
         self.station = station
         self.options = options
+        self.isAssumed = isAssumed
     }
 }
 
@@ -224,6 +228,14 @@ extension ActiveTrip {
 
     /// The open choice as the Lock Screen draws it, or nil when there is nothing to pick between.
     public var decision: DecisionGlance? {
+        if let (riding, other) = assumption, let other {
+            return DecisionGlance(station: riding.boardStopName, options: [
+                BranchGlance(id: Self.assumedPrefix + Self.key(for: riding), routes: [riding.label], departs: riding.board,
+                             arrival: arrival, isRealtime: riding.isRealtime),
+                BranchGlance(id: Self.assumedPrefix + other.id, routes: Array(other.rides.map(\.label).prefix(3)), departs: other.ride.board,
+                             arrival: other.arrival, isRealtime: other.ride.isRealtime),
+            ], isAssumed: true)
+        }
         let branches = branches
         guard branches.count > 1, !isFinished else { return nil }
         return DecisionGlance(station: branches[0].ride.boardStopName, options: branches.map { branch in
