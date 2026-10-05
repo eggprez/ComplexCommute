@@ -151,6 +151,124 @@ private func itinerary(rides: [Ride]? = nil) -> Itinerary {
         #expect(trip.arrival == t0 + 2_600)
     }
 
+    @Test func seenAtTheStopToChangeAtTheRiderIsOffHoweverEarlyItGotIn() throws {
+        let first = ride("8", from: platformA, to: stationM, board: 900, alight: 1_500)
+        let second = ride("X1", "X", from: stationM, to: platformB, board: 1_700, alight: 2_100)
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary(rides: [first, second])))
+        trip.markArrived(now: t0 + 800)
+        trip.update(location: nil, now: t0 + 1_000)
+        #expect(trip.hasBoarded)
+
+        // Passing a stop on the way at speed isn't getting off anywhere.
+        let onTheWay = Coordinate(latitude: 40.729, longitude: -74.035)
+        trip.update(fix: LocationFix(coordinate: onTheWay, time: t0 + 1_100, accuracy: 10, speed: 14), now: t0 + 1_100)
+        #expect(trip.hasBoarded)
+
+        // In four minutes early, and standing at Station M: off the 8, with everything from there open again.
+        trip.update(location: stationM.coordinate, now: t0 + 1_260)
+        #expect(!trip.hasBoarded)
+        #expect(trip.isChangingVehicles)
+        #expect(trip.currentLeg?.option.rides.map(\.routeName) == ["X"])
+        #expect(trip.instruction(at: t0 + 1_260).kind == .change)
+        let request = try #require(trip.replanRequest(location: stationM.coordinate, now: t0 + 1_260))
+        #expect(request.firstSegment == 1)
+        #expect(request.keptRides.isEmpty)
+        #expect(request.template.waypoints.first?.name == "Station M")
+        #expect(request.departure == t0 + 1_260)
+        #expect(request.isWaitingAtOrigin)
+    }
+
+    @Test func stillMovingWhenItWasDueInTheRiderIsOnAVehicleRunningLate() throws {
+        let first = ride("8", from: platformA, to: stationM, board: 900, alight: 1_500)
+        let second = ride("X1", "X", from: stationM, to: platformB, board: 1_700, alight: 2_100)
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary(rides: [first, second])))
+        trip.markArrived(now: t0 + 800)
+        trip.update(location: nil, now: t0 + 1_000)
+
+        let onTheWay = Coordinate(latitude: 40.729, longitude: -74.035)
+        trip.update(fix: LocationFix(coordinate: onTheWay, time: t0 + 1_520, accuracy: 10, speed: 14), now: t0 + 1_520)
+        #expect(trip.hasBoarded)
+        #expect(trip.currentLeg?.option.rides.count == 2)
+        #expect(try #require(trip.currentRide(at: t0 + 1_520)).alight > t0 + 1_520)
+
+        // With nothing to see (underground), the clock decides, and by the clock alone the change still needs its time.
+        var unseen = try #require(ActiveTrip(template: template, itinerary: itinerary(rides: [first, second])))
+        unseen.markArrived(now: t0 + 800)
+        unseen.update(location: nil, now: t0 + 1_000)
+        unseen.update(location: nil, now: t0 + 1_510)
+        #expect(!unseen.hasBoarded)
+        #expect(try #require(unseen.replanRequest(location: nil, now: t0 + 1_510)).isWaitingAtOrigin == false)
+    }
+
+    @Test func boardingTheOtherWayMovesTheTripOntoIt() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary()))
+        trip.markArrived(now: t0 + 800)
+        let request = try #require(trip.replanRequest(location: nil, now: t0 + 800))
+        let bus = ride("Q1", "Q", from: platformA, to: stationM, board: 960, alight: 1_500)
+        let onward = ride("X1", "X", from: stationM, to: platformB, board: 1_700, alight: 2_000)
+        func rest(_ itinerary: Itinerary) -> Itinerary {
+            Itinerary(legs: itinerary.legs.dropFirst().enumerated().map { offset, leg in
+                var leg = leg
+                leg.segmentIndex = offset
+                return leg
+            })
+        }
+        trip.apply([rest(itinerary()), rest(itinerary(rides: [bus, onward]))], for: request)
+        #expect(trip.branches.map(\.ride.routeName) == ["Q", "A"])
+        #expect(trip.currentRide(at: t0 + 800)?.routeName == "A")
+        let watched = try #require(trip.ridesToWatch(at: t0 + 800))
+        #expect(watched.rides.map(\.ride.routeName) == ["A", "Q"])
+        #expect(watched.rides.map(\.isAlternative) == [false, true])
+
+        // A fix or two that fit the bus don't move the trip: it flipped between plans on less, once.
+        trip.apply(TrainMatch(ride: bus, rideIndex: 0, offset: 30, isConfident: false, isAlternative: true), segment: 1, now: t0 + 1_000)
+        #expect(!trip.hasBoarded)
+        #expect(trip.currentRide(at: t0 + 1_000)?.routeName == "A")
+
+        // Clearly on it: the trip is on the bus, and what follows is planned from where it lets off.
+        trip.apply(TrainMatch(ride: bus, rideIndex: 0, offset: 10, isConfident: true, isAlternative: true), segment: 1, now: t0 + 1_100)
+        #expect(trip.hasBoarded)
+        #expect(trip.boardedBy == .location)
+        #expect(trip.branches.isEmpty)
+        #expect(trip.currentLeg?.option.rides.map(\.routeName) == ["Q"])
+        let next = try #require(trip.replanRequest(location: nil, now: t0 + 1_100))
+        #expect(next.keptRides.map(\.routeName) == ["Q"])
+        #expect(next.template.waypoints.first?.name == "Station M")
+
+        let fromM = Waypoint(name: "Station M", coordinate: stationM.coordinate, kind: .stop(feedID: "f", stopID: "M"))
+        trip.apply([Itinerary(legs: [
+            Leg(segmentIndex: 0, from: fromM, to: stationB, option: LegOption(mode: .transit, departure: t0 + 1_700, arrival: t0 + 2_000, rides: [onward])),
+            Leg(segmentIndex: 1, from: stationB, to: office, option: LegOption(mode: .walk, departure: t0 + 2_000, arrival: t0 + 2_300)),
+        ])], for: next)
+        #expect(trip.currentLeg?.option.rides.map(\.routeName) == ["Q", "X"])
+        #expect(trip.notice == nil)
+        #expect(trip.arrival == t0 + 2_300)
+    }
+
+    @Test func twoLinesThatShareTheRoadOutAreAskedAbout() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary()))
+        trip.markArrived(now: t0 + 800)
+        let bus = ride("Q1", "Q", from: platformA, to: stationM, board: 960, alight: 1_500)
+        trip.apply(TrainMatch(ride: bus, rideIndex: 0, offset: 20, isConfident: false, rival: ride("8", board: 900, alight: 2_100),
+                              isAlternative: true, rivalIsAlternative: false), segment: 1, now: t0 + 1_150)
+        let question = try #require(trip.trainQuestion)
+        #expect(question.options.map(\.routeName) == ["A", "Q"])
+        trip.answerTrainQuestion(1, now: t0 + 1_160)
+        #expect(trip.boardedBy == .rider)
+        #expect(trip.currentLeg?.option.rides.map(\.routeName) == ["Q"])
+        #expect(try #require(trip.replanRequest(location: nil, now: t0 + 1_160)).keptRides.count == 1)
+    }
+
+    @Test func buttonsAreNamedForWhatIsBeingCaught() {
+        var bus = ride("Q1", "Q70", board: 900, alight: 1_500)
+        bus.routeType = 3
+        #expect(bus.vehicle == .bus)
+        #expect(ride("8", board: 900, alight: 1_500).vehicle == .train)
+        #expect(TripAction.aboard.title(for: .bus) == "On Bus")
+        #expect(TripAction.arrived.title(for: .bus) == "At Stop")
+        #expect(TripAction.aboard.title(for: nil) == "On Train")
+    }
+
     @Test func twoTrainsThatFitAlikeAreAskedAboutOnce() throws {
         var trip = try #require(ActiveTrip(template: template, itinerary: itinerary()))
         trip.markArrived(now: t0 + 800)

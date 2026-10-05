@@ -34,8 +34,30 @@ struct TripActionIntent: LiveActivityIntent {
     }
 }
 
+/// A Live Activity button for one of the ways onward from the next boarding: picks it without opening the app.
+struct ChooseBranchIntent: LiveActivityIntent {
+    static let title: LocalizedStringResource = "Choose Route"
+    static let isDiscoverable = false
+
+    @Parameter(title: "Branch")
+    var branch: String
+
+    init() {}
+
+    init(_ branch: String) {
+        self.branch = branch
+    }
+
+    @MainActor
+    func perform() async throws -> some IntentResult {
+        TripActionRouter.branchHandler?(branch)
+        return .result()
+    }
+}
+
 /// Where Live Activity buttons go. Set by the app; the widget extension only draws the buttons.
 @MainActor
 enum TripActionRouter {
     static var handler: ((TripAction) -> Void)?
+    static var branchHandler: ((String) -> Void)?
 }

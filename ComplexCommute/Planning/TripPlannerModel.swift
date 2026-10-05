@@ -70,9 +70,9 @@ final class TripPlannerModel {
 
     /// Fixes older than this say nothing about the train the rider is on now.
     static let fixMemory: TimeInterval = 8 * 60
-    static let fixSpacing: TimeInterval = 10
+    static let fixSpacing: TimeInterval = 5
     /// Matching runs on location changes, but no more often than this.
-    static let trainCheckInterval: TimeInterval = 15
+    static let trainCheckInterval: TimeInterval = 8
 
     /// How often "leave now" trips re-plan while on screen.
     static let refreshInterval: Duration = .seconds(30)
@@ -81,6 +81,10 @@ final class TripPlannerModel {
     static let arriveByRefreshInterval: Duration = .seconds(120)
     /// A trip in progress re-plans more eagerly: a missed connection should show up fast.
     static let activeRefreshInterval: Duration = .seconds(20)
+    /// Coming up on a boarding or on getting off, more eagerly still: these are the minutes a plan can change in.
+    static let decisionRefreshInterval: Duration = .seconds(8)
+    private var isRefreshing = false
+    private var needsAnotherRefresh = false
 
     init(location: LocationService, resolver: any LegResolving, notifier: TripNotifier = TripNotifier(), trains: TransitPlanner? = nil) {
         self.location = location
@@ -216,6 +220,13 @@ final class TripPlannerModel {
         active?.follow(itinerary)
     }
 
+    /// The rider picked one of the ways onward, in the app or from the Live Activity.
+    func choose(_ branch: String) {
+        active?.choose(branch: branch)
+        storeRecords()
+        Task { await refreshActiveTrip() }
+    }
+
     // MARK: Geofences and the Lock Screen
 
     /// A station geofence was crossed, possibly with the app woken just to hear it.
@@ -226,7 +237,7 @@ final class TripPlannerModel {
         if movedOn { Task { await refreshActiveTrip() } }
     }
 
-    /// The rider says they're on the train, without saying which: location matching can still tell.
+    /// The rider says they're aboard, without saying which vehicle: location matching can still tell.
     func markAboard() {
         active?.markAboard()
         storeRecords()
@@ -277,7 +288,14 @@ final class TripPlannerModel {
         }
         guard segment < trip.legs.count, index < trip.legs[segment].option.rides.count else { return nil }
         let planned = trip.legs[segment].option.rides[index]
-        return (segment, index, planned, await trains.trains(like: planned))
+        var found = await trains.trains(like: planned)
+        // The other way onward leaves from the same place: its vehicles are just as likely the one boarded.
+        for branch in trip.branches where branch.segment == segment && branch.rideIndex == index {
+            for ride in await trains.trains(like: branch.ride) where !found.contains(where: { $0.trip == ride.trip }) {
+                found.append(ride)
+            }
+        }
+        return (segment, index, planned, found.sorted { $0.board < $1.board })
     }
 
     /// Where each train going the way of the ride the rider is on or heading for is right now.
@@ -317,7 +335,8 @@ final class TripPlannerModel {
     private func followActiveTrip() async {
         while !Task.isCancelled, let trip = active, !trip.isFinished {
             await refreshActiveTrip()
-            try? await Task.sleep(for: Self.activeRefreshInterval)
+            let isClose = active?.isNearDecision(location: location.coordinate, now: .now) ?? false
+            try? await Task.sleep(for: isClose ? Self.decisionRefreshInterval : Self.activeRefreshInterval)
         }
     }
 
@@ -339,15 +358,46 @@ final class TripPlannerModel {
                 if active?.currentSegment != segment { await refreshActiveTrip() }
             }
         }
-        let wasMoving = active?.isMoving ?? false
-        let movedOn = active?.update(fix: location.fix, now: .now) == true
-        // Setting out ahead of time changes when the rest of the trip happens, so it's worth a re-plan too.
-        guard movedOn || active?.isMoving != wasMoving else { return }
+        let before = active.map(Stage.init)
+        active?.update(fix: location.fix, now: .now)
+        // Reaching a station, getting on or off, setting out ahead of time: each changes what the rest of the trip
+        // can be, so each is worth a re-plan there and then rather than at the next tick.
+        guard active.map(Stage.init) != before else { return }
         storeRecords()
         Task { await refreshActiveTrip() }
     }
 
+    /// Where the trip stands, as far as re-planning cares.
+    private struct Stage: Equatable {
+        let segment: Int
+        let hasBoarded: Bool
+        let rides: Int
+        let isMoving: Bool
+
+        init(_ trip: ActiveTrip) {
+            segment = trip.currentSegment
+            hasBoarded = trip.hasBoarded
+            rides = trip.currentLeg?.option.rides.count ?? 0
+            isMoving = trip.isMoving
+        }
+    }
+
+    /// One re-plan at a time: asked again while one is under way, it runs once more when that one is done,
+    /// so the last word is always planned from the latest state.
     func refreshActiveTrip() async {
+        guard !isRefreshing else {
+            needsAnotherRefresh = true
+            return
+        }
+        isRefreshing = true
+        defer { isRefreshing = false }
+        repeat {
+            needsAnotherRefresh = false
+            await planActiveTrip()
+        } while needsAnotherRefresh && !Task.isCancelled
+    }
+
+    private func planActiveTrip() async {
         active?.update(fix: location.fix, now: .now)
         storeRecords()
         if trainCheck == nil { await checkTrain() }
@@ -365,8 +415,15 @@ final class TripPlannerModel {
 
     /// A plan worth switching to is worth a notification: the phone is usually in a pocket by now.
     private func announceNotice() {
-        guard let trip = active, case .fasterOption(let faster) = trip.notice else { return }
-        notifier.announceFasterOption(faster, saving: trip.arrival.timeIntervalSince(faster.arrival))
+        guard let trip = active else { return }
+        switch trip.notice {
+        case .fasterOption(let faster):
+            notifier.announceFasterOption(faster, saving: trip.arrival.timeIntervalSince(faster.arrival))
+        case .switchedToFaster(let previousArrival):
+            notifier.announceSwitch(to: Itinerary(legs: trip.remainingLegs), saving: previousArrival.timeIntervalSince(trip.arrival))
+        default:
+            break
+        }
     }
 
     /// Plans once, then keeps re-planning from the live location until the calling task is cancelled.

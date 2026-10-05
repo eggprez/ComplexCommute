@@ -250,7 +250,7 @@ struct ConnectionBoardRow: View {
 
     private var spoken: String {
         let times = board.departures.map { departure in
-            "\(departure.route.name) at \(departure.time.clockTime)\(departure.isPlanned ? ", your train" : "")\(departure.isRealtime ? ", live" : "")"
+            "\(departure.route.name) at \(departure.time.clockTime)\(departure.isPlanned ? ", the one planned" : "")\(departure.isRealtime ? ", live" : "")"
         }
         return "Next to \(board.toward) from \(board.station): \(times.joined(separator: "; "))"
     }

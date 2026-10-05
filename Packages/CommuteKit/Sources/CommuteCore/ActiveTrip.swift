@@ -1,5 +1,26 @@
 import Foundation
 
+/// One way onward from the next boarding: the vehicle to get on there, and the rest of the trip that follows from it.
+public struct TripBranch: Codable, Hashable, Identifiable, Sendable {
+    /// Names the vehicle boarded, so the same choice keeps its place from one re-plan to the next.
+    public var id: String
+    /// The rest of the trip this way, numbered as the trip's own legs are.
+    public var itinerary: Itinerary
+    /// Where in the trip the boarding is.
+    public var segment: Int
+    public var rideIndex: Int
+    public var ride: Ride
+
+    public var arrival: Date { itinerary.arrival }
+
+    /// Every vehicle this way from the boarding on, in order.
+    public var rides: [Ride] {
+        itinerary.legs.flatMap { leg in
+            leg.segmentIndex < segment ? [] : leg.segmentIndex == segment ? Array(leg.option.rides.dropFirst(rideIndex)) : leg.option.rides
+        }
+    }
+}
+
 /// A trip being travelled: which leg the rider is on, and how to re-plan the rest from where they really are.
 ///
 /// GPS is unreliable underground, so progress combines three signals: proximity to the next waypoint,
@@ -13,6 +34,8 @@ public struct ActiveTrip: Codable, Sendable {
         case planChanged(previousArrival: Date)
         /// The followed plan still works, but another gets there meaningfully sooner.
         case fasterOption(Itinerary)
+        /// Another plan got there so much sooner that the trip moved to it without asking.
+        case switchedToFaster(previousArrival: Date)
     }
 
     /// What to plan next: a template for the part of the trip still ahead.
@@ -75,12 +98,24 @@ public struct ActiveTrip: Codable, Sendable {
     public private(set) var trainQuestion: TrainQuestion?
     /// Asked once already for the ride under way; not again, whatever the answer.
     private var askedWhichTrain: Bool?
+    /// The two best ways onward from the next boarding, until the rider picks one or is seen to board. Re-plans
+    /// refresh them in place rather than moving the trip between them. Optional, like the rest from here down,
+    /// so a trip saved by an earlier version still loads.
+    private var openBranches: [TripBranch]?
+    /// The rider picked which way to go from the next boarding: the plan stays theirs until they have boarded.
+    private var hasChosenBranch: Bool?
+    /// The vehicle just got off, while the next one of the same leg is still to board.
+    private var finishedRide: Ride?
+    /// Aboard something the plan didn't have. What follows it isn't known until the next plan lands.
+    private var isOffPlan: Bool?
 
     private struct Sensing: Codable {
         /// Inside the geofence around the platform the next train leaves from.
         var isInsideStation: Bool?
         /// When the rider last left that geofence: about when their train pulled out, if they are on one.
         var leftStationAt: Date?
+        /// The rider was seen at the stop the last vehicle let them off at, not just taken to be there by the clock.
+        var sawExit: Bool?
     }
 
     private var sense: Sensing {
@@ -88,10 +123,18 @@ public struct ActiveTrip: Codable, Sendable {
         set { sensing = newValue }
     }
 
-    /// An alternative has to save at least this much before it interrupts the rider.
-    public static let worthwhileSaving: TimeInterval = 5 * 60
+    /// Once the rider has picked a way to go, another has to save at least this much before they are asked about it.
+    public static let askSaving: TimeInterval = 10 * 60
+    /// Saving more than this, the trip moves to it without asking, and says so.
+    public static let switchSaving: TimeInterval = 20 * 60
     /// Close enough to a boarding stop to count as being at it.
     static let platformRadius = 200.0
+    /// Standing this close to the stop a vehicle lets off at, the rider is off it.
+    static let exitRadius = 120.0
+    /// A fix older than this says where the rider was, not where they are.
+    static let freshFix: TimeInterval = 20
+    /// This close to a boarding or to getting off, the trip is worth following more closely.
+    static let closeWatch: TimeInterval = 4 * 60
     /// Until the rider sets out, re-plans look this far ahead of the followed plan for an earlier way to go.
     /// Beyond it they plan from the trip's own time, not the clock: a trip started the night before is
     /// about tomorrow morning's trains, not whatever runs at midnight.
@@ -126,10 +169,18 @@ public struct ActiveTrip: Codable, Sendable {
         return (ride, ride.board.timeIntervalSince(leg.arrival) - ride.walkBefore)
     }
 
-    /// The ride the rider is on or waiting for within the current transit leg.
+    /// The ride the rider is on or waiting for within the current transit leg. Rides got off are dropped from
+    /// the leg as they end, so it is always the first.
     public func currentRide(at now: Date) -> Ride? {
-        guard let leg = currentLeg else { return nil }
-        return leg.option.rides.first { $0.alight > now } ?? leg.option.rides.last
+        currentLeg?.option.rides.first
+    }
+
+    /// Between two vehicles of the same leg: off one, not yet on the next.
+    public var isChangingVehicles: Bool { finishedRide != nil && !hasBoarded }
+
+    /// The two best ways onward from the next boarding, while which to take is still open.
+    public var branches: [TripBranch] {
+        hasChosenBranch == true ? [] : openBranches ?? []
     }
 
     // MARK: Progress
@@ -167,15 +218,77 @@ public struct ActiveTrip: Codable, Sendable {
            leg.departure.timeIntervalSince(now) <= Self.departureWindow {
             isUnderway = true
         }
-        if let leg = currentLeg, leg.mode == .transit, !hasBoarded, !isAwaitingReplan {
-            let boardTime = leg.option.rides.first?.board ?? leg.departure
-            if now >= boardTime.addingTimeInterval(30) {
-                hasBoarded = true
-                boardedBy = .schedule
-                recordBoarding(now: now)
-            }
+        // Catching up after a long silence can take more than one step: off one ride and, by the clock, onto the next.
+        for _ in 0..<4 {
+            let before = (currentLeg?.option.rides.count, hasBoarded)
+            followRide(with: fix, now: now)
+            assumeBoarding(with: fix, now: now)
+            if (currentLeg?.option.rides.count, hasBoarded) == before { break }
         }
         return currentSegment != segmentBefore
+    }
+
+    private static func isCurrent(_ fix: LocationFix, at now: Date) -> Bool {
+        now.timeIntervalSince(fix.time) <= freshFix && fix.accuracy <= surfacedAccuracy
+    }
+
+    /// Getting off one vehicle with another still to catch in the same leg. Seen standing at the stop it lets off
+    /// at, the rider is off it, however early it got in. Still moving when it was due in, they are on a vehicle
+    /// running late. With nothing to go on (underground), the clock decides.
+    private mutating func followRide(with fix: LocationFix?, now: Date) {
+        guard hasBoarded, var leg = currentLeg, leg.mode == .transit, leg.option.rides.count > 1, var ride = leg.option.rides.first else { return }
+        if let fix, Self.isCurrent(fix, at: now), let exit = ride.stops.last?.station {
+            let meters = fix.coordinate.distance(to: exit.coordinate)
+            let isOnAVehicle = (fix.speed ?? 0) >= LocationFix.vehicleSpeed
+            if !isOnAVehicle, meters <= Self.exitRadius, now >= ride.board.addingTimeInterval(60) {
+                finishRide(now: now, seen: true)
+                return
+            }
+            if isOnAVehicle, meters > Self.platformRadius, now >= ride.alight.addingTimeInterval(-30), let speed = fix.speed {
+                ride.alight = now.addingTimeInterval(max(60, meters / speed))
+                leg.option.rides[0] = ride
+                legs[currentSegment] = leg
+                return
+            }
+        }
+        if now >= ride.alight { finishRide(now: now, seen: false) }
+    }
+
+    /// Drops the ride just got off from the leg, which now starts at the stop it let the rider off at.
+    private mutating func finishRide(now: Date, seen: Bool) {
+        guard var leg = currentLeg, leg.option.rides.count > 1 else { return }
+        let done = leg.option.rides.removeFirst()
+        if let exit = done.stops.last?.station {
+            leg.from = Waypoint(name: exit.name, coordinate: exit.coordinate, kind: .stop(feedID: exit.feedID, stopID: exit.stopID))
+        }
+        leg.option.departure = seen ? now : done.alight
+        legs[currentSegment] = leg
+        finishedRide = done
+        hasBoarded = false
+        boardedBy = nil
+        trainQuestion = nil
+        askedWhichTrain = nil
+        reachedPlatformAt = nil
+        sensing = Sensing(sawExit: seen)
+        // They were ways on from a vehicle the rider is no longer on; the next plan starts from this stop.
+        openBranches = nil
+    }
+
+    /// A vehicle's time passing means aboard, unless the rider can be seen still standing at the stop.
+    private mutating func assumeBoarding(with fix: LocationFix?, now: Date) {
+        guard let leg = currentLeg, leg.mode == .transit, !hasBoarded, !isAwaitingReplan else { return }
+        let ride = leg.option.rides.first
+        guard now >= (ride?.board ?? leg.departure).addingTimeInterval(30) else { return }
+        if let fix, let stop = ride?.stops.first?.station, Self.isCurrent(fix, at: now), (fix.speed ?? 0) < LocationFix.vehicleSpeed,
+           fix.coordinate.distance(to: stop.coordinate) <= Self.platformRadius {
+            return
+        }
+        hasBoarded = true
+        boardedBy = hasChosenBranch == true ? .riderAboard : .schedule
+        hasChosenBranch = nil
+        openBranches = nil
+        recordBoarding(now: now)
+        recordChange(now: now)
     }
 
     /// The rider says they have reached the next waypoint.
@@ -199,6 +312,8 @@ public struct ActiveTrip: Codable, Sendable {
         askedWhichTrain = nil
         sense.leftStationAt = nil
         isAwaitingReplan = true
+        hasChosenBranch = nil
+        openBranches = nil
     }
 
     public mutating func dismissNotice() {
@@ -211,6 +326,11 @@ public struct ActiveTrip: Codable, Sendable {
         reachedPlatformAt = nil
         startedAtPlatform = false
         if recording { recordConnections(leaving: currentSegment, now: now) }
+        // A way picked for a boarding in the leg now over was either taken or passed up.
+        if currentLeg?.mode == .transit { hasChosenBranch = nil }
+        openBranches = nil
+        finishedRide = nil
+        isOffPlan = nil
         currentSegment += 1
         legStartedAt = now
         hasBoarded = false
@@ -290,15 +410,14 @@ public struct ActiveTrip: Codable, Sendable {
         if leg.mode == .transit {
             if hasBoarded {
                 let rides = leg.option.rides
-                if let ride = currentRide(at: now), let index = rides.firstIndex(of: ride), index + 1 < rides.count,
-                   let exit = ride.stops.last?.station {
+                if let ride = rides.first, rides.count > 1 || isOffPlan == true, let exit = ride.stops.last?.station {
                     // Aboard, with changes still to make: what's ridden so far is fixed, but the rest of the leg is
                     // worth another look from where this train really gets in.
                     let exitStop = Waypoint(name: exit.name, coordinate: exit.coordinate, kind: .stop(feedID: exit.feedID, stopID: exit.stopID))
                     return ReplanRequest(template: TripTemplate(waypoints: [exitStop] + waypoints[(currentSegment + 1)...],
                                                                 modes: Array(modes[currentSegment...]), excludedFeedIDs: template.excludedFeedIDs),
                                          departure: max(now, ride.alight), firstSegment: currentSegment, canDelayDeparture: false,
-                                         isWaitingAtOrigin: false, keptRides: Array(rides[...index]))
+                                         isWaitingAtOrigin: false, keptRides: [ride])
                 }
                 // Aboard the last ride of the leg: it is fixed. Everything after it starts when it arrives.
                 let next = currentSegment + 1
@@ -311,8 +430,21 @@ public struct ActiveTrip: Codable, Sendable {
             var ahead = Array(waypoints[currentSegment...])
             // Standing where the leg starts only counts when that place is a stop. A rider at home is
             // not on a platform, however exactly the trip starts at their door.
-            var isAtStation = currentSegment > 0 || (leg.from.isStop
-                && location.map { $0.distance(to: leg.from.coordinate) <= Self.platformRadius } ?? false)
+            let isAtStart = location.map { $0.distance(to: leg.from.coordinate) <= Self.platformRadius } ?? false
+            var isAtStation = currentSegment > 0 || (leg.from.isStop && isAtStart)
+            if leg.from.id != ahead[0].id, leg.from.isStop {
+                // Off one vehicle and waiting for the next: the leg starts at that stop now.
+                ahead[0] = leg.from
+                // By the clock alone the rider may still be pulling in. Only seeing them there spares the time for the change.
+                if finishedRide != nil { isAtStation = sense.sawExit == true || isAtStart }
+            }
+            var departure = notYetDue
+            // A vehicle due a moment ago may only be late, or be pulling out with the rider aboard and the phone a
+            // few seconds behind. It isn't planned away at the stroke of its time.
+            if !isAwaitingReplan, let first = leg.option.rides.first, first.board <= now,
+               now.timeIntervalSince(first.board) <= (first.isRealtime ? 60 : 180) {
+                departure = min(departure, first.board.addingTimeInterval(-first.walkBefore))
+            }
             if !isAtStation, let location, let platform = leg.option.rides.first?.stops.first?.station,
                location.distance(to: platform.coordinate) <= Self.platformRadius {
                 // Already on the platform, ahead of where the leg said it would start: plan from the
@@ -323,7 +455,7 @@ public struct ActiveTrip: Codable, Sendable {
             }
             return ReplanRequest(template: TripTemplate(waypoints: ahead, modes: Array(modes[currentSegment...]),
                                                            excludedFeedIDs: template.excludedFeedIDs),
-                                 departure: notYetDue, firstSegment: currentSegment, canDelayDeparture: false, isWaitingAtOrigin: isAtStation)
+                                 departure: departure, firstSegment: currentSegment, canDelayDeparture: false, isWaitingAtOrigin: isAtStation)
         }
 
         // Driving or walking: measure from where the rider actually is.
@@ -336,8 +468,12 @@ public struct ActiveTrip: Codable, Sendable {
                              departure: isUnderway ? now : notYetDue, firstSegment: currentSegment, canDelayDeparture: !isUnderway, isWaitingAtOrigin: false)
     }
 
-    /// Takes fresh plans for `request`. Keeps following the same vehicles when that is still possible (updating
-    /// their times), and otherwise switches to the best new plan and says so.
+    /// Takes fresh plans for `request`.
+    ///
+    /// While the next boarding is still open, the two best ways on from it are kept side by side for the rider to
+    /// pick from, and the trip stays on the one it was showing for as long as that is one of them: it never
+    /// flips between them by itself. Once the rider has picked (or there is only one way to go), the same
+    /// vehicles are followed with their latest times, and another plan only comes into it by saving real time.
     public mutating func apply(_ itineraries: [Itinerary], for request: ReplanRequest) {
         // A request is stale if the rider moved on while it was being planned.
         guard !itineraries.isEmpty, request.firstSegment >= currentSegment, request.firstSegment < legs.count else { return }
@@ -349,24 +485,54 @@ public struct ActiveTrip: Codable, Sendable {
                   leg.option.rides.count >= request.keptRides.count,
                   zip(leg.option.rides, request.keptRides).allSatisfy({ Self.isSameRide($0, $1) }) else { return }
             itineraries = itineraries.compactMap { Self.merging($0, onto: Array(leg.option.rides.prefix(request.keptRides.count)), of: leg) }
-            guard !itineraries.isEmpty else { return }
+        } else if request.firstSegment == currentSegment, hasBoarded, legs[currentSegment].mode == .transit {
+            // Planned while the rider was still waiting, and they have boarded since.
+            return
         }
+        let first = request.firstSegment
+        let candidates = itineraries.map { Self.reindexed($0, from: first) }.filter { first + $0.legs.count == legs.count }
+        guard let best = candidates.min(by: { $0.arrival < $1.arrival }) else { return }
         isAwaitingReplan = false
+        let wasOffPlan = isOffPlan == true
+        isOffPlan = nil
 
-        let followedID = Itinerary(legs: Array(legs[request.firstSegment...])).id
-        let best = itineraries.min { $0.arrival < $1.arrival } ?? itineraries[0]
+        let followedID = Itinerary(legs: Array(legs[first...])).id
+        let same = candidates.first { $0.id == followedID }
+        var found = branches(among: candidates)
+        if hasChosenBranch == true, same == nil, found.count > 1 {
+            // The way the rider picked can't be done any more: it is theirs to pick again.
+            hasChosenBranch = nil
+        }
+        if hasChosenBranch != true, found.count > 1 {
+            let followed = nextBoarding(in: legs[first...]).map { Self.key(for: $0.ride) }
+            let follow = found.first { $0.itinerary.id == followedID } ?? found.first { $0.id == followed } ?? found[0]
+            // Each keeps the place it had: two buttons that swap sides under a thumb are worse than none.
+            if let shown = openBranches, shown.first?.id == found[1].id || (shown.count > 1 && shown[1].id == found[0].id) {
+                found.swapAt(0, 1)
+            }
+            openBranches = found
+            legs.replaceSubrange(first..., with: follow.itinerary.legs)
+            if case .fasterOption = notice { notice = nil }
+            return
+        }
 
-        if let same = itineraries.first(where: { $0.id == followedID }) {
-            replaceLegs(from: request.firstSegment, with: same)
-            if best.id != followedID, same.arrival.timeIntervalSince(best.arrival) >= Self.worthwhileSaving {
-                notice = .fasterOption(Self.reindexed(best, from: request.firstSegment))
+        openBranches = nil
+        if let same {
+            legs.replaceSubrange(first..., with: same.legs)
+            let saving = same.arrival.timeIntervalSince(best.arrival)
+            if best.id != followedID, saving > Self.switchSaving {
+                legs.replaceSubrange(first..., with: best.legs)
+                notice = .switchedToFaster(previousArrival: same.arrival)
+            } else if best.id != followedID, saving >= Self.askSaving {
+                notice = .fasterOption(best)
             } else if case .fasterOption = notice {
                 notice = nil
             }
         } else {
             let previousArrival = arrival
-            replaceLegs(from: request.firstSegment, with: best)
-            notice = .planChanged(previousArrival: previousArrival)
+            legs.replaceSubrange(first..., with: best.legs)
+            // Boarding something the plan didn't have is the rider's doing, not news to them.
+            if !wasOffPlan { notice = .planChanged(previousArrival: previousArrival) }
         }
     }
 
@@ -376,11 +542,66 @@ public struct ActiveTrip: Codable, Sendable {
               first + itinerary.legs.count == legs.count else { return }
         legs.replaceSubrange(first..., with: itinerary.legs)
         notice = nil
+        openBranches = nil
+        hasChosenBranch = true
     }
 
-    private mutating func replaceLegs(from firstSegment: Int, with itinerary: Itinerary) {
-        guard firstSegment + itinerary.legs.count == legs.count else { return }
-        legs.replaceSubrange(firstSegment..., with: Self.reindexed(itinerary, from: firstSegment).legs)
+    // MARK: Branches
+
+    /// The rider picks one of the ways onward. Picking one whose vehicle has already pulled out says they are on it.
+    public mutating func choose(branch id: String, now: Date = .now) {
+        guard let branch = branches.first(where: { $0.id == id }), let first = branch.itinerary.legs.first?.segmentIndex,
+              first >= currentSegment, first + branch.itinerary.legs.count == legs.count else { return }
+        legs.replaceSubrange(first..., with: branch.itinerary.legs)
+        notice = nil
+        trainQuestion = nil
+        openBranches = nil
+        hasChosenBranch = true
+        if branch.segment == currentSegment, !hasBoarded, now >= branch.ride.board {
+            board(branch.ride, segment: branch.segment, rideIndex: branch.rideIndex, evidence: .riderAboard, now: now)
+        }
+    }
+
+    /// The next boarding still ahead in `legs` (which start at the current one or later): where, and onto what.
+    private func nextBoarding(in legs: some Sequence<Leg>) -> (segment: Int, rideIndex: Int, ride: Ride)? {
+        for leg in legs where leg.mode == .transit {
+            if leg.segmentIndex == currentSegment, hasBoarded {
+                if leg.option.rides.count > 1 { return (leg.segmentIndex, 1, leg.option.rides[1]) }
+            } else if let ride = leg.option.rides.first {
+                return (leg.segmentIndex, 0, ride)
+            }
+        }
+        return nil
+    }
+
+    /// The two soonest-arriving plans that board different vehicles at the next boarding.
+    private func branches(among candidates: [Itinerary]) -> [TripBranch] {
+        var found: [TripBranch] = []
+        for itinerary in candidates.sorted(by: { $0.arrival < $1.arrival }) {
+            guard let next = nextBoarding(in: itinerary.legs) else { continue }
+            let id = Self.key(for: next.ride)
+            guard !found.contains(where: { $0.id == id }) else { continue }
+            found.append(TripBranch(id: id, itinerary: itinerary, segment: next.segment, rideIndex: next.rideIndex, ride: next.ride))
+            if found.count == 2 { break }
+        }
+        return found
+    }
+
+    private static func key(for ride: Ride) -> String {
+        "\(ride.routeName)@\(ride.boardStopName)@\(Int(ride.scheduledBoard.timeIntervalSince1970))"
+    }
+
+    /// Coming up on a boarding or on getting off: the minutes in which the plan can still change, when the
+    /// rider's location and the departures are worth following closely.
+    public func isNearDecision(location: Coordinate?, now: Date) -> Bool {
+        guard let leg = currentLeg else { return false }
+        if leg.mode == .transit, hasBoarded, let ride = leg.option.rides.first {
+            return ride.alight.timeIntervalSince(now) <= Self.closeWatch
+        }
+        guard let next = nextBoarding(in: remainingLegs) else { return false }
+        if next.ride.board.timeIntervalSince(now) <= Self.closeWatch { return true }
+        guard let location, let stop = next.ride.stops.first?.station else { return false }
+        return location.distance(to: stop.coordinate) <= 2 * Self.platformRadius
     }
 
     /// Puts rides already taken back in front of a plan for the rest of their leg.
@@ -427,16 +648,18 @@ public struct ActiveTrip: Codable, Sendable {
             guard segment < legs.count, legs[segment].mode == .transit else { return nil }
             rides = legs[segment].option.rides
         }
-        let watched = rides.enumerated().filter { $0.offset >= from && $0.element.trip != nil }
+        var watched = rides.enumerated().filter { $0.offset >= from && $0.element.trip != nil }
             .map { WatchedRide(index: $0.offset, ride: $0.element) }
+        // The other way the rider could go from the same place: boarding it is as likely as boarding the one shown.
+        for branch in branches where branch.segment == segment && branch.rideIndex >= from && branch.ride.trip != nil {
+            guard !watched.contains(where: { $0.index == branch.rideIndex && Self.isSameRide($0.ride, branch.ride) }) else { continue }
+            watched.append(WatchedRide(index: branch.rideIndex, ride: branch.ride, isAlternative: true))
+        }
         return watched.isEmpty ? nil : (segment: segment, rides: watched)
     }
 
-    /// Where in the current leg the rider is, ride by ride.
-    public func ridingIndex(at now: Date) -> Int {
-        guard let leg = currentLeg, let ride = currentRide(at: now) else { return 0 }
-        return leg.option.rides.firstIndex(of: ride) ?? 0
-    }
+    /// Where in the current leg the rider is, ride by ride: always the first, now that rides got off are dropped.
+    public func ridingIndex(at now: Date) -> Int { 0 }
 
     /// Takes a train the location matched. A clear match is taken as fact, an unclear one as the likeliest train for
     /// now, to be replaced if later fixes fit another better. Only when two trains still fit alike well after the rider
@@ -446,11 +669,21 @@ public struct ActiveTrip: Codable, Sendable {
         let rides = legs[segment].option.rides
         guard match.rideIndex < rides.count else { return }
         let evidence: BoardingEvidence = match.isConfident ? .location : .likely
-        if segment == currentSegment, hasBoarded, rides[match.rideIndex].trip == trip, ridingIndex(at: now) == match.rideIndex {
+        if match.isAlternative {
+            // The other way to go, not the one shown: only a clear match moves the trip onto it. Until then the
+            // trip stays where it is, and two lines that can't be told apart are put to the rider.
+            guard match.isConfident, segment == currentSegment || match.leftStation, boardedBy != .rider else {
+                ask(about: match, segment: segment, rideIndex: match.rideIndex)
+                return
+            }
+            board(match.ride, segment: segment, rideIndex: match.rideIndex, evidence: evidence, leavingPlan: true, now: now)
+            return
+        }
+        if segment == currentSegment, hasBoarded, rides[match.rideIndex].trip == trip, match.rideIndex == 0 {
             // Already shown on that very train; the location just makes it surer.
             if let boardedBy, boardedBy != .rider, boardedBy != .location { self.boardedBy = evidence }
         } else {
-            if segment == currentSegment, hasBoarded, match.rideIndex <= ridingIndex(at: now),
+            if segment == currentSegment, hasBoarded, match.rideIndex == 0,
                boardedBy == .rider || (boardedBy == .location && !match.isConfident) {
                 // The rider's word stands, and a clear match isn't undone by a vaguer one.
                 return
@@ -462,25 +695,40 @@ public struct ActiveTrip: Codable, Sendable {
         }
         if match.isConfident {
             trainQuestion = nil
-        } else if let rival = match.rival, boardedBy != .rider, askedWhichTrain != true {
-            trainQuestion = TrainQuestion(options: [match.ride, rival].sorted { $0.board < $1.board },
-                                          segment: currentSegment, rideIndex: ridingIndex(at: now))
-            askedWhichTrain = true
+        } else {
+            ask(about: match, segment: currentSegment, rideIndex: 0)
         }
+    }
+
+    /// Two vehicles still fit alike well after the rider should be past a stop or two: put it to them, once.
+    private mutating func ask(about match: TrainMatch, segment: Int, rideIndex: Int) {
+        guard let rival = match.rival, boardedBy != .rider, askedWhichTrain != true else { return }
+        let options = [(ride: match.ride, isAlternative: match.isAlternative), (ride: rival, isAlternative: match.rivalIsAlternative)]
+            .sorted { $0.ride.board < $1.ride.board }
+        trainQuestion = TrainQuestion(options: options.map(\.ride), segment: segment, rideIndex: rideIndex,
+                                      alternatives: options.map(\.isAlternative))
+        askedWhichTrain = true
     }
 
     /// The rider picked one of the trains the app asked about.
     public mutating func answerTrainQuestion(_ option: Int, now: Date = .now) {
         guard let question = trainQuestion, question.options.indices.contains(option) else { return }
-        board(question.options[option], segment: question.segment, rideIndex: question.rideIndex, evidence: .rider, now: now)
+        board(question.options[option], segment: question.segment, rideIndex: question.rideIndex, evidence: .rider,
+              leavingPlan: question.alternatives?[option] ?? false, now: now)
+        trainQuestion = nil
     }
 
     /// Puts the rider on `ride` in place of ride `rideIndex` of leg `segment`, moving the trip on to that leg if it
     /// hadn't got there: a drive to the station that ended without the app seeing it end is simply over.
-    public mutating func board(_ ride: Ride, segment: Int, rideIndex: Int, evidence: BoardingEvidence, now: Date = .now) {
+    /// - Parameter leavingPlan: the ride goes another way than the plan did, so nothing the plan had after it in
+    ///   the leg still holds; the next plan starts from where it lets the rider off.
+    public mutating func board(_ ride: Ride, segment: Int, rideIndex: Int, evidence: BoardingEvidence, leavingPlan: Bool = false,
+                               now: Date = .now) {
         guard segment >= currentSegment, segment < legs.count, legs[segment].mode == .transit,
               rideIndex < legs[segment].option.rides.count else { return }
         let isCatchingUp = segment > currentSegment
+        // Swapping the vehicle the rider is already shown on for another isn't boarding anew.
+        let isNewBoarding = isCatchingUp || !hasBoarded || rideIndex > 0
         while currentSegment < segment { advance(now: now, recording: false) }
 
         var leg = legs[segment]
@@ -493,6 +741,10 @@ public struct ActiveTrip: Codable, Sendable {
         rides[rideIndex] = ride
         // Rides before this one are done with.
         rides.removeFirst(rideIndex)
+        if leavingPlan {
+            rides = [ride]
+            isOffPlan = true
+        }
         if rideIndex > 0, let board = ride.stops.first?.station {
             leg.from = Waypoint(name: board.name, coordinate: board.coordinate, kind: .stop(feedID: board.feedID, stopID: board.stopID))
             leg.option.departure = ride.board.addingTimeInterval(-ride.walkBefore)
@@ -511,6 +763,12 @@ public struct ActiveTrip: Codable, Sendable {
         trainQuestion = nil
         isAwaitingReplan = false
         if !wasBoarded, !isCatchingUp { recordBoarding(now: now) }
+        if isNewBoarding {
+            // Whatever was open or picked was about this boarding. The next one starts afresh.
+            hasChosenBranch = nil
+            openBranches = nil
+            if leavingPlan { finishedRide = nil } else { recordChange(now: now) }
+        }
     }
 
     // MARK: Geofences
@@ -656,7 +914,7 @@ public struct ActiveTrip: Codable, Sendable {
     /// A trip that starts with a ride has no leg boundary at the station, so the connection is timed
     /// from the rider turning up on the platform to the train pulling out.
     private mutating func recordBoarding(now: Date) {
-        guard accessRecordID == nil, !startedAtPlatform, let reachedPlatformAt,
+        guard finishedRide == nil, accessRecordID == nil, !startedAtPlatform, let reachedPlatformAt,
               let promised = committed[currentSegment], let aimedFor = promised.option.rides.first,
               let plannedArrival = plannedPlatformArrival(for: promised) else { return }
 
@@ -677,6 +935,31 @@ public struct ActiveTrip: Codable, Sendable {
         )
         accessRecordID = record.id
         records.append(record)
+    }
+
+    /// A change of vehicles, recorded as the second is boarded. Changes happen underground, where there is nothing
+    /// to watch, so they are only worth recording where realtime says what actually became of them.
+    private mutating func recordChange(now: Date) {
+        defer { finishedRide = nil }
+        guard let off = finishedRide, let onto = currentLeg?.option.rides.first, off.isRealtime || onto.isRealtime,
+              let promised = committed[currentSegment]?.option.rides,
+              let was = promised.firstIndex(where: { Self.isSameRide($0, off) }),
+              was + 1 < promised.count, Self.isSameRide(promised[was + 1], onto) else { return }
+        // The platform is reached when the first vehicle lets the rider off and they have walked across.
+        let actualArrival = off.alight.addingTimeInterval(onto.walkBefore)
+        records.append(ConnectionRecord(
+            date: now,
+            approach: .change,
+            stationID: onto.stops.first?.station.id,
+            stationName: onto.boardStopName,
+            routeName: onto.routeName,
+            plannedArrival: promised[was].alight.addingTimeInterval(promised[was + 1].walkBefore),
+            actualArrival: actualArrival,
+            plannedDeparture: promised[was + 1].board,
+            actualDeparture: onto.board,
+            isObserved: false,
+            wasMissed: actualArrival > onto.board
+        ))
     }
 
     private mutating func recordConnections(leaving segment: Int, now: Date) {

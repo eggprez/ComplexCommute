@@ -107,6 +107,38 @@ public struct ConnectionBoard: Codable, Hashable, Sendable {
     }
 }
 
+/// One of the ways onward from the next boarding, as a button: the lines it rides, when the first of them
+/// leaves, and when it gets the rider there.
+public struct BranchGlance: Codable, Hashable, Identifiable, Sendable {
+    /// The branch's own id (see `TripBranch`), handed back when the button is tapped.
+    public var id: String
+    /// The lines ridden this way, in order.
+    public var routes: [RouteLabel]
+    public var departs: Date
+    public var arrival: Date
+    public var isRealtime: Bool
+
+    public init(id: String, routes: [RouteLabel], departs: Date, arrival: Date, isRealtime: Bool = false) {
+        self.id = id
+        self.routes = routes
+        self.departs = departs
+        self.arrival = arrival
+        self.isRealtime = isRealtime
+    }
+}
+
+/// The choice coming up: where it is made, and the two best ways on from there.
+public struct DecisionGlance: Codable, Hashable, Sendable {
+    /// Where the boarding is: "LaGuardia Terminal B".
+    public var station: String
+    public var options: [BranchGlance]
+
+    public init(station: String, options: [BranchGlance]) {
+        self.station = station
+        self.options = options
+    }
+}
+
 /// A trip in progress boiled down to what fits on a Lock Screen or a wrist: how it stands against
 /// the time to be there, and the next thing to do.
 public struct TripGlance: Codable, Hashable, Sendable {
@@ -121,10 +153,16 @@ public struct TripGlance: Codable, Hashable, Sendable {
     public var connections: ConnectionBoard?
     /// Buttons for telling the trip what happened without opening the app.
     public var actions: [TripAction]
+    /// What the buttons are about, so they can say "On Bus" at a bus stop.
+    public var vehicle: VehicleKind?
+    /// The ways onward from the next boarding, while which to take is still the rider's to pick.
+    public var decision: DecisionGlance?
 
     public init(destination: String, instruction: TripInstruction, arrival: Date, arriveBy: Date? = nil, isFinished: Bool = false,
-                connections: ConnectionBoard? = nil, actions: [TripAction] = []) {
+                connections: ConnectionBoard? = nil, actions: [TripAction] = [], vehicle: VehicleKind? = nil, decision: DecisionGlance? = nil) {
         self.actions = actions
+        self.vehicle = vehicle
+        self.decision = decision
         self.destination = destination
         self.instruction = instruction
         self.arrival = arrival
@@ -168,8 +206,30 @@ extension ActiveTrip {
             // otherwise unchanged doesn't count as new every second.
             projected = Date(timeIntervalSinceReferenceDate: (now.timeIntervalSinceReferenceDate / 60).rounded(.up) * 60)
         }
-        return TripGlance(destination: template.waypoints.last?.name ?? "", instruction: instruction(at: now),
-                          arrival: projected, arriveBy: arriveBy, isFinished: isFinished, actions: actions(at: now))
+        var instruction = instruction(at: now)
+        let decision = decision
+        if decision != nil, instruction.kind != .ride {
+            // Which vehicle is the open question: the step names the place, and the choices say the rest.
+            instruction.route = nil
+            instruction.detail = nil
+            if instruction.kind == .board || instruction.kind == .change {
+                instruction.deadline = nil
+                instruction.countsSeconds = false
+            }
+        }
+        return TripGlance(destination: template.waypoints.last?.name ?? "", instruction: instruction,
+                          arrival: projected, arriveBy: arriveBy, isFinished: isFinished, actions: actions(at: now),
+                          vehicle: (currentLeg?.mode == .transit ? currentRide(at: now) : connection?.ride)?.vehicle, decision: decision)
+    }
+
+    /// The open choice as the Lock Screen draws it, or nil when there is nothing to pick between.
+    public var decision: DecisionGlance? {
+        let branches = branches
+        guard branches.count > 1, !isFinished else { return nil }
+        return DecisionGlance(station: branches[0].ride.boardStopName, options: branches.map { branch in
+            BranchGlance(id: branch.id, routes: Array(branch.rides.map(\.label).prefix(3)), departs: branch.ride.board,
+                         arrival: branch.arrival, isRealtime: branch.ride.isRealtime)
+        })
     }
 
     public func instruction(at now: Date) -> TripInstruction {
@@ -197,7 +257,7 @@ extension ActiveTrip {
                                    detail: detail.isEmpty ? nil : detail, route: ride.label, deadline: ride.alight)
         }
 
-        let isChange = leg.option.rides.first != ride
+        let isChange = isChangingVehicles
         let walk = ride.walkBefore >= 60 ? "\(ride.walkBefore.shortDuration) walk" : nil
         let toward = ride.headsign.map { "toward \($0)" }
         let delay = ride.board.timeIntervalSince(ride.scheduledBoard)

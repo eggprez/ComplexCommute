@@ -123,7 +123,7 @@ struct ActiveTripView: View {
                 Button("Departures at \(station.name)", systemImage: "clock") { router.station = station }
             }
             if leg.mode == .transit, trip.hasBoarded, !leg.option.rides.isEmpty {
-                Button("I Missed This Train", systemImage: "figure.wave") {
+                Button("I Missed This \((trip.currentRide(at: .now)?.vehicle ?? .train).title)", systemImage: "figure.wave") {
                     planner.markMissed()
                     Task { await planner.refreshActiveTrip() }
                 }
@@ -407,6 +407,22 @@ private struct NoticeRow: View {
                     .labelStyle(.iconOnly)
                     .buttonStyle(.borderless)
             }
+        case .switchedToFaster(let previousArrival):
+            HStack {
+                Label {
+                    Text("Switched to a Faster Way")
+                        .font(.headline)
+                    Text("It gets you there \(previousArrival.timeIntervalSince(arrival).shortDuration) sooner, at \(arrival.formatted(date: .omitted, time: .shortened)).")
+                } icon: {
+                    Image(systemName: "bolt.fill")
+                        .foregroundStyle(.green)
+                }
+                Spacer()
+                Button("Dismiss", systemImage: "xmark.circle.fill", action: dismiss)
+                    .foregroundStyle(.tertiary)
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderless)
+            }
         case .fasterOption(let itinerary):
             HStack {
                 Label {
@@ -432,8 +448,8 @@ private struct NoticeRow: View {
 
 // MARK: - Which train
 
-/// Which train the rider is on, why the app thinks so, and the way to put it right: the manual backup to
-/// matching the rider's location against where each train is.
+/// Which way the rider goes from the next boarding, which vehicle they're on and why the app thinks so, and
+/// the way to put it right: the manual backup to matching the rider's location against where each vehicle is.
 struct TrainCheckSection: View {
     let trip: ActiveTrip
     let now: Date
@@ -444,23 +460,57 @@ struct TrainCheckSection: View {
         if let question = trip.trainQuestion {
             questionRow(question)
         } else if let leg = trip.currentLeg {
-            if leg.mode == .transit, trip.hasBoarded, let ride = trip.currentRide(at: now), now >= ride.board {
-                aboardRow(ride)
-            } else if leg.mode == .transit {
-                Button("I'm On a Train", systemImage: "tram.fill", action: pickTrain)
-            } else if trip.connection != nil {
-                // The drive or walk may have ended without the app seeing it: a garage, a dead zone, a fast platform.
-                Button("I'm Already on the Train", systemImage: "tram.fill", action: pickTrain)
+            let riding = leg.mode == .transit && trip.hasBoarded ? trip.currentRide(at: now).flatMap { now >= $0.board ? $0 : nil } : nil
+            let branches = trip.branches
+            // What the rider would be getting on: the drive or walk may have ended without the app seeing it
+            // (a garage, a dead zone, a fast platform).
+            let catching = riding == nil ? (leg.mode == .transit ? trip.currentRide(at: now) : trip.connection?.ride)?.vehicle : nil
+            if riding != nil || branches.count > 1 || catching != nil {
+                VStack(alignment: .leading, spacing: 12) {
+                    if let riding {
+                        aboardRow(riding)
+                    }
+                    if branches.count > 1 {
+                        branchRows(branches, isAboard: riding != nil)
+                    }
+                    if let catching {
+                        Button(branches.count > 1 ? "I'm on Something Else" : leg.mode == .transit ? "I'm on a \(catching.title)" : "I'm Already on the \(catching.title)",
+                               systemImage: catching.symbol, action: pickTrain)
+                            .buttonStyle(.borderless)
+                    }
+                }
             }
         }
+    }
+
+    /// The two best ways on from the next boarding, side by side until one is taken: tapped here, or boarded.
+    private func branchRows(_ branches: [TripBranch], isAboard: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(isAboard ? "Next, from \(branches[0].ride.boardStopName)" : "Your Choice at \(branches[0].ride.boardStopName)")
+                .font(.headline)
+            Text("Tap the one you take. Both stay here with their latest times until you do, or until you're seen aboard one.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            ForEach(branches) { branch in
+                Button {
+                    withAnimation { planner.choose(branch.id) }
+                } label: {
+                    BranchRow(branch: branch, now: now)
+                }
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.roundedRectangle(radius: 12))
+                .tint(.primary)
+            }
+        }
+        .padding(.vertical, 4)
     }
 
     /// Two trains still fit alike: back to back, or a local and an express that haven't split yet.
     private func questionRow(_ question: TrainQuestion) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Which Train Are You On?")
+            Text(Set(question.options.map(\.vehicle)).count == 1 ? "Which \(question.options[0].vehicle.title) Are You On?" : "Which One Are You On?")
                 .font(.headline)
-            Text("Your location fits both. Pick one so times follow your train.")
+            Text("Your location fits both. Pick one so times follow it.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
             HStack {
@@ -492,7 +542,7 @@ struct TrainCheckSection: View {
                     RouteBadgeView(route: ride.badge)
                 }
                 .font(.subheadline.weight(.semibold))
-                Text(trip.boardedBy?.explanation ?? "")
+                Text(trip.boardedBy?.explanation(for: ride.vehicle) ?? "")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -521,18 +571,55 @@ extension BoardingEvidence {
         }
     }
 
-    var explanation: String {
+    func explanation(for vehicle: VehicleKind) -> String {
         switch self {
-        case .schedule: "Assumed from the schedule. Confirm it so times follow your train."
-        case .likely: "Your location fits this train best so far. Still checking at each stop."
-        case .riderAboard: "You said you're aboard. Your location will pick out the train, or confirm it here."
-        case .location: "Matched to your location. Times follow this train."
-        case .rider: "Confirmed by you. Times follow this train."
+        case .schedule: "Assumed from the schedule. Confirm it so times follow your \(vehicle.noun)."
+        case .likely: "Your location fits this \(vehicle.noun) best so far. Still checking at each stop."
+        case .riderAboard: "You said you're aboard. Your location will pick out the \(vehicle.noun), or confirm it here."
+        case .location: "Matched to your location. Times follow this \(vehicle.noun)."
+        case .rider: "Confirmed by you. Times follow this \(vehicle.noun)."
         }
     }
 }
 
-/// Every train going the rider's way around now, to say which one they're on.
+/// One way onward: the lines it rides, when the first of them leaves, and when it gets the rider there.
+private struct BranchRow: View {
+    let branch: TripBranch
+    let now: Date
+
+    var body: some View {
+        let wait = branch.ride.board.timeIntervalSince(now)
+        let leaving = wait >= 60 ? "Leaves \(branch.ride.board.clockTime) · in \(wait.shortDuration)"
+            : wait > -60 ? "Leaving now" : "Left \((-wait).shortDuration) ago"
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 4) {
+                    ForEach(Array(branch.rides.prefix(4).enumerated()), id: \.offset) { _, ride in
+                        RouteBadgeView(route: ride.badge)
+                    }
+                }
+                Text(leaving)
+                    .font(.subheadline)
+                    .foregroundStyle(branch.ride.isRealtime ? Color.goodText : Color.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            VStack(alignment: .trailing, spacing: 0) {
+                Text(branch.arrival.clockTime)
+                    .font(.system(.title3, design: .rounded, weight: .bold))
+                    .monospacedDigit()
+                Text("arrive")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Take \(branch.rides.map(\.routeName).joined(separator: ", then ")). \(leaving). Arrive \(branch.arrival.clockTime).")
+    }
+}
+
+/// Every vehicle going the rider's way around now, to say which one they're on.
 struct TrainPickerView: View {
     let planner: TripPlannerModel
 
@@ -557,17 +644,17 @@ struct TrainPickerView: View {
                     } header: {
                         Text("From \(choices.planned.boardStopName) toward \(choices.planned.alightStopName)")
                     } footer: {
-                        Text("Arrival times, and everything after this train, will follow the one you pick.")
+                        Text("Arrival times, and everything after this \(choices.planned.vehicle.noun), will follow the one you pick.")
                     }
                 } else if !isLoading {
-                    ContentUnavailableView("No Trains Found", systemImage: "tram",
-                                           description: Text("There's no schedule for this part of the trip to pick a train from."))
+                    ContentUnavailableView("Nothing Found", systemImage: "tram",
+                                           description: Text("There's no schedule for this part of the trip to pick from."))
                 }
             }
             .overlay {
                 if isLoading { ProgressView() }
             }
-            .navigationTitle("Which Train?")
+            .navigationTitle(choices.map { "Which \($0.planned.vehicle.title)?" } ?? "Which One?")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

@@ -83,6 +83,7 @@ private extension Ride {
         #expect(riding.deadline == t0 + 1800)
 
         // Off the first train, not yet on the second: a change, with the walk across and how late it is running.
+        trip.update(location: nil, now: t0 + 1900)
         let changing = trip.instruction(at: t0 + 1900)
         #expect(changing.kind == .change)
         #expect(changing.spokenTitle == "Change to B at Station B")
@@ -95,8 +96,10 @@ private extension Ride {
         var crossing = try #require(ActiveTrip(template: template, itinerary: Itinerary(legs: legs)))
         crossing.markArrived(now: t0 + 900)
         crossing.update(location: nil, now: t0 + 1300)
+        crossing.update(location: nil, now: t0 + 1900)
         #expect(crossing.instruction(at: t0 + 1900).detail == "3 min walk · free transfer · 2 min late")
 
+        trip.update(location: nil, now: t0 + 2300)
         let last = trip.instruction(at: t0 + 2300)
         #expect(last.kind == .ride)
         #expect(last.detail == "then walk to Office")
@@ -126,10 +129,12 @@ private extension Ride {
         #expect(aboard.catchableFrom == t0 + 1800 + 180)
 
         // Off and changing: whatever leaves from now on.
+        trip.update(location: nil, now: t0 + 1900)
         let changing = try #require(trip.upcomingChange(at: t0 + 1900))
         #expect(changing.catchableFrom == t0 + 1900)
 
         // On the last vehicle, with only a walk after it: nothing to change to.
+        trip.update(location: nil, now: t0 + 2600)
         #expect(trip.upcomingChange(at: t0 + 2600) == nil)
     }
 

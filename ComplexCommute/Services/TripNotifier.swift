@@ -62,6 +62,20 @@ final class TripNotifier {
         center.add(UNNotificationRequest(identifier: ID.fasterOption, content: content, trigger: nil))
     }
 
+    /// The trip moved itself to a plan that gets there much sooner. Said once per plan.
+    func announceSwitch(to itinerary: Itinerary, saving: TimeInterval) {
+        guard isAuthorized, announced != itinerary.id else { return }
+        announced = itinerary.id
+
+        let content = UNMutableNotificationContent()
+        content.title = "Switched to a Faster Way"
+        let routes = itinerary.legs.flatMap(\.option.rides).map(\.routeName).joined(separator: " → ")
+        content.body = "\(Int(saving / 60)) min sooner\(routes.isEmpty ? "" : " by \(routes)"). Arrive \(itinerary.arrival.formatted(date: .omitted, time: .shortened))."
+        content.sound = .default
+        content.interruptionLevel = .timeSensitive
+        center.add(UNNotificationRequest(identifier: ID.fasterOption, content: content, trigger: nil))
+    }
+
     /// Two trains fit the rider's location about equally: ask which, with a button for each, so it's answered
     /// from the Lock Screen without opening the app. Asked at most once a ride.
     func askWhichTrain(_ options: [Ride]) {
@@ -72,9 +86,10 @@ final class TripNotifier {
         center.setNotificationCategories([UNNotificationCategory(identifier: ID.whichTrain, actions: actions, intentIdentifiers: [])])
 
         let content = UNMutableNotificationContent()
-        content.title = "Which Train?"
+        let kinds = Set(options.map(\.vehicle))
+        content.title = kinds.count == 1 ? "Which \(options[0].vehicle.title)?" : "Which One?"
         content.body = "Can't tell whether you're on the \(options.map { Self.name($0, among: options) }.joined(separator: " or the ")). "
-            + "Pick one so arrival times follow your train."
+            + "Pick one so arrival times follow it."
         content.categoryIdentifier = ID.whichTrain
         content.interruptionLevel = .timeSensitive
         center.add(UNNotificationRequest(identifier: ID.whichTrain, content: content, trigger: nil))

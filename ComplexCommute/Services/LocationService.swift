@@ -13,6 +13,10 @@ final class LocationService {
     private var alwaysSession: CLServiceSession?
     private var background: CLBackgroundActivitySession?
     private var updates: Task<Void, Never>?
+    /// A trip is being travelled: fixes are asked for as a navigation app would, not as a map that happens to be open.
+    private var isFollowingTrip = false
+    /// Which run of `updates` is the current one, so one being replaced can't clear its replacement on the way out.
+    private var generation = 0
 
     var coordinate: Coordinate? {
         location.map { Coordinate(latitude: $0.coordinate.latitude, longitude: $0.coordinate.longitude) }
@@ -27,18 +31,22 @@ final class LocationService {
 
     func start() {
         guard updates == nil else { return }
-        session = CLServiceSession(authorization: .whenInUse)
+        if session == nil { session = CLServiceSession(authorization: .whenInUse) }
+        generation += 1
+        let run = generation
+        // On a trip every fix counts: a bus pulling out, a stop reached early. Navigation-grade updates keep coming
+        // at full rate and accuracy, where the default eases off to save power.
+        let configuration: CLLocationUpdate.LiveConfiguration = isFollowingTrip ? .otherNavigation : .default
         updates = Task {
             do {
-                for try await update in CLLocationUpdate.liveUpdates() {
+                for try await update in CLLocationUpdate.liveUpdates(configuration) {
                     if let location = update.location {
                         self.location = location
                         onUpdate?()
                     }
                 }
-            } catch {
-                self.updates = nil
-            }
+            } catch {}
+            if generation == run { self.updates = nil }
         }
     }
 
@@ -46,6 +54,14 @@ final class LocationService {
     /// iOS only honours a session begun while the app is in front, so `renew` starts a fresh one
     /// whenever the app comes forward mid-trip.
     func keepRunningInBackground(_ keep: Bool, renew: Bool = false) {
+        if keep != isFollowingTrip {
+            isFollowingTrip = keep
+            if updates != nil {
+                updates?.cancel()
+                updates = nil
+                start()
+            }
+        }
         if !keep || renew {
             background?.invalidate()
             background = nil
