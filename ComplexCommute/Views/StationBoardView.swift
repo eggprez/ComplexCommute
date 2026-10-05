@@ -73,6 +73,7 @@ struct StationBoardView: View {
                 ProgressView()
             }
         }
+        .contentMargins(.top, 8, for: .scrollContent)
         // Rows otherwise show through the title bar as they scroll under it.
         .scrollEdgeEffectStyle(.hard, for: .top)
         .navigationTitle(station.name)
@@ -101,7 +102,9 @@ struct StationBoardView: View {
         ScrollView(.horizontal) {
             HStack(spacing: 8) {
                 Button("All") { routeFilter = nil }
+                    .font(.subheadline.weight(.semibold))
                     .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
                     .tint(routeFilter == nil ? Color.accentColor : Color.secondary)
                 ForEach(routes, id: \.name) { route in
                     Button {
@@ -140,12 +143,20 @@ private struct DepartureGroupRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            RouteBadgeView(route: group.route, size: .large)
-                .frame(minWidth: 34)
-            VStack(alignment: .leading, spacing: 2) {
+            // A subway bullet leads the row; a line with a name ("Ronkonkoma Branch") sits under the destination
+            // so neither is squeezed.
+            let isBullet = group.route.name.count <= 4
+            if isBullet {
+                RouteBadgeView(route: group.route, size: .large)
+                    .frame(minWidth: 34)
+            }
+            VStack(alignment: .leading, spacing: 4) {
                 Text(group.destination)
                     .font(.body.weight(.medium))
                     .lineLimit(2)
+                if !isBullet {
+                    RouteBadgeView(route: group.route)
+                }
                 if let first = group.departures.first, first.isRealtime, abs(delay(of: first)) >= 60 {
                     Text(delay(of: first) > 0 ? "\(delay(of: first).shortDuration) late" : "\((-delay(of: first)).shortDuration) early")
                         .font(.footnote)
@@ -179,12 +190,12 @@ private struct DepartureGroupRow: View {
             if minutes == 0 {
                 Text("Now")
             } else if isNext {
-                Text("\(minutes) min")
+                Text("\(minutes)") + Text(" min").font(.caption.weight(.semibold))
             } else {
                 Text("\(minutes)")
             }
         }
-        .font(isNext ? .headline : .subheadline)
+        .font(isNext ? .system(.title3, design: .rounded, weight: .bold) : .system(.subheadline, design: .rounded, weight: .medium))
         .monospacedDigit()
         .foregroundStyle(departure.isRealtime ? Color.goodText : isNext ? Color.primary : Color.secondary)
         .lineLimit(1)

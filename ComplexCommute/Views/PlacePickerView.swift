@@ -94,7 +94,11 @@ struct PlacePickerView: View {
             Button {
                 pick(.currentLocation())
             } label: {
-                Label("Current Location", systemImage: "location.fill")
+                Label {
+                    Text("Current Location")
+                } icon: {
+                    IconTile(systemName: "location.fill", color: .blue, isRound: true)
+                }
             }
         }
         if !nearbyStops.isEmpty {
@@ -107,20 +111,21 @@ struct PlacePickerView: View {
         if !places.isEmpty {
             Section("Places") {
                 ForEach(places) { place in
-                    waypointButton(place.waypoint, symbol: "mappin.circle.fill")
+                    waypointButton(place.waypoint, symbol: place.symbol, color: place.tint)
                 }
             }
         }
         if !recents.isEmpty {
             Section("Recents") {
                 ForEach(recents) { recent in
-                    waypointButton(recent, symbol: recent.station == nil ? "clock" : "tram.fill")
+                    waypointButton(recent, symbol: recent.station == nil ? "clock" : "tram.fill",
+                                   color: recent.station == nil ? Color(.systemGray) : TravelMode.transit.tint)
                 }
             }
         }
     }
 
-    private func waypointButton(_ waypoint: Waypoint, symbol: String) -> some View {
+    private func waypointButton(_ waypoint: Waypoint, symbol: String, color: Color) -> some View {
         Button {
             pick(waypoint)
         } label: {
@@ -130,7 +135,7 @@ struct PlacePickerView: View {
                     Text(subtitle)
                 }
             } icon: {
-                Image(systemName: symbol)
+                IconTile(systemName: symbol, color: color, isRound: true)
             }
         }
         .tint(.primary)
@@ -202,8 +207,8 @@ private struct CompletionRow: View {
                     .lineLimit(1)
             }
         } icon: {
-            Image(systemName: completion.isQuery ? "magnifyingglass" : "mappin.circle.fill")
-                .foregroundStyle(completion.isQuery ? Color.secondary : Color.red)
+            IconTile(systemName: completion.isQuery ? "magnifyingglass" : "mappin",
+                     color: completion.isQuery ? Color(.systemGray) : Color.red, isRound: true)
         }
     }
 

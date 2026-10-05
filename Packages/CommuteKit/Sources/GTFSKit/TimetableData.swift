@@ -149,15 +149,7 @@ extension FeedDatabase {
         return (parts.year ?? 0) * 10_000 + (parts.month ?? 0) * 100 + (parts.day ?? 0)
     }
 
-    func timetableData(for days: [ServiceDay]) throws -> FeedTimetableData {
-        var stops: [FeedTimetableData.Stop] = []
-        let stopRows = try database.prepare("SELECT stop_id, name, lat, lon, parent_idx FROM stops ORDER BY stop_idx")
-        while try stopRows.step() {
-            stops.append(.init(id: stopRows.string(0) ?? "", name: stopRows.string(1) ?? "",
-                               coordinate: Coordinate(latitude: stopRows.double(2), longitude: stopRows.double(3)),
-                               parent: stopRows.optionalInt(4)))
-        }
-
+    private func routeTable() throws -> (routes: [RouteBadge], ids: [String]) {
         var routes: [RouteBadge] = []
         var routeIDs: [String] = []
         let routeRows = try database.prepare("SELECT short_name, long_name, color, text_color, type, route_id FROM routes ORDER BY route_idx")
@@ -166,14 +158,11 @@ extension FeedDatabase {
             routes.append(RouteBadge(name: routeRows.string(0) ?? routeRows.string(1) ?? "", colorHex: routeRows.string(2),
                                      textColorHex: routeRows.string(3), type: routeRows.int(4)))
         }
+        return (routes, routeIDs)
+    }
 
-        var transfers: [FeedTimetableData.Transfer] = []
-        let transferRows = try database.prepare("SELECT from_stop_idx, to_stop_idx, min_time FROM transfers WHERE type != 3")
-        while try transferRows.step() {
-            transfers.append(.init(from: transferRows.int(0), to: transferRows.int(1), seconds: transferRows.optionalInt(2)))
-        }
-
-        // Which days each service runs on.
+    /// Which of `days` each service runs on.
+    private func daysByService(_ days: [ServiceDay]) throws -> [Int: [ServiceDay]] {
         var daysByService: [Int: [ServiceDay]] = [:]
         let activeServices = try database.prepare("""
             SELECT service_idx FROM calendar WHERE start_date <= ?1 AND end_date >= ?1 AND (weekdays & ?2) != 0
@@ -191,6 +180,143 @@ extension FeedDatabase {
                 daysByService[activeServices.int(0), default: []].append(day)
             }
         }
+        return daysByService
+    }
+
+    var hasBoardIndex: Bool {
+        guard let statement = try? database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'stop_times_by_stop'") else { return false }
+        return (try? statement.step()) == true
+    }
+
+    /// The schedule cut down to the trips that call at `stopIDs` (stations, or stops in their own right) within
+    /// `window`, in seconds from the base day's midnight. Those trips are whole, so a board can say where each is
+    /// going; everything else about the feed is left on disk. A departure board near the rider needs no more, and a
+    /// widget has the memory for no more.
+    func timetableData(for days: [ServiceDay], callingAt stopIDs: [String], between window: Range<Int>) throws -> FeedTimetableData {
+        let (routes, routeIDs) = try routeTable()
+        let daysByService = try daysByService(days)
+
+        // The stops asked for, and the platforms of the ones that are stations.
+        var wanted = Set<Int>()
+        let platforms = try database.prepare("SELECT stop_idx FROM stops WHERE stop_id = ?1 OR parent_id = ?1")
+        for id in stopIDs {
+            platforms.reset()
+            platforms.bind(id, at: 1)
+            while try platforms.step() { wanted.insert(platforms.int(0)) }
+        }
+
+        struct TripRow {
+            var id: String
+            var route: Int
+            var service: Int
+            var headsign: String?
+            var shape: Int?
+        }
+        var tripRows: [Int: TripRow?] = [:]
+        let tripStatement = try database.prepare("SELECT route_idx, service_idx, headsign, trip_id, \(hasShapes ? "shape_idx" : "NULL") FROM trips WHERE trip_idx = ?")
+        func tripRow(_ index: Int) throws -> TripRow? {
+            if let known = tripRows[index] { return known }
+            tripStatement.reset()
+            tripStatement.bind(index, at: 1)
+            let row = try tripStatement.step()
+                ? TripRow(id: tripStatement.string(3) ?? "", route: tripStatement.int(0), service: tripStatement.int(1),
+                          headsign: tripStatement.string(2), shape: tripStatement.optionalInt(4))
+                : nil
+            tripRows[index] = .some(row)
+            return row
+        }
+
+        // Every call at those stops, on any day; which of them fall in the window depends on the day each trip runs.
+        var tripDays: [Int: [ServiceDay]] = [:]
+        if !wanted.isEmpty {
+            let calls = try database.prepare("""
+                SELECT trip_idx, departure FROM stop_times
+                WHERE stop_idx IN (\(wanted.sorted().map(String.init).joined(separator: ","))) AND departure IS NOT NULL
+                """)
+            while try calls.step() {
+                let (trip, departure) = (calls.int(0), calls.int(1))
+                guard let row = try tripRow(trip), let running = daysByService[row.service] else { continue }
+                for day in running where window.contains(departure + day.offsetSeconds) && !(tripDays[trip]?.contains(day) ?? false) {
+                    tripDays[trip, default: []].append(day)
+                }
+            }
+        }
+
+        var trips: [FeedTimetableData.Trip] = []
+        var stopTimes: [FeedTimetableData.StopTime] = []
+        let callRows = try database.prepare("SELECT stop_idx, arrival, departure, pickup_type, drop_off_type FROM stop_times WHERE trip_idx = ? ORDER BY seq")
+        for (trip, days) in tripDays.sorted(by: { $0.key < $1.key }) {
+            guard let row = try tripRow(trip) else { continue }
+            callRows.reset()
+            callRows.bind(trip, at: 1)
+            var calls: [FeedTimetableData.StopTime] = []
+            while try callRows.step() {
+                guard let arrival = callRows.optionalInt(1), let departure = callRows.optionalInt(2) else { continue }
+                calls.append(.init(stop: callRows.int(0), arrival: arrival, departure: departure,
+                                   canBoard: callRows.int(3) != 1, canAlight: callRows.int(4) != 1))
+            }
+            guard calls.count >= 2 else { continue }
+            for day in days {
+                let start = stopTimes.count
+                for call in calls {
+                    var shifted = call
+                    shifted.arrival += day.offsetSeconds
+                    shifted.departure += day.offsetSeconds
+                    stopTimes.append(shifted)
+                }
+                trips.append(.init(id: row.id, serviceDate: day.date, route: row.route, headsign: row.headsign, shape: row.shape, stopTimes: start..<stopTimes.count))
+            }
+        }
+
+        // Only the stops those trips touch, their stations, and what was asked for, renumbered to stand alone.
+        var used = wanted.union(stopTimes.map(\.stop))
+        var rows: [Int: FeedTimetableData.Stop] = [:]
+        let stopRow = try database.prepare("SELECT stop_id, name, lat, lon, parent_idx FROM stops WHERE stop_idx = ?")
+        var pending = Array(used)
+        while let index = pending.popLast() {
+            stopRow.reset()
+            stopRow.bind(index, at: 1)
+            guard try stopRow.step() else { continue }
+            let parent = stopRow.optionalInt(4)
+            rows[index] = .init(id: stopRow.string(0) ?? "", name: stopRow.string(1) ?? "",
+                                coordinate: Coordinate(latitude: stopRow.double(2), longitude: stopRow.double(3)), parent: parent)
+            if let parent, used.insert(parent).inserted { pending.append(parent) }
+        }
+        let order = rows.keys.sorted()
+        let position = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($1, $0) })
+        let stops = order.compactMap { index -> FeedTimetableData.Stop? in
+            guard var stop = rows[index] else { return nil }
+            stop.parent = stop.parent.flatMap { position[$0] }
+            return stop
+        }
+        // A call at a stop the feed never defined can't be drawn or boarded; the importer keeps none, but be safe.
+        guard stopTimes.allSatisfy({ position[$0.stop] != nil }) else {
+            return FeedTimetableData(feedID: feedID, stops: [], routes: routes, routeIDs: routeIDs, trips: [], stopTimes: [])
+        }
+        for index in stopTimes.indices {
+            stopTimes[index].stop = position[stopTimes[index].stop] ?? 0
+        }
+        return FeedTimetableData(feedID: feedID, stops: stops, routes: routes, routeIDs: routeIDs, trips: trips, stopTimes: stopTimes)
+    }
+
+    func timetableData(for days: [ServiceDay]) throws -> FeedTimetableData {
+        var stops: [FeedTimetableData.Stop] = []
+        let stopRows = try database.prepare("SELECT stop_id, name, lat, lon, parent_idx FROM stops ORDER BY stop_idx")
+        while try stopRows.step() {
+            stops.append(.init(id: stopRows.string(0) ?? "", name: stopRows.string(1) ?? "",
+                               coordinate: Coordinate(latitude: stopRows.double(2), longitude: stopRows.double(3)),
+                               parent: stopRows.optionalInt(4)))
+        }
+
+        let (routes, routeIDs) = try routeTable()
+
+        var transfers: [FeedTimetableData.Transfer] = []
+        let transferRows = try database.prepare("SELECT from_stop_idx, to_stop_idx, min_time FROM transfers WHERE type != 3")
+        while try transferRows.step() {
+            transfers.append(.init(from: transferRows.int(0), to: transferRows.int(1), seconds: transferRows.optionalInt(2)))
+        }
+
+        let daysByService = try daysByService(days)
 
         struct TripRow {
             var id: String

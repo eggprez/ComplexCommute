@@ -24,8 +24,12 @@ struct ActiveTripView: View {
 
                 // The turns themselves are left to a maps app; this one keeps following from behind it.
                 if let target = trip.directionsTarget(at: .now) {
-                    DirectionsButton(destination: target.destination, mode: target.mode)
-                        .listRowBackground(Color.accentColor.opacity(0.12))
+                    DirectionsButton(destination: target.destination, mode: target.mode, fillsWidth: true)
+                        .buttonStyle(.borderedProminent)
+                        .buttonBorderShape(.capsule)
+                        .controlSize(.large)
+                        .listRowInsets(EdgeInsets())
+                        .listRowBackground(Color.clear)
                 }
 
                 if !trip.isFinished {
@@ -65,6 +69,7 @@ struct ActiveTripView: View {
                 }
             }
         }
+        .contentMargins(.top, 6, for: .scrollContent)
         // Like Maps, the top of the sheet is the trip's vital signs, and all that shows when the sheet is pulled down.
         .safeAreaInset(edge: .top, spacing: 0) {
             if let trip = planner.active {
@@ -216,7 +221,7 @@ private struct TripSummaryBar: View {
     private func stat(_ value: String, _ unit: String) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(value)
-                .font(.system(.title2, design: .rounded, weight: .bold))
+                .font(.system(.title, design: .rounded, weight: .bold))
                 .monospacedDigit()
                 .contentTransition(.numericText())
             Text(unit)
@@ -250,6 +255,8 @@ private struct TripSummaryBar: View {
 struct DirectionsButton: View {
     let destination: Waypoint
     let mode: TravelMode
+    /// Stretched across its row, where it is the row's one action.
+    var fillsWidth = false
 
     @AppStorage(DirectionsApp.key) private var app = DirectionsApp.appleMaps
 
@@ -264,6 +271,7 @@ struct DirectionsButton: View {
         } label: {
             Label("Directions in \(app.name)", systemImage: "arrow.triangle.turn.up.right.diamond.fill")
                 .font(.headline)
+                .frame(maxWidth: fillsWidth ? .infinity : nil)
         } primaryAction: {
             app.open(to: destination, mode: mode)
         }
@@ -277,6 +285,11 @@ private struct NextStepCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            Text(trip.currentLeg == nil ? "Trip Complete" : "Next")
+                .font(.caption.weight(.bold))
+                .textCase(.uppercase)
+                .kerning(0.6)
+                .foregroundStyle(Color.accentColor)
             if let leg = trip.currentLeg {
                 step(for: leg)
             } else {
@@ -330,15 +343,21 @@ private struct NextStepCard: View {
     @ViewBuilder
     private func rideStep(_ ride: Ride, in leg: Leg) -> some View {
         let isAboard = trip.hasBoarded && now >= ride.board
-        HStack(spacing: 8) {
-            RouteBadgeView(route: ride.badge, size: .large)
-            if isAboard {
-                Text("Exit at \(ride.alightStopName)")
-            } else {
-                Text("Board at \(ride.board.formatted(date: .omitted, time: .shortened))")
+        let action = Text(isAboard ? "Exit at \(ride.alightStopName)" : "Board at \(ride.board.formatted(date: .omitted, time: .shortened))")
+            .font(.title2.weight(.bold))
+        // A line with a long name ("Ronkonkoma Branch") takes a row of its own rather than squeeze the words.
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                RouteBadgeView(route: ride.badge, size: .large)
+                    .fixedSize()
+                action
+                    .fixedSize()
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                RouteBadgeView(route: ride.badge, size: .large)
+                action
             }
         }
-        .font(.title2.weight(.bold))
 
         if isAboard {
             Text("Arrives \(ride.alight.formatted(date: .omitted, time: .shortened)) · \(ride.stopCount) \(ride.stopCount == 1 ? "stop" : "stops") from \(ride.boardStopName)")
@@ -383,7 +402,8 @@ private struct NoticeRow: View {
                         .foregroundStyle(.orange)
                 }
                 Spacer()
-                Button("Dismiss", systemImage: "xmark", action: dismiss)
+                Button("Dismiss", systemImage: "xmark.circle.fill", action: dismiss)
+                    .foregroundStyle(.tertiary)
                     .labelStyle(.iconOnly)
                     .buttonStyle(.borderless)
             }

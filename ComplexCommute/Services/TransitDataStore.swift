@@ -37,7 +37,13 @@ final class TransitDataStore {
     private var regionPlans: [TransitRegion: (feeds: [FeedDescriptor], done: Set<String>)] = [:]
 
     init() {
-        var directory = URL.applicationSupportDirectory.appending(path: "Feeds", directoryHint: .isDirectory)
+        var directory = AppGroup.feedsDirectory
+        // Schedules downloaded before widgets could read them move to where they can. Same disk, so it is a rename.
+        let legacy = AppGroup.legacyFeedsDirectory
+        if directory != legacy, FileManager.default.fileExists(atPath: legacy.path), !FileManager.default.fileExists(atPath: directory.path) {
+            try? FileManager.default.createDirectory(at: directory.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? FileManager.default.moveItem(at: legacy, to: directory)
+        }
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         // Schedules can always be downloaded again; keep them out of iCloud/device backups.
         var values = URLResourceValues()
@@ -52,6 +58,9 @@ final class TransitDataStore {
         installed = Dictionary(uniqueKeysWithValues: await library.installedFeeds().map { ($0.feedID, $0) })
         await installBuiltInFeeds()
         refreshStaleFeeds()
+        // Keys and schedules from before there were widgets, made readable by one.
+        KeychainStore.shareWithWidgets(APIKeyID.allCases.map(\.rawValue))
+        await library.indexForBoards()
     }
 
     /// The airport links the app carries go wherever the rest of their city is, and are rebuilt when the

@@ -461,6 +461,31 @@ private func changingItinerary(delay: TimeInterval = 0, isRealtime: Bool = true,
         let trip = try trip()
         #expect(trip.arriveByProgress(now: t0) == nil)
     }
+
+    @Test func holdsATripWithoutATargetToTheArrivalItFirstPlanned() throws {
+        var trip = try trip()
+        let planned = trip.arrival
+        trip.holdToPlannedArrival()
+        #expect(trip.arriveBy == planned)
+        #expect(trip.statedArriveBy == nil) // the plan's time, not one the rider gave
+        #expect(trip.arriveByProgress(now: t0)?.standing == .onTime)
+
+        // Survives being written down and read back as the plan's time.
+        let restored = try JSONDecoder().decode(ActiveTrip.self, from: JSONEncoder().encode(trip))
+        #expect(restored.arriveBy == planned)
+        #expect(restored.statedArriveBy == nil)
+
+        // Once the rider sets a time themselves, it is theirs.
+        trip.arriveBy = planned + 600
+        #expect(trip.statedArriveBy == planned + 600)
+    }
+
+    @Test func leavesATargetTheRiderGaveAlone() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary(driveStart: 0), arriveBy: t0 + 2500))
+        trip.holdToPlannedArrival()
+        #expect(trip.arriveBy == t0 + 2500)
+        #expect(trip.statedArriveBy == t0 + 2500)
+    }
 }
 
 extension ActiveTrip.Notice: Equatable {

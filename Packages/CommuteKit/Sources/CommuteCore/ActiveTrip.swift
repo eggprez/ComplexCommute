@@ -34,7 +34,12 @@ public struct ActiveTrip: Codable, Sendable {
     /// The followed itinerary, one leg per template segment.
     public private(set) var legs: [Leg]
     /// When the rider has to be there, if they said. Can be set or changed mid-trip.
-    public var arriveBy: Date?
+    public var arriveBy: Date? {
+        didSet { arriveByIsFromPlan = nil }
+    }
+    /// The arrive-by time is the arrival the plan promised at the start, not one the rider gave.
+    /// Optional so a trip saved by an earlier version still loads.
+    private var arriveByIsFromPlan: Bool?
     public private(set) var currentSegment = 0
     /// Aboard the current transit leg (or, for a leg without ride details, under way on it).
     public private(set) var hasBoarded = false
@@ -614,6 +619,19 @@ public struct ActiveTrip: Codable, Sendable {
         }
         // An arrival already in the past means the plan has stopped moving; the clock hasn't.
         return ArriveByProgress(target: arriveBy, projectedArrival: max(arrival, now))
+    }
+
+    /// A trip started without a time to be there by is measured against its own first estimate:
+    /// the arrival the plan promised when the rider set out.
+    public mutating func holdToPlannedArrival() {
+        guard arriveBy == nil, !legs.isEmpty else { return }
+        arriveBy = arrival
+        arriveByIsFromPlan = true
+    }
+
+    /// The arrive-by time the rider gave themselves, as opposed to one taken from the plan.
+    public var statedArriveBy: Date? {
+        arriveByIsFromPlan == true ? nil : arriveBy
     }
 
     // MARK: Learning the buffer

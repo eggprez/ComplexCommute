@@ -136,7 +136,10 @@ final class TripPlannerModel {
         if let coordinate = location.coordinate {
             resolved.updateCurrentLocation(coordinate)
         }
-        active = ActiveTrip(template: resolved, itinerary: selected, arriveBy: departure.target)
+        var trip = ActiveTrip(template: resolved, itinerary: selected, arriveBy: departure.target)
+        // Leaving now with no time to be there by: the arrival this plan promises becomes the one to keep.
+        if case .now = departure { trip?.holdToPlannedArrival() }
+        active = trip
         beginFollowing()
         // The reminder has done its job, and from here the trip screen is the thing to watch.
         notifier.cancelLeaveNow()
@@ -156,7 +159,7 @@ final class TripPlannerModel {
     /// Picks a trip back up after the app was closed under it.
     func resume(_ trip: ActiveTrip) {
         template = trip.template
-        departure = trip.arriveBy.map(DepartureChoice.arriveBy) ?? .now
+        departure = trip.statedArriveBy.map(DepartureChoice.arriveBy) ?? .now
         active = trip
         beginFollowing()
     }
@@ -391,6 +394,16 @@ final class TripPlannerModel {
         }
         let planned = try? await planner.plan(resolved, arrivingBy: target, notBefore: .now)
         return planned?.first { $0.arrival <= target } ?? planned?.first
+    }
+
+    /// Plans a commute as if leaving now, without disturbing the trip on screen: enough to know what it is travelled by.
+    func preview(_ template: TripTemplate) async -> Itinerary? {
+        var resolved = template
+        if resolved.usesCurrentLocation {
+            guard let coordinate = location.coordinate else { return nil }
+            resolved.updateCurrentLocation(coordinate)
+        }
+        return try? await planner.plan(resolved, departingAt: .now).first
     }
 
     /// Keeps the "time to leave" reminder on the trip being planned, so it fires with the phone away.
