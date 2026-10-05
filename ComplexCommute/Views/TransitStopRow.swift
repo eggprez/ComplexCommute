@@ -9,65 +9,39 @@ struct TransitStopRow: View {
     var body: some View {
         Label {
             Text(stop.name)
-            HStack(spacing: 4) {
-                ForEach(stop.routes.prefix(Self.maxBadges), id: \.self) { route in
-                    RouteBadgeView(route: route)
-                }
-                if stop.routes.count > Self.maxBadges {
-                    Text("+\(stop.routes.count - Self.maxBadges)")
-                        .font(.caption2)
-                }
-                if let distanceMeters {
-                    Text(Measurement(value: distanceMeters, unit: UnitLength.meters), format: .measurement(width: .abbreviated, usage: .road))
-                        .font(.footnote)
+            // As many bullets as fit whole: a squeezed one reads as "…".
+            ViewThatFits(in: .horizontal) {
+                ForEach([Self.maxBadges, 7, 5, 4, 3, 2, 1], id: \.self) { count in
+                    details(badges: count)
                 }
             }
         } icon: {
-            Image(systemName: stop.symbol)
+            IconTile(systemName: stop.symbol, color: TravelMode.transit.tint, isRound: true)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(stop.name), \(stop.routes.map(\.name).joined(separator: ", "))")
     }
 
+    private func details(badges count: Int) -> some View {
+        HStack(spacing: 4) {
+            ForEach(stop.routes.prefix(count), id: \.self) { route in
+                RouteBadgeView(route: route)
+                    .fixedSize()
+            }
+            if stop.routes.count > count {
+                Text("+\(stop.routes.count - count)")
+                    .font(.caption2)
+                    .fixedSize()
+            }
+            if let distanceMeters {
+                Text(Measurement(value: distanceMeters, unit: UnitLength.meters), format: .measurement(width: .abbreviated, usage: .road))
+                    .font(.footnote)
+                    .fixedSize()
+            }
+        }
+    }
+
     private static let maxBadges = 9
-}
-
-/// A line's bullet as riders know it from signs: a disc for a subway letter or number, a lozenge for anything longer.
-struct RouteBadgeView: View {
-    enum Size {
-        case small, regular, large
-
-        var height: CGFloat {
-            switch self {
-            case .small: 18
-            case .regular: 22
-            case .large: 30
-            }
-        }
-
-        var font: Font {
-            switch self {
-            case .small: .caption2.weight(.bold)
-            case .regular: .caption.weight(.bold)
-            case .large: .callout.weight(.bold)
-            }
-        }
-    }
-
-    let route: RouteBadge
-    var size = Size.small
-
-    var body: some View {
-        let fill = Color(hex: route.colorHex) ?? Color(.systemGray3)
-        Text(route.name)
-            .font(size.font)
-            .lineLimit(1)
-            .foregroundStyle(Color(hex: route.textColorHex) ?? Color.readable(on: route.colorHex) ?? Color.primary)
-            .padding(.horizontal, route.name.count <= 2 ? 0 : size.height * 0.3)
-            .frame(minWidth: size.height, minHeight: size.height)
-            .background(fill, in: .rect(cornerRadius: route.name.count <= 2 ? size.height / 2 : size.height * 0.28))
-            .accessibilityLabel("\(route.name) line")
-    }
 }
 
 extension TransitStop {

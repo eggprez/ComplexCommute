@@ -54,6 +54,7 @@ struct TripView: View {
                 ForEach(Array(planner.template.waypoints.enumerated()), id: \.element.id) { index, waypoint in
                     WaypointRow(
                         waypoint: waypoint,
+                        isDestination: index > 0 && index == planner.template.waypoints.count - 1,
                         modeToNext: index < planner.template.modes.count ? modeBinding(forSegment: index) : nil
                     ) {
                         pickerTarget = .replace(index)
@@ -97,17 +98,24 @@ struct TripView: View {
                 }
             }
 
-            if planner.selected != nil {
+            if let selected = planner.selected {
                 Section {
                     Button {
                         if planner.startActiveTrip() { onStart() }
                     } label: {
-                        Text("Go")
-                            .font(.title3.weight(.bold))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 6)
+                        VStack(spacing: 1) {
+                            Text("Go")
+                                .font(.system(.title2, design: .rounded, weight: .heavy))
+                            Text("Arrive \(selected.arrival.formatted(date: .omitted, time: .shortened))")
+                                .font(.footnote.weight(.medium))
+                                .monospacedDigit()
+                                .opacity(0.85)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 2)
                     }
                     .buttonStyle(.borderedProminent)
+                    .buttonBorderShape(.capsule)
                     .tint(.green)
                     .accessibilityLabel("Start Trip")
                     .listRowInsets(EdgeInsets())
@@ -144,8 +152,12 @@ struct TripView: View {
         .task(id: PlanKey(template: planner.template, departure: planner.departure, bufferMinutes: bufferMinutes)) {
             await planner.planContinuously()
         }
-        .onAppear { isOnScreen = true }
+        .onAppear {
+            isOnScreen = true
+            rememberLook()
+        }
         .onDisappear { isOnScreen = false }
+        .onChange(of: planner.selected.map(CommuteLook.init(itinerary:))) { rememberLook() }
         .onChange(of: planner.template) { previous, template in
             autosave(template, replacing: previous)
             if previous.excludedFeedIDs != template.excludedFeedIDs {
@@ -201,6 +213,14 @@ struct TripView: View {
             commute = saved
             askingArriveBy = saved
         }
+        try? modelContext.save()
+    }
+
+    /// Keeps the commute's icon true to how it is really travelled: the subway, a bus, a drive to a train.
+    private func rememberLook() {
+        guard isOnScreen, let commute, commute.template == planner.template,
+              let look = planner.selected.map(CommuteLook.init(itinerary:)), commute.look != look else { return }
+        commute.look = look
         try? modelContext.save()
     }
 
@@ -363,7 +383,7 @@ private struct ServicesPicker: View {
                     Text(summary)
                         .foregroundStyle(excluded.isEmpty ? Color.secondary : Color.accentColor)
                 } label: {
-                    Label("Services", systemImage: "tram")
+                    TileLabel(title: "Services", systemImage: "tram.fill", color: TravelMode.transit.tint)
                 }
                 .contentShape(.rect)
             }
@@ -413,6 +433,7 @@ private struct ServicesPicker: View {
 
 private struct WaypointRow: View {
     let waypoint: Waypoint
+    var isDestination = false
     let modeToNext: Binding<TravelMode>?
     let onTap: () -> Void
 
@@ -430,7 +451,7 @@ private struct WaypointRow: View {
                                 .foregroundStyle(Color.secondary)
                         }
                     } icon: {
-                        Image(systemName: waypoint.symbol)
+                        IconTile(systemName: waypoint.symbol, color: tileColor, isRound: true)
                     }
                     .multilineTextAlignment(.leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -453,6 +474,15 @@ private struct WaypointRow: View {
             }
         }
         .buttonStyle(.borderless)
+    }
+
+    private var tileColor: Color {
+        if isDestination { return .red }
+        return switch waypoint.kind {
+        case .currentLocation: .blue
+        case .stop: TravelMode.transit.tint
+        case .place: Color(.systemGray)
+        }
     }
 }
 
@@ -528,7 +558,7 @@ private struct LeaveAtCard: View {
                     .monospacedDigit()
                     .contentTransition(.numericText())
                 Text(lead)
-                    .font(.subheadline)
+                    .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
             }
             HStack(spacing: 6) {

@@ -193,6 +193,31 @@ private struct Fixture {
         #expect(nearby.map(\.stopID) == ["S1", "S2"])
     }
 
+    @Test func readsOnlyTheTripsCallingAtAStationForItsBoard() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let directory = fixture.directory.appendingPathComponent("feeds")
+        let library = FeedLibrary(directory: directory)
+        _ = try await library.install(feedID: "test", zip: fixture.zipURL)
+        #expect(try FeedDatabase(url: directory.appendingPathComponent("test.sqlite")).hasBoardIndex)
+
+        let monday = ServiceDay(date: 20260921, weekday: 0, offsetSeconds: 0)
+        // Asked by station; the trains call at its platform. The 10:00 is outside the window, the bus elsewhere.
+        let data = try #require(await library.timetableData(for: [monday], callingAt: ["test": ["S2"]], between: 7 * 3600..<9 * 3600).first)
+        #expect(data.trips.map(\.id) == ["T1"])
+        #expect(Set(data.stops.map(\.id)) == ["S1", "S1N", "S2", "S2N"])
+        let calls = data.stopTimes[try #require(data.trips.first).stopTimes]
+        #expect(calls.map { data.stops[$0.stop].id } == ["S2N", "S1N"])
+        #expect(calls.map(\.departure) == [8 * 3600 + 30, 8 * 3600 + 210])
+        // Platforms still point at their stations after being renumbered.
+        let platform = try #require(data.stops.first { $0.id == "S2N" })
+        #expect(platform.parent.map { data.stops[$0].id } == "S2")
+
+        // A day the service doesn't run on has nothing, however the clock reads.
+        let saturday = ServiceDay(date: 20260926, weekday: 5, offsetSeconds: 0)
+        #expect(await library.timetableData(for: [saturday], callingAt: ["test": ["S2"]], between: 0..<86_400).first?.trips.isEmpty == true)
+    }
+
     @Test func importsShapesAndTiesThemToTrips() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }

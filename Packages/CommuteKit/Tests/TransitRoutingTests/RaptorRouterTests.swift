@@ -511,3 +511,63 @@ private extension Timetable {
     #expect(timetable.departures(feedID: feedID, stopID: "bos-blue", toward: (feedID, "bos-e"),
                                  from: Date(timeIntervalSince1970: 10 * 3600), within: 900, limit: 20).contains { $0.route.name == "33" })
 }
+
+@Test func aNearbyBoardListsEachLineOnceAtTheNearestPlaceToBoardIt() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("nearby-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let library = FeedLibrary(directory: directory)
+    func times(_ trips: [(id: String, start: Int, stops: [String])]) -> String {
+        func clock(_ minutes: Int) -> String { String(format: "%02d:%02d:00", minutes / 60, minutes % 60) }
+        return "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n" + trips.flatMap { trip in
+            trip.stops.enumerated().map { "\(trip.id),\(clock(trip.start + $0 * 5)),\(clock(trip.start + $0 * 5)),\($1),\($0 + 1)" }
+        }.joined(separator: "\n")
+    }
+    let eight = 8 * 60
+    let trains = (0..<6).map { (id: "Q\($0)", start: eight + 5 + $0 * 10, stops: ["STN", "ENDN"]) }
+    let buses = [(id: "B0", start: eight + 7, stops: ["B1", "B2"]), (id: "B1", start: eight + 27, stops: ["B1", "B2"]),
+                 // The same bus calls across the street two minutes later: nothing a rider needs to be told twice.
+                 (id: "X0", start: eight + 9, stops: ["B1X", "B2"])]
+    _ = try await library.install(feedID: "city", files: [
+        "routes.txt": "route_id,route_short_name,route_long_name,route_type\nQ,Q,Broadway Express,1\nM9,M9,Crosstown,3",
+        "stops.txt": """
+            stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station
+            ST,Canal St,40.7500,-73.9900,1,
+            STN,Canal St,40.7500,-73.9900,0,ST
+            END,96 St,40.7900,-73.9500,1,
+            ENDN,96 St,40.7900,-73.9500,0,END
+            B1,Canal St & Broadway,40.7505,-73.9905,0,
+            B1X,Canal St & Church St,40.7512,-73.9912,0,
+            B2,Avenue C,40.7300,-73.9700,0,
+            """,
+        "calendar.txt": "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\nWKD,1,1,1,1,1,0,0,20260101,20261231",
+        "trips.txt": "route_id,service_id,trip_id,trip_headsign\n" + trains.map { "Q,WKD,\($0.id),96 St" }.joined(separator: "\n") + "\n"
+            + buses.map { "M9,WKD,\($0.id),Avenue C" }.joined(separator: "\n"),
+        "stop_times.txt": times(trains + buses),
+    ])
+
+    let newYork = try #require(TimeZone(identifier: "America/New_York"))
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = newYork
+    let now = try #require(calendar.date(from: DateComponents(year: 2026, month: 9, day: 21, hour: 8)))
+    let planner = TransitPlanner(library: library, timeZone: newYork)
+    let here = Coordinate(latitude: 40.7500, longitude: -73.9900)
+
+    let boards = await planner.nearbyBoards(around: here, at: now)
+    #expect(boards.map(\.station.stopID) == ["ST", "B1"])
+    #expect(boards.map(\.isBus) == [false, true])
+    let q = try #require(boards.first?.groups.first)
+    #expect(q.route.name == "Q" && q.destination == "96 St")
+    #expect(q.departures.map { Int($0.time.timeIntervalSince(now)) / 60 } == [5, 15, 25])
+    #expect(boards.last?.groups.first?.departures.map { Int($0.time.timeIntervalSince(now)) / 60 } == [7, 27])
+
+    #expect(await planner.nearbyBoards(around: here, at: now, modes: .rail).map(\.station.stopID) == ["ST"])
+    #expect(await planner.nearbyBoards(around: here, at: now, modes: .bus).map(\.station.stopID) == ["B1"])
+    // Nothing runs on a Saturday, and nothing is near the middle of the harbor.
+    #expect(await planner.nearbyBoards(around: here, at: now.addingTimeInterval(5 * 86_400)).isEmpty)
+    #expect(await planner.nearbyBoards(around: Coordinate(latitude: 40.6, longitude: -74.05), at: now).isEmpty)
+
+    // Ten minutes on, the 8:05 and the 8:07 have gone.
+    let later = boards.map { $0.upcoming(at: now.addingTimeInterval(600)) }
+    #expect(later.first?.groups.first?.departures.count == 2)
+    #expect(later.last?.groups.first?.departures.count == 1)
+}

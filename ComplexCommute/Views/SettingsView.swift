@@ -14,7 +14,11 @@ struct SettingsView: View {
                     NavigationLink {
                         BufferStatsView()
                     } label: {
-                        LabeledContent("Station Buffer", value: bufferMinutes == 0 ? "None" : "\(bufferMinutes) min")
+                        LabeledContent {
+                            Text(bufferMinutes == 0 ? "None" : "\(bufferMinutes) min")
+                        } label: {
+                            TileLabel(title: "Station Buffer", systemImage: "hourglass", color: .orange)
+                        }
                     }
                     NotificationRow()
                 } header: {
@@ -24,10 +28,12 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Picker("Directions In", selection: $directionsApp) {
+                    Picker(selection: $directionsApp) {
                         ForEach(DirectionsApp.allCases) { app in
                             Text(app.name).tag(app)
                         }
+                    } label: {
+                        TileLabel(title: "Directions In", systemImage: "arrow.triangle.turn.up.right.diamond.fill", color: .blue)
                     }
                 } footer: {
                     Text("Drives and walks are handed to this app for turn-by-turn directions. Commute keeps following the trip in the background and on your Lock Screen.")
@@ -48,7 +54,11 @@ struct SettingsView: View {
                         NavigationLink {
                             APIKeyView(key: key)
                         } label: {
-                            LabeledContent(key.name, value: store.apiKey(key) == nil ? "Not Set" : "Added")
+                            LabeledContent {
+                                Text(store.apiKey(key) == nil ? "Not Set" : "Added")
+                            } label: {
+                                TileLabel(title: key.name, systemImage: "key.fill", color: Color(.systemGray))
+                            }
                         }
                     }
                 } header: {
@@ -58,8 +68,10 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    NavigationLink("Data Sources") {
+                    NavigationLink {
                         DataSourcesView()
+                    } label: {
+                        TileLabel(title: "Data Sources", systemImage: "building.columns.fill", color: .teal)
                     }
                 } footer: {
                     Text("Transit information comes from the agencies' public data. ComplexCommute isn't affiliated with or endorsed by any of them.")
@@ -84,15 +96,23 @@ private struct NotificationRow: View {
     var body: some View {
         switch notifier.authorization {
         case .authorized, .provisional, .ephemeral:
-            LabeledContent("Trip Notifications", value: "On")
+            row("On")
         case .notDetermined:
-            LabeledContent("Trip Notifications", value: "Asked when you start a trip")
+            row("Asked when you start a trip")
         default:
             if let url = URL(string: UIApplication.openSettingsURLString) {
                 Link(destination: url) {
-                    LabeledContent("Trip Notifications", value: "Off")
+                    row("Off")
                 }
             }
+        }
+    }
+
+    private func row(_ value: String) -> some View {
+        LabeledContent {
+            Text(value)
+        } label: {
+            TileLabel(title: "Trip Notifications", systemImage: "bell.badge.fill", color: .red)
         }
     }
 }
@@ -105,9 +125,12 @@ private struct RegionRow: View {
     private var feeds: [FeedDescriptor] { FeedCatalog.feeds(in: region) }
 
     var body: some View {
-        HStack {
+        HStack(alignment: .top, spacing: 12) {
+            IconTile(systemName: "building.2.fill", size: 36)
+                .padding(.top, 2)
             VStack(alignment: .leading, spacing: 3) {
                 Text(region.name)
+                    .font(.headline)
                 Text(feeds.map(\.name).formatted(.list(type: .and)))
                     .font(.footnote)
                     .foregroundStyle(.secondary)

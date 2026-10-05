@@ -3,7 +3,7 @@ import Foundation
 import GTFSKit
 
 /// A vehicle due to leave a station.
-public struct StopDeparture: Hashable, Identifiable, Sendable {
+public struct StopDeparture: Codable, Hashable, Identifiable, Sendable {
     public let route: RouteBadge
     /// Where the vehicle is headed: its headsign, or failing that its last stop.
     public let destination: String
@@ -11,15 +11,29 @@ public struct StopDeparture: Hashable, Identifiable, Sendable {
     public let time: Date
     public let isRealtime: Bool
 
+    public init(route: RouteBadge, destination: String, scheduled: Date, time: Date, isRealtime: Bool) {
+        self.route = route
+        self.destination = destination
+        self.scheduled = scheduled
+        self.time = time
+        self.isRealtime = isRealtime
+    }
+
     public var id: String { "\(route.name)|\(destination)|\(Int(scheduled.timeIntervalSince1970))" }
 }
 
 /// The next few vehicles of one line to one destination, which is how a rider reads a departure board.
-public struct DepartureGroup: Hashable, Identifiable, Sendable {
+public struct DepartureGroup: Codable, Hashable, Identifiable, Sendable {
     public let route: RouteBadge
     public let destination: String
     /// Soonest first.
     public let departures: [StopDeparture]
+
+    public init(route: RouteBadge, destination: String, departures: [StopDeparture]) {
+        self.route = route
+        self.destination = destination
+        self.departures = departures
+    }
 
     public var id: String { "\(route.name)|\(destination)" }
 

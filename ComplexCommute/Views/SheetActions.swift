@@ -8,6 +8,16 @@ final class SheetRouter {
     /// A station whose departure board should open.
     var station: StationRef?
     var isShowingTransitData = false
+    /// A commute (by its `widgetID`) to open with its arrival time ready to be chosen: where its widget leads.
+    var commuteID: String?
+
+    /// A tap on a widget.
+    func open(_ link: AppLink) {
+        switch link {
+        case .commute(let id): commuteID = id
+        case .station(let station): self.station = station
+        }
+    }
 }
 
 extension EnvironmentValues {

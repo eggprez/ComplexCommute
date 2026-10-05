@@ -22,6 +22,10 @@ public enum GTFSImporter {
     /// Agencies trace shapes far more finely than a phone map can show.
     static let shapeToleranceMeters = 4.0
 
+    /// What calls at a stop, without reading every trip in the feed: all a departure board near the rider needs,
+    /// and all a widget has the memory for. Files imported before this was kept are given it by `FeedLibrary`.
+    static let boardIndex = "CREATE INDEX IF NOT EXISTS stop_times_by_stop ON stop_times (stop_idx, departure)"
+
     private static let schema = """
         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
         CREATE TABLE routes (route_idx INTEGER PRIMARY KEY, route_id TEXT NOT NULL, short_name TEXT, long_name TEXT,
@@ -332,6 +336,7 @@ public enum GTFSImporter {
                 WHERE parent_idx IS NULL AND EXISTS (SELECT 1 FROM stop_routes r WHERE r.stop_idx = stops.stop_idx);
             CREATE INDEX stops_by_lat ON stops (lat) WHERE searchable = 1;
             CREATE INDEX calendar_dates_by_date ON calendar_dates (date);
+            \(boardIndex);
             """)
 
         let insertMeta = try database.prepare("INSERT INTO meta VALUES (?, ?)")

@@ -4,6 +4,7 @@ import Foundation
 import Observation
 import SwiftData
 import TransitRouting
+import WidgetKit
 
 /// The app's long-lived pieces. They live above the view tree because a background refresh has to
 /// reach them when there is no view on screen at all.
@@ -16,7 +17,6 @@ final class AppServices {
     let notifier: TripNotifier
     let container: ModelContainer
     let liveActivity = TripActivityController()
-    let motion = MotionService()
     let stations = StationWatcher()
 
     private let tripStore = ActiveTripStore()
@@ -54,13 +54,19 @@ final class AppServices {
         }
 
         location.onUpdate = { [planner] in planner.locationDidChange() }
-        motion.onUpdate = { [planner] in planner.motionDidChange($0) }
         stations.onCrossing = { [planner] id, entered, date in planner.crossed(id, entered: entered, at: date) }
         TripActionRouter.handler = { [planner] in planner.perform($0) }
+        notifier.onTrainAnswer = { [planner] in planner.answerTrainQuestion($0) }
         // Before the trip is picked back up: a geofence crossing may be why the app was launched at all.
         stations.start()
         planner.recordConnections = { [weak self] in self?.keep($0) }
         planner.onTripChange = { [weak self] in self?.tripDidChange() }
+
+        // Every save of the store, whoever made it: a widget should never name a commute that has changed.
+        NotificationCenter.default.addObserver(forName: ModelContext.didSave, object: container.mainContext, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.publishCommutes() }
+        }
+        publishCommutes()
 
         if let trip = tripStore.load() {
             planner.resume(trip)
@@ -84,7 +90,6 @@ final class AppServices {
         liveActivity.show(glance, force: force)
         let isUnderway = trip.map { !$0.isFinished } ?? false
         location.keepRunningInBackground(isUnderway, renew: force)
-        if isUnderway { motion.start() } else { motion.stop() }
         stations.watch(isUnderway ? trip?.placesToWatch ?? [] : [])
 
         guard state != stored else { return }
@@ -128,6 +133,27 @@ final class AppServices {
     /// and background location begin, so a trip that started without them gets them now.
     func sceneDidChange(isActive: Bool) {
         tripDidChange(force: isActive && planner.active != nil)
+        if !isActive { updateWidgets() }
+    }
+
+    // MARK: Widgets
+
+    /// Writes the commutes out where their widgets can read them, and redraws the widgets if anything changed.
+    private func publishCommutes() {
+        let commutes = (try? container.mainContext.fetch(FetchDescriptor<Commute>(sortBy: [SortDescriptor(\.createdAt)]))) ?? []
+        if CommuteSummary.saveAll(commutes.filter(\.template.isPlannable).map(\.summary)) {
+            WidgetCenter.shared.reloadTimelines(ofKind: WidgetKind.commute)
+        }
+    }
+
+    /// The rider is putting the phone away: the Home Screen is what they see next. Reloads asked for by the app
+    /// in front don't count against a widget's daily allowance.
+    private func updateWidgets() {
+        publishCommutes()
+        if let coordinate = location.coordinate {
+            LastKnownPlace(latitude: coordinate.latitude, longitude: coordinate.longitude, date: location.location?.timestamp ?? .now).save()
+        }
+        WidgetCenter.shared.reloadTimelines(ofKind: WidgetKind.nearby)
     }
 
     /// Connections the trip in progress has timed, kept for learning the buffer from.
@@ -175,6 +201,25 @@ final class AppServices {
         }
         guard let best = await planner.plan(commute.template, arrivingBy: target) else { return }
         notifier.scheduleLeaveNow(at: best.departure, for: commute.name, arriveBy: target)
+    }
+
+    /// Works out what each commute is travelled by, for its icon, where that isn't known yet: a commute saved
+    /// before icons said so, or one not opened since. Opening a commute keeps its own up to date.
+    func learnCommuteLooks() async {
+        let context = container.mainContext
+        let commutes = (try? context.fetch(FetchDescriptor<Commute>())) ?? []
+        for commute in commutes where commute.lookData == nil && commute.template.isPlannable {
+            let template = commute.template
+            let planned = if let target = commute.nextArriveBy {
+                await planner.plan(template, arrivingBy: target)
+            } else {
+                await planner.preview(template)
+            }
+            // An estimate, made without a schedule, can't say what kind of transit it is.
+            guard let planned, !planned.hasEstimates, commute.template == template else { continue }
+            commute.look = CommuteLook(itinerary: planned)
+        }
+        try? context.save()
     }
 
     /// The commute closest to its standing arrival time, if one is within the window.

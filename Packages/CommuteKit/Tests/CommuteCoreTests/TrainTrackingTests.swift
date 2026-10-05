@@ -49,7 +49,7 @@ private func itinerary(rides: [Ride]? = nil) -> Itinerary {
         let watch = try #require(trip.ridesToWatch(at: t0 + 700))
         #expect(watch.segment == 1)
         let earlier = ride("7", board: 600, alight: 1_800)
-        trip.apply(TrainMatch(ride: earlier, rideIndex: 0, offset: 10, isConfident: true), segment: watch.segment, now: t0 + 700)
+        trip.apply(TrainMatch(ride: earlier, rideIndex: 0, offset: 10, isConfident: true, leftStation: true), segment: watch.segment, now: t0 + 700)
 
         #expect(trip.currentSegment == 1)
         #expect(trip.hasBoarded)
@@ -60,25 +60,36 @@ private func itinerary(rides: [Ride]? = nil) -> Itinerary {
         #expect(trip.drainRecords().isEmpty)
     }
 
-    @Test func anUnclearMatchIsPutToTheRider() throws {
+    @Test func anUnclearMatchIsTakenWithoutAsking() throws {
         var trip = try #require(ActiveTrip(template: template, itinerary: itinerary()))
         trip.markArrived(now: t0 + 800)
         let later = ride("9", board: 1_200, alight: 2_400)
         trip.apply(TrainMatch(ride: later, rideIndex: 0, offset: 80, isConfident: false), segment: 1, now: t0 + 1_300)
-        #expect(trip.suggestedTrain?.ride.trip?.tripID == "9")
+        #expect(trip.boardedBy == .likely)
+        #expect(trip.currentLeg?.option.rides.first?.trip?.tripID == "9")
+        #expect(trip.currentLeg?.arrival == t0 + 2_400)
+        #expect(trip.actions(at: t0 + 1_300).isEmpty)
 
-        trip.rejectSuggestedTrain()
-        #expect(trip.suggestedTrain == nil)
-        // Said no once: not asked again, however well it fits.
-        trip.apply(TrainMatch(ride: later, rideIndex: 0, offset: 5, isConfident: true), segment: 1, now: t0 + 1_400)
-        #expect(trip.currentLeg?.option.rides.first?.trip?.tripID == "8")
-
-        let other = ride("10", board: 1_500, alight: 2_700)
-        trip.apply(TrainMatch(ride: other, rideIndex: 0, offset: 80, isConfident: false), segment: 1, now: t0 + 1_600)
-        trip.acceptSuggestedTrain(now: t0 + 1_600)
-        #expect(trip.boardedBy == .rider)
+        // Later fixes fit another train better: it moves over.
+        let other = ride("10", board: 1_250, alight: 2_450)
+        trip.apply(TrainMatch(ride: other, rideIndex: 0, offset: 40, isConfident: false), segment: 1, now: t0 + 1_400)
         #expect(trip.currentLeg?.option.rides.first?.trip?.tripID == "10")
-        #expect(trip.currentLeg?.arrival == t0 + 2_700)
+        trip.apply(TrainMatch(ride: other, rideIndex: 0, offset: 10, isConfident: true), segment: 1, now: t0 + 1_500)
+        #expect(trip.boardedBy == .location)
+
+        // Once sure, a vaguer fit to another train doesn't undo it.
+        trip.apply(TrainMatch(ride: later, rideIndex: 0, offset: 60, isConfident: false), segment: 1, now: t0 + 1_600)
+        #expect(trip.currentLeg?.option.rides.first?.trip?.tripID == "10")
+    }
+
+    @Test func aCarBesideTheTracksDoesNotCatchTheTripUp() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary()))
+        trip.update(location: home.coordinate, now: t0 + 300)
+        let earlier = ride("7", board: 600, alight: 1_800)
+        trip.apply(TrainMatch(ride: earlier, rideIndex: 0, offset: 30, isConfident: false), segment: 1, now: t0 + 700)
+        trip.apply(TrainMatch(ride: earlier, rideIndex: 0, offset: 10, isConfident: true, leftStation: false), segment: 1, now: t0 + 700)
+        #expect(trip.currentSegment == 0)
+        #expect(!trip.hasBoarded)
     }
 
     @Test func theRiderHasTheLastWord() throws {
@@ -138,5 +149,69 @@ private func itinerary(rides: [Ride]? = nil) -> Itinerary {
         #expect(leg.option.rides.last?.trip?.tripID == "X2")
         #expect(leg.from == stationA)
         #expect(trip.arrival == t0 + 2_600)
+    }
+
+    @Test func twoTrainsThatFitAlikeAreAskedAboutOnce() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary()))
+        trip.markArrived(now: t0 + 800)
+        let eight = ride("8", board: 900, alight: 2_100)
+        let express = ride("8X", "AX", board: 960, alight: 2_000)
+        trip.apply(TrainMatch(ride: eight, rideIndex: 0, offset: 20, isConfident: false, rival: express), segment: 1, now: t0 + 1_100)
+        let question = try #require(trip.trainQuestion)
+        #expect(question.options.map { $0.trip?.tripID } == ["8", "8X"])
+        #expect(trip.boardedBy == .likely)
+
+        trip.answerTrainQuestion(1, now: t0 + 1_150)
+        #expect(trip.trainQuestion == nil)
+        #expect(trip.boardedBy == .rider)
+        #expect(trip.currentLeg?.option.rides.first?.trip?.tripID == "8X")
+
+        // Answered: never asked again on this ride.
+        trip.apply(TrainMatch(ride: eight, rideIndex: 0, offset: 20, isConfident: false, rival: express), segment: 1, now: t0 + 1_300)
+        #expect(trip.trainQuestion == nil)
+    }
+
+    @Test func aClearMatchSettlesTheQuestion() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary()))
+        trip.markArrived(now: t0 + 800)
+        let eight = ride("8", board: 900, alight: 2_100)
+        trip.apply(TrainMatch(ride: eight, rideIndex: 0, offset: 20, isConfident: false, rival: ride("9", board: 960, alight: 2_160)),
+                   segment: 1, now: t0 + 1_100)
+        #expect(trip.trainQuestion != nil)
+        trip.apply(TrainMatch(ride: eight, rideIndex: 0, offset: 5, isConfident: true), segment: 1, now: t0 + 1_200)
+        #expect(trip.trainQuestion == nil)
+        #expect(trip.boardedBy == .location)
+    }
+
+    @Test func passingUnderTheDestinationOnTheTrainIsNotArriving() throws {
+        // The office is 350 m short of Station B, along the line: the train runs right under it on the way in.
+        let office = Waypoint(name: "Office", coordinate: Coordinate(latitude: 40.75 - 350 / 111_320, longitude: -73.99))
+        let template = TripTemplate(waypoints: [home, stationA, stationB, office], modes: [.drive, .transit, .walk])
+        var plan = itinerary()
+        var walk = plan.legs[2]
+        walk.to = office
+        plan = Itinerary(legs: [plan.legs[0], plan.legs[1], walk])
+        var trip = try #require(ActiveTrip(template: template, itinerary: plan))
+        trip.markArrived(now: t0 + 800)
+        trip.update(location: nil, now: t0 + 1_000)
+        #expect(trip.hasBoarded)
+
+        // A minute out, under the office: a cell-tower fix, then one with the train's speed.
+        trip.update(fix: LocationFix(coordinate: office.coordinate, time: t0 + 2_040, accuracy: 400), now: t0 + 2_040)
+        trip.update(fix: LocationFix(coordinate: office.coordinate, time: t0 + 2_050, accuracy: 30, speed: 12), now: t0 + 2_050)
+        #expect(trip.currentSegment == 1)
+
+        // In at B; the same stale fix, heard again, isn't walking there either.
+        trip.update(fix: LocationFix(coordinate: stationB.coordinate, time: t0 + 2_110, accuracy: 30, speed: 0), now: t0 + 2_110)
+        #expect(trip.currentSegment == 2)
+        trip.update(fix: LocationFix(coordinate: office.coordinate, time: t0 + 2_050, accuracy: 30, speed: 12), now: t0 + 2_120)
+        trip.update(fix: LocationFix(coordinate: office.coordinate, time: t0 + 2_115, accuracy: 30, speed: 1.4), now: t0 + 2_115)
+        #expect(!trip.isFinished)
+        trip.crossed("end.2", entered: true, now: t0 + 2_120)
+        #expect(!trip.isFinished)
+
+        // Up to the street and back along it: there.
+        trip.update(fix: LocationFix(coordinate: office.coordinate, time: t0 + 2_300, accuracy: 15, speed: 1.3), now: t0 + 2_300)
+        #expect(trip.isFinished)
     }
 }

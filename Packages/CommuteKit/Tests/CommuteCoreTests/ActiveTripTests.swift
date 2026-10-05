@@ -156,7 +156,10 @@ private func itinerary(train: TimeInterval = 900, route: String = "A", delay: Ti
         let surfaced = Coordinate(latitude: 40.7535, longitude: -73.99) // ~390 m from Station B's pin
         let moved3 = trip.update(location: surfaced, now: t0 + 1500)
         #expect(!moved3)
-        let moved4 = trip.update(location: surfaced, now: t0 + 2050)
+        // A minute out the train can be passing right under there: still not off it.
+        let early = trip.update(location: surfaced, now: t0 + 2050)
+        #expect(!early)
+        let moved4 = trip.update(location: surfaced, now: t0 + 2110)
         #expect(moved4)
         #expect(trip.currentLeg?.mode == .walk)
     }
@@ -457,6 +460,31 @@ private func changingItinerary(delay: TimeInterval = 0, isRealtime: Bool = true,
     @Test func withoutATargetThereIsNothingToReport() throws {
         let trip = try trip()
         #expect(trip.arriveByProgress(now: t0) == nil)
+    }
+
+    @Test func holdsATripWithoutATargetToTheArrivalItFirstPlanned() throws {
+        var trip = try trip()
+        let planned = trip.arrival
+        trip.holdToPlannedArrival()
+        #expect(trip.arriveBy == planned)
+        #expect(trip.statedArriveBy == nil) // the plan's time, not one the rider gave
+        #expect(trip.arriveByProgress(now: t0)?.standing == .onTime)
+
+        // Survives being written down and read back as the plan's time.
+        let restored = try JSONDecoder().decode(ActiveTrip.self, from: JSONEncoder().encode(trip))
+        #expect(restored.arriveBy == planned)
+        #expect(restored.statedArriveBy == nil)
+
+        // Once the rider sets a time themselves, it is theirs.
+        trip.arriveBy = planned + 600
+        #expect(trip.statedArriveBy == planned + 600)
+    }
+
+    @Test func leavesATargetTheRiderGaveAlone() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary(driveStart: 0), arriveBy: t0 + 2500))
+        trip.holdToPlannedArrival()
+        #expect(trip.arriveBy == t0 + 2500)
+        #expect(trip.statedArriveBy == t0 + 2500)
     }
 }
 

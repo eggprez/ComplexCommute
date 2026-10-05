@@ -5,13 +5,17 @@ import Foundation
 /// An actor so imports and searches never touch a connection concurrently.
 public actor FeedLibrary {
     private let directory: URL
+    /// A reader that isn't the library's keeper (a widget) leaves files it can't open alone: the app may be
+    /// part-way through writing one.
+    private let isReadOnly: Bool
     private var open: [String: FeedDatabase] = [:]
     private var didScan = false
     /// Changes whenever a feed is installed or removed, so routers know to rebuild their timetables.
     public private(set) var revision = 0
 
-    public init(directory: URL) {
+    public init(directory: URL, isReadOnly: Bool = false) {
         self.directory = directory
+        self.isReadOnly = isReadOnly
     }
 
     public func installedFeeds() -> [FeedInfo] {
@@ -91,6 +95,36 @@ public actor FeedLibrary {
         return feedIDs.compactMap { open[$0] }.compactMap { try? $0.timetableData(for: days) }
     }
 
+    /// The schedules of only the trips calling at the given stops of each feed within `window` (seconds from the
+    /// base day's midnight): enough for departure boards, at a fraction of the memory of a whole network.
+    public func timetableData(for days: [ServiceDay], callingAt stopIDs: [String: [String]], between window: Range<Int>) -> [FeedTimetableData] {
+        scanIfNeeded()
+        return stopIDs.keys.sorted().compactMap { feedID in
+            try? open[feedID]?.timetableData(for: days, callingAt: stopIDs[feedID] ?? [], between: window)
+        }
+    }
+
+    /// Gives schedules imported before boards could be read stop by stop the index that makes that cheap.
+    /// Runs off the actor: building one takes a few seconds for a city's buses, and searches shouldn't wait on it.
+    public nonisolated func indexForBoards() async {
+        for url in await filesWithoutBoardIndex() {
+            guard let database = try? SQLiteDatabase(url: url) else { continue }
+            // Losing a race with a reader just leaves it for the next launch.
+            try? database.execute("PRAGMA busy_timeout = 2000; \(GTFSImporter.boardIndex);")
+            // A network built while the file was being written to may have missed it.
+            await noteChange()
+        }
+    }
+
+    private func noteChange() {
+        revision += 1
+    }
+
+    private func filesWithoutBoardIndex() -> [URL] {
+        scanIfNeeded()
+        return open.values.filter { !$0.hasBoardIndex }.map { databaseURL(for: $0.feedID) }
+    }
+
     /// The path trips with this shape follow, or nil when the feed has none.
     public func shape(feedID: String, index: Int) -> [Coordinate]? {
         scanIfNeeded()
@@ -108,7 +142,7 @@ public actor FeedLibrary {
         for file in files where file.pathExtension == "sqlite" {
             // Feeds imported by a schema too old to read are dropped; the app offers them for download again.
             guard let database = try? FeedDatabase(url: file), database.isUsableSchema else {
-                try? FileManager.default.removeItem(at: file)
+                if !isReadOnly { try? FileManager.default.removeItem(at: file) }
                 continue
             }
             open[database.feedID] = database

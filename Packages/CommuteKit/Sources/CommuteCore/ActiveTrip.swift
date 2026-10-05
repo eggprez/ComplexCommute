@@ -34,7 +34,12 @@ public struct ActiveTrip: Codable, Sendable {
     /// The followed itinerary, one leg per template segment.
     public private(set) var legs: [Leg]
     /// When the rider has to be there, if they said. Can be set or changed mid-trip.
-    public var arriveBy: Date?
+    public var arriveBy: Date? {
+        didSet { arriveByIsFromPlan = nil }
+    }
+    /// The arrive-by time is the arrival the plan promised at the start, not one the rider gave.
+    /// Optional so a trip saved by an earlier version still loads.
+    private var arriveByIsFromPlan: Bool?
     public private(set) var currentSegment = 0
     /// Aboard the current transit leg (or, for a leg without ride details, under way on it).
     public private(set) var hasBoarded = false
@@ -61,35 +66,27 @@ public struct ActiveTrip: Codable, Sendable {
     private var isAwaitingReplan = false
     /// Why the app thinks the rider is on the ride it shows them on, once aboard.
     public private(set) var boardedBy: BoardingEvidence?
-    /// A train the rider's location fits, but not clearly enough to act on without asking them.
-    public private(set) var suggestedTrain: TrainSuggestion?
-    /// Trains the rider said they are not on, so the location doesn't keep suggesting them.
-    /// Optional so a trip saved by an earlier version still loads.
-    private var rejectedTrains: Set<TripRef>?
-    /// What the motion sensor and the station geofences have said. Optional for the same reason.
+    /// What the station geofences have said. Optional so a trip saved by an earlier version still loads.
     private var sensing: Sensing?
+    /// When the current leg began, as far as the app could tell. Optional for the same reason.
+    private var legStartedAt: Date?
+    /// Two trains fit the rider's location about equally (back to back, or a local and an express that haven't
+    /// split yet): the one time the app asks which.
+    public private(set) var trainQuestion: TrainQuestion?
+    /// Asked once already for the ride under way; not again, whatever the answer.
+    private var askedWhichTrain: Bool?
 
     private struct Sensing: Codable {
-        var motion: Motion?
-        /// The motion sensor saw this leg being driven, so walking afterwards means the car is parked.
-        var sawDriving = false
         /// Inside the geofence around the platform the next train leaves from.
-        var isInsideStation = false
-        /// Something says the rider is moving on a train, but not which one: ask them.
-        var isAskingAboutTrain = false
+        var isInsideStation: Bool?
+        /// When the rider last left that geofence: about when their train pulled out, if they are on one.
+        var leftStationAt: Date?
     }
 
     private var sense: Sensing {
         get { sensing ?? Sensing() }
         set { sensing = newValue }
     }
-
-    /// Movement is taken as boarding the planned train only this close to when it was due to leave.
-    static let movementBoardingWindow: TimeInterval = 3 * 60
-    /// Walking after driving this close to the station means the car is parked. A park-and-ride lot can be big.
-    static let parkedRadius = 1_000.0
-    /// Without having seen the drive, walking only counts this close: it could be a stop on the way.
-    static let unseenParkedRadius = 400.0
 
     /// An alternative has to save at least this much before it interrupts the rider.
     public static let worthwhileSaving: TimeInterval = 5 * 60
@@ -137,16 +134,23 @@ public struct ActiveTrip: Codable, Sendable {
 
     // MARK: Progress
 
-    /// Folds in a location fix and the clock. Returns true if the rider moved on to another leg.
+    /// Folds in a location and the clock, as if it were a fresh, accurate fix. Returns true if the rider moved on to another leg.
     @discardableResult
     public mutating func update(location: Coordinate?, now: Date) -> Bool {
+        update(fix: location.map { LocationFix(coordinate: $0, time: now, accuracy: 10) }, now: now)
+    }
+
+    /// Folds in a location fix and the clock. Returns true if the rider moved on to another leg.
+    @discardableResult
+    public mutating func update(fix: LocationFix?, now: Date) -> Bool {
         let segmentBefore = currentSegment
         let isFirstFix = startLocation == nil
-        if let location {
+        let location = fix?.coordinate
+        if let fix, let location {
             if startLocation == nil { startLocation = location }
             if let startLocation, location.distance(to: startLocation) > Self.earlyDepartureRadius { isUnderway = true }
 
-            while let leg = currentLeg, hasReachedEnd(of: leg, at: location, now: now) {
+            while let leg = currentLeg, hasReachedEnd(of: leg, with: fix, now: now) {
                 advance(now: now)
             }
         }
@@ -191,8 +195,9 @@ public struct ActiveTrip: Codable, Sendable {
         recordMiss(now: now)
         hasBoarded = false
         boardedBy = nil
-        suggestedTrain = nil
-        sense.isAskingAboutTrain = false
+        trainQuestion = nil
+        askedWhichTrain = nil
+        sense.leftStationAt = nil
         isAwaitingReplan = true
     }
 
@@ -207,11 +212,12 @@ public struct ActiveTrip: Codable, Sendable {
         startedAtPlatform = false
         if recording { recordConnections(leaving: currentSegment, now: now) }
         currentSegment += 1
+        legStartedAt = now
         hasBoarded = false
         boardedBy = nil
-        suggestedTrain = nil
-        let motion = sense.motion
-        sensing = Sensing(motion: motion)
+        trainQuestion = nil
+        askedWhichTrain = nil
+        sensing = nil
         isUnderway = true
         if isFinished {
             finishedAt = now
@@ -229,8 +235,16 @@ public struct ActiveTrip: Codable, Sendable {
 
     /// At the leg's end, or, for a drive or walk that leads to a train, on the platform that train leaves from:
     /// a station's pin, or the car park, can be a long way from where the rider actually ends up.
-    private func hasReachedEnd(of leg: Leg, at location: Coordinate, now: Date) -> Bool {
-        if location.distance(to: leg.to.coordinate) <= arrivalRadius(for: leg, now: now) { return true }
+    private func hasReachedEnd(of leg: Leg, with fix: LocationFix, now: Date) -> Bool {
+        let location = fix.coordinate
+        let isOnAVehicle = (fix.speed ?? 0) >= LocationFix.vehicleSpeed
+        if leg.mode == .walk {
+            // A train can run right under where the rider is walking to, and a fix taken aboard it isn't them there.
+            guard !isOnAVehicle, canFinishWalk(leg, at: fix.time) else { return false }
+            if isWalkFromTrain(leg), fix.accuracy > Self.surfacedAccuracy { return false }
+        }
+        let radius = isOnAVehicle ? min(arrivalRadius(for: leg, now: now), Self.platformRadius) : arrivalRadius(for: leg, now: now)
+        if location.distance(to: leg.to.coordinate) <= radius { return true }
         guard leg.mode != .transit, leg.segmentIndex + 1 < legs.count, legs[leg.segmentIndex + 1].mode == .transit,
               let platform = legs[leg.segmentIndex + 1].option.rides.first?.stops.first?.station else { return false }
         return location.distance(to: platform.coordinate) <= Self.platformRadius
@@ -244,9 +258,24 @@ public struct ActiveTrip: Codable, Sendable {
             return 120
         case .transit:
             // Surfacing from a big station can put the first fix blocks from its pin, so be generous once the
-            // train is due in. Before that, stay strict: the next station may simply be close by.
-            return hasBoarded && now >= leg.arrival.addingTimeInterval(-90) ? 600 : 200
+            // train is in. Before that, stay strict: the train may be passing under somewhere near it on the way.
+            return hasBoarded && now >= leg.arrival ? 600 : 200
         }
+    }
+
+    /// Worse than this, a fix is the phone guessing from cell towers: underground, still on the train.
+    static let surfacedAccuracy = 100.0
+
+    /// Getting off a train, up to the street and along it takes time: a walk from one can't be over the moment it starts.
+    private func isWalkFromTrain(_ leg: Leg) -> Bool {
+        leg.segmentIndex > 0 && legs[leg.segmentIndex - 1].mode == .transit
+    }
+
+    private func canFinishWalk(_ leg: Leg, at time: Date) -> Bool {
+        guard isWalkFromTrain(leg) else { return true }
+        guard let legStartedAt else { return true }
+        let least = min(2 * 60, max(30, leg.duration / 2))
+        return time.timeIntervalSince(legStartedAt) >= least
     }
 
     // MARK: Re-planning
@@ -409,36 +438,41 @@ public struct ActiveTrip: Codable, Sendable {
         return leg.option.rides.firstIndex(of: ride) ?? 0
     }
 
-    /// Takes a train the location matched: a clear match is acted on, an unclear one is put to the rider.
+    /// Takes a train the location matched. A clear match is taken as fact, an unclear one as the likeliest train for
+    /// now, to be replaced if later fixes fit another better. Only when two trains still fit alike well after the rider
+    /// should be past a stop or two is it put to them, once.
     public mutating func apply(_ match: TrainMatch, segment: Int, now: Date) {
-        guard let trip = match.ride.trip, !(rejectedTrains ?? []).contains(trip), segment >= currentSegment, segment < legs.count else { return }
+        guard let trip = match.ride.trip, segment >= currentSegment, segment < legs.count else { return }
         let rides = legs[segment].option.rides
         guard match.rideIndex < rides.count else { return }
+        let evidence: BoardingEvidence = match.isConfident ? .location : .likely
         if segment == currentSegment, hasBoarded, rides[match.rideIndex].trip == trip, ridingIndex(at: now) == match.rideIndex {
             // Already shown on that very train; the location just makes it surer.
-            if boardedBy != .rider, match.isConfident { boardedBy = .location }
-            if suggestedTrain?.ride.trip == trip { suggestedTrain = nil }
-            return
-        }
-        if segment == currentSegment, boardedBy == .rider, match.rideIndex <= ridingIndex(at: now) { return }
-        if match.isConfident {
-            board(match.ride, segment: segment, rideIndex: match.rideIndex, evidence: .location, now: now)
+            if let boardedBy, boardedBy != .rider, boardedBy != .location { self.boardedBy = evidence }
         } else {
-            suggestedTrain = TrainSuggestion(ride: match.ride, segment: segment, rideIndex: match.rideIndex)
+            if segment == currentSegment, hasBoarded, match.rideIndex <= ridingIndex(at: now),
+               boardedBy == .rider || (boardedBy == .location && !match.isConfident) {
+                // The rider's word stands, and a clear match isn't undone by a vaguer one.
+                return
+            }
+            // Moving on from a drive or walk the app didn't see end takes more: in a car beside the tracks, a single
+            // fix can fit a passing train. Only a clear match, from the station itself, will do.
+            if segment > currentSegment, !(match.isConfident && match.leftStation) { return }
+            board(match.ride, segment: segment, rideIndex: match.rideIndex, evidence: evidence, now: now)
+        }
+        if match.isConfident {
+            trainQuestion = nil
+        } else if let rival = match.rival, boardedBy != .rider, askedWhichTrain != true {
+            trainQuestion = TrainQuestion(options: [match.ride, rival].sorted { $0.board < $1.board },
+                                          segment: currentSegment, rideIndex: ridingIndex(at: now))
+            askedWhichTrain = true
         }
     }
 
-    /// The rider says they're on the suggested train.
-    public mutating func acceptSuggestedTrain(now: Date = .now) {
-        guard let suggestion = suggestedTrain else { return }
-        board(suggestion.ride, segment: suggestion.segment, rideIndex: suggestion.rideIndex, evidence: .rider, now: now)
-    }
-
-    /// The rider says they're not on the suggested train.
-    public mutating func rejectSuggestedTrain() {
-        guard let trip = suggestedTrain?.ride.trip else { return }
-        rejectedTrains = (rejectedTrains ?? []).union([trip])
-        suggestedTrain = nil
+    /// The rider picked one of the trains the app asked about.
+    public mutating func answerTrainQuestion(_ option: Int, now: Date = .now) {
+        guard let question = trainQuestion, question.options.indices.contains(option) else { return }
+        board(question.options[option], segment: question.segment, rideIndex: question.rideIndex, evidence: .rider, now: now)
     }
 
     /// Puts the rider on `ride` in place of ride `rideIndex` of leg `segment`, moving the trip on to that leg if it
@@ -474,17 +508,15 @@ public struct ActiveTrip: Codable, Sendable {
         let wasBoarded = hasBoarded
         hasBoarded = true
         boardedBy = evidence
+        trainQuestion = nil
         isAwaitingReplan = false
-        suggestedTrain = nil
-        sense.isAskingAboutTrain = false
-        if let trip = ride.trip { rejectedTrains?.remove(trip) }
         if !wasBoarded, !isCatchingUp { recordBoarding(now: now) }
     }
 
-    // MARK: Motion and geofences
+    // MARK: Geofences
 
-    /// Something says the rider is on a train, but not which one.
-    public var isAskingAboutTrain: Bool { sense.isAskingAboutTrain }
+    /// When the rider left the station they were waiting at, for telling which train pulled out with them.
+    public var leftStationAt: Date? { sense.leftStationAt }
 
     /// The rider says they're on the train: the one they're waiting for, or the one the drive or walk is for.
     public mutating func markAboard(now: Date = .now) {
@@ -496,47 +528,6 @@ public struct ActiveTrip: Codable, Sendable {
         } else if currentSegment + 1 < legs.count, let ride = legs[currentSegment + 1].option.rides.first {
             board(ride, segment: currentSegment + 1, rideIndex: 0, evidence: .riderAboard, now: now)
         }
-    }
-
-    /// The rider says they're not on a train after all.
-    public mutating func dismissTrainQuestion() {
-        sense.isAskingAboutTrain = false
-    }
-
-    /// Folds in what the motion sensor says. Returns true if the rider moved on to another leg.
-    ///
-    /// Driving then walking near the station: parked. Standing at the station then moving like a vehicle:
-    /// on the train. Riding then walking at the far end: off it.
-    @discardableResult
-    public mutating func update(motion: Motion, location: Coordinate?, now: Date) -> Bool {
-        let before = currentSegment
-        let previous = sense.motion
-        sense.motion = motion
-        guard let leg = currentLeg else { return false }
-
-        switch leg.mode {
-        case .drive:
-            if motion == .automotive { sense.sawDriving = true }
-            guard motion.isOnFoot, currentSegment + 1 < legs.count, legs[currentSegment + 1].mode == .transit else { break }
-            let radius = sense.sawDriving ? Self.parkedRadius : Self.unseenParkedRadius
-            let isNear = location.map { isNearStation(after: leg, $0, within: radius) }
-                ?? (sense.sawDriving && now >= leg.arrival.addingTimeInterval(-10 * 60))
-            if isNear { advance(now: now) }
-        case .walk:
-            // Walked to the station and now moving like a vehicle from it: the walk is over and the train under way.
-            guard motion == .automotive, currentSegment + 1 < legs.count, legs[currentSegment + 1].mode == .transit,
-                  sense.isInsideStation || location.map({ isNearStation(after: leg, $0, within: Self.unseenParkedRadius) }) ?? false else { break }
-            advance(now: now)
-            boardByMovement(now: now)
-        case .transit:
-            if motion == .automotive, !hasBoarded || boardedBy == .schedule, wasAtStation(location: location) {
-                boardByMovement(now: now)
-            } else if motion.isOnFoot, previous == .automotive, hasBoarded, now >= leg.arrival.addingTimeInterval(-5 * 60),
-                      location.map({ $0.distance(to: leg.to.coordinate) <= 600 }) ?? true {
-                advance(now: now)
-            }
-        }
-        return currentSegment != before
     }
 
     /// Geofences for where the trip is now. Crossing one is reported to `crossed(_:entered:now:)`.
@@ -562,8 +553,9 @@ public struct ActiveTrip: Codable, Sendable {
 
         switch (parts[0], entered) {
         case ("end", true) where segment == currentSegment:
-            // Passing through the exit station's fence on a train isn't arriving: only once it's due in.
-            if leg.mode != .transit || (hasBoarded && now >= leg.arrival.addingTimeInterval(-5 * 60)) {
+            // Passing through the exit station's fence on a train isn't arriving: only once it's due in. Nor is
+            // passing under where a walk from the train ends, before there has been time to walk anywhere.
+            if leg.mode == .walk ? canFinishWalk(leg, at: now) : leg.mode != .transit || (hasBoarded && now >= leg.arrival.addingTimeInterval(-5 * 60)) {
                 advance(now: now)
             }
         case ("board", true):
@@ -572,67 +564,32 @@ public struct ActiveTrip: Codable, Sendable {
             }
             if segment == currentSegment, currentLeg?.mode == .transit {
                 sense.isInsideStation = true
+                sense.leftStationAt = nil
                 if !hasBoarded, reachedPlatformAt == nil, !startedAtPlatform { reachedPlatformAt = now }
             }
         case ("board", false) where segment == currentSegment && leg.mode == .transit:
-            guard sense.isInsideStation else { break }
+            guard sense.isInsideStation == true else { break }
             sense.isInsideStation = false
-            // Leaving the station on foot is leaving it; leaving it at vehicle speed is the train pulling out.
-            if sense.motion == .automotive { boardByMovement(now: now) }
+            // On foot or on a train, nobody can tell yet: the location matcher weighs this against when each
+            // train left, and only takes it as a train once the rider moves along the line faster than a run.
+            sense.leftStationAt = now
         default:
             break
         }
         return currentSegment != before
     }
 
-    private func isNearStation(after leg: Leg, _ location: Coordinate, within radius: Double) -> Bool {
-        if location.distance(to: leg.to.coordinate) <= radius { return true }
-        guard leg.segmentIndex + 1 < legs.count, let platform = legs[leg.segmentIndex + 1].option.rides.first?.stops.first?.station else { return false }
-        return location.distance(to: platform.coordinate) <= radius
-    }
-
-    private func wasAtStation(location: Coordinate?) -> Bool {
-        if reachedPlatformAt != nil || startedAtPlatform || sense.isInsideStation { return true }
-        guard let location, let platform = currentRide(at: .now)?.stops.first?.station else { return false }
-        return location.distance(to: platform.coordinate) <= Self.unseenParkedRadius
-    }
-
-    /// Moving like a vehicle from the station: on the planned train if it was due, otherwise on some train, so ask.
-    private mutating func boardByMovement(now: Date) {
-        guard let leg = currentLeg, leg.mode == .transit, let ride = currentRide(at: now) else { return }
-        if hasBoarded {
-            if boardedBy == .schedule { boardedBy = .movement }
-            return
-        }
-        if abs(now.timeIntervalSince(ride.board)) <= Self.movementBoardingWindow {
-            hasBoarded = true
-            boardedBy = .movement
-            isAwaitingReplan = false
-            recordBoarding(now: now)
-        } else {
-            sense.isAskingAboutTrain = true
-        }
-    }
-
-    /// What the rider can say from the Lock Screen right now, and the question it answers, if there is one.
-    public func actions(at now: Date) -> (prompt: String?, actions: [TripAction]) {
-        guard let leg = currentLeg else { return (nil, []) }
-        if let suggestion = suggestedTrain {
-            return ("On the \(suggestion.ride.board.clockTime) \(suggestion.ride.routeName)?", [.confirmTrain, .rejectTrain])
-        }
-        if sense.isAskingAboutTrain {
-            return ("On a train?", [.aboard, .rejectTrain])
-        }
+    /// What the rider can say from outside the app right now: the manual backup to the geofences and the location.
+    public func actions(at now: Date) -> [TripAction] {
+        guard let leg = currentLeg else { return [] }
         switch leg.mode {
-        case .transit where !hasBoarded:
-            return (nil, [.aboard, .missed])
-        case .transit where boardedBy == .schedule:
-            return ("On the \(currentRide(at: now)?.routeName ?? "train")?", [.aboard, .missed])
+        case .transit where !hasBoarded || boardedBy == .schedule:
+            return [.aboard, .missed]
         case .transit:
-            return (nil, [])
+            return []
         case .drive, .walk:
-            guard isUnderway, connection != nil else { return (nil, []) }
-            return (nil, [.arrived, .aboard])
+            guard isUnderway, connection != nil else { return [] }
+            return [.arrived, .aboard]
         }
     }
 
@@ -662,6 +619,19 @@ public struct ActiveTrip: Codable, Sendable {
         }
         // An arrival already in the past means the plan has stopped moving; the clock hasn't.
         return ArriveByProgress(target: arriveBy, projectedArrival: max(arrival, now))
+    }
+
+    /// A trip started without a time to be there by is measured against its own first estimate:
+    /// the arrival the plan promised when the rider set out.
+    public mutating func holdToPlannedArrival() {
+        guard arriveBy == nil, !legs.isEmpty else { return }
+        arriveBy = arrival
+        arriveByIsFromPlan = true
+    }
+
+    /// The arrive-by time the rider gave themselves, as opposed to one taken from the plan.
+    public var statedArriveBy: Date? {
+        arriveByIsFromPlan == true ? nil : arriveBy
     }
 
     // MARK: Learning the buffer

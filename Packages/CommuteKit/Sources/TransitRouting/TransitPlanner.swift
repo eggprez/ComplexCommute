@@ -106,6 +106,66 @@ public actor TransitPlanner {
         }
     }
 
+    // MARK: Nearby
+
+    /// What leaves next from the stations and stops around `coordinate`, nearest first. Each line to each destination
+    /// is listed once, at the nearest place to board it: the stop across the street going the same way adds nothing.
+    ///
+    /// Reads only the trips calling at those few stops instead of building the whole network, so it fits in a
+    /// widget's memory and leaves the network a trip is being planned with alone.
+    /// - Parameter perLine: how many departures to keep for each line to each destination.
+    public func nearbyBoards(around coordinate: Coordinate, at date: Date = .now, modes: NearbyModes = .all,
+                             horizon: TimeInterval = 90 * 60, perLine: Int = 3, live: Bool = true) async -> [NearbyBoard] {
+        let found = await library.stops(near: coordinate, radiusMeters: Self.nearbyStationRadius, limit: 60)
+        var places: [(stop: TransitStop, meters: Double, isBus: Bool)] = []
+        var (stations, busStops) = (0, 0)
+        for stop in found where !stop.routes.isEmpty {
+            let meters = stop.coordinate.distance(to: coordinate)
+            let isBus = stop.routes.allSatisfy { Timetable.isBus(routeType: $0.type) }
+            if isBus {
+                guard modes != .rail, meters <= Self.nearbyBusRadius, busStops < Self.nearbyBusStopLimit else { continue }
+                busStops += 1
+            } else {
+                guard modes != .bus, stations < Self.nearbyStationLimit else { continue }
+                stations += 1
+            }
+            places.append((stop, meters, isBus))
+        }
+        guard !places.isEmpty else { return [] }
+
+        let midnight = calendar.startOfDay(for: date)
+        let earliest = Int(date.timeIntervalSince(midnight))
+        let stopIDs = Dictionary(grouping: places, by: \.stop.feedID).mapValues { $0.map(\.stop.stopID) }
+        let feeds = await library.timetableData(for: serviceDays(around: midnight), callingAt: stopIDs,
+                                                between: earliest..<earliest + Int(horizon) + 1)
+        guard !feeds.isEmpty else { return [] }
+        var timetable = Timetable(feeds: feeds, midnight: midnight)
+        if live, let realtime {
+            let platforms = Set(places.flatMap { place in
+                [place.stop.stopID] + timetable.platforms(feedID: place.stop.feedID, stopID: place.stop.stopID).map { timetable.stops[$0].id }
+            })
+            timetable = timetable.applying(await realtime.snapshot(for: stopIDs.keys.sorted(), servingStops: platforms).feeds)
+        }
+
+        var boards: [NearbyBoard] = []
+        var listed = Set<String>()
+        for place in places {
+            let departures = timetable.departures(feedID: place.stop.feedID, stopID: place.stop.stopID, from: date, within: horizon, limit: 400)
+            let groups = DepartureGroup.groups(departures, limit: perLine).filter { listed.insert($0.id).inserted }
+            guard !groups.isEmpty else { continue }
+            boards.append(NearbyBoard(station: StationRef(feedID: place.stop.feedID, stopID: place.stop.stopID, name: place.stop.name,
+                                                          coordinate: place.stop.coordinate),
+                                      meters: place.meters, isBus: place.isBus, groups: groups))
+        }
+        return boards
+    }
+
+    /// A station is worth a longer walk than a bus stop is.
+    static let nearbyStationRadius = 1_000.0
+    static let nearbyBusRadius = 500.0
+    static let nearbyStationLimit = 4
+    static let nearbyBusStopLimit = 8
+
     // MARK: Following a train
 
     /// The network for following `ride`, live where predictions exist, with every way of going its way.
@@ -128,18 +188,26 @@ public actor TransitPlanner {
     }
 
     /// The train the rider's recent location fixes keep pace with, among everything going the way of any of `rides`.
-    public func matchTrain(for rides: [WatchedRide], fixes: [LocationFix], at date: Date = .now) async -> TrainMatch? {
+    public func matchTrain(for rides: [WatchedRide], fixes: [LocationFix], leftStation: Date? = nil, at date: Date = .now) async -> TrainMatch? {
         var best: (match: Timetable.TripFit, watched: WatchedRide, timetable: Timetable, midnight: Date)?
         for watched in rides {
             guard let (timetable, midnight, runs) = await runs(for: watched.ride, at: date),
-                  let fit = timetable.fit(fixes, to: runs) else { continue }
+                  // The geofence is round the platform the first of them leaves from; later changes have none.
+                  let fit = timetable.fit(fixes, to: runs, leftStation: watched == rides.first ? leftStation : nil) else { continue }
             if best.map({ fit.offset < $0.match.offset }) ?? true { best = (fit, watched, timetable, midnight) }
         }
         guard let best else { return nil }
         let ride = await self.ride(pattern: best.match.run.pattern, trip: best.match.trip, board: best.match.run.board,
                                    alight: best.match.run.alight, in: best.timetable, midnight: best.midnight,
                                    walkBefore: best.watched.ride.walkBefore, freeTransfer: best.watched.ride.freeTransfer)
-        return TrainMatch(ride: ride, rideIndex: best.watched.index, offset: best.match.offset, isConfident: best.match.isConfident)
+        var rival: Ride?
+        if let other = best.match.rival {
+            rival = await self.ride(pattern: other.run.pattern, trip: other.trip, board: other.run.board, alight: other.run.alight,
+                                    in: best.timetable, midnight: best.midnight,
+                                    walkBefore: best.watched.ride.walkBefore, freeTransfer: best.watched.ride.freeTransfer)
+        }
+        return TrainMatch(ride: ride, rideIndex: best.watched.index, offset: best.match.offset, isConfident: best.match.isConfident,
+                          leftStation: best.match.leftStation, rival: rival)
     }
 
     /// Trains going `ride`'s way that leave its boarding station around now, for the rider to say which one they're on.
@@ -178,13 +246,9 @@ public actor TransitPlanner {
         return live
     }
 
-    /// - Parameter acceptingMore: a network already built with other feeds besides will do. Boards only read it, and
-    ///   rebuilding for them would throw away the one the trip in progress is being re-planned with.
-    private func timetable(for date: Date, near coordinates: [Coordinate], excluding excludedFeedIDs: Set<String> = [],
-                           acceptingMore: Bool = false) async -> (Timetable, Date, CacheKey)? {
-        let midnight = calendar.startOfDay(for: date)
-        let revision = await library.revision
-
+    /// The service days a clock measured from `midnight` has to draw on: yesterday's trips that run past midnight,
+    /// today's, and tomorrow's early ones so late-night plans can finish.
+    private func serviceDays(around midnight: Date) -> [ServiceDay] {
         func serviceDay(offsetDays: Int, endingAfter: Int? = nil, startingBefore: Int? = nil) -> ServiceDay {
             let day = calendar.date(byAdding: .day, value: offsetDays, to: midnight) ?? midnight
             let parts = calendar.dateComponents([.year, .month, .day, .weekday], from: day)
@@ -192,10 +256,17 @@ public actor TransitPlanner {
                               weekday: ((parts.weekday ?? 2) + 5) % 7, // Calendar: 1 = Sunday; GTFS bit order: 0 = Monday
                               offsetSeconds: offsetDays * 86_400, tripsEndingAfter: endingAfter, tripsStartingBefore: startingBefore)
         }
-        let today = serviceDay(offsetDays: 0)
+        return [serviceDay(offsetDays: -1, endingAfter: 86_400), serviceDay(offsetDays: 0), serviceDay(offsetDays: 1, startingBefore: 8 * 3_600)]
+    }
 
-        // Yesterday's trips that run past midnight, and tomorrow's early ones so late-night plans can finish.
-        let days = [serviceDay(offsetDays: -1, endingAfter: 86_400), today, serviceDay(offsetDays: 1, startingBefore: 8 * 3_600)]
+    /// - Parameter acceptingMore: a network already built with other feeds besides will do. Boards only read it, and
+    ///   rebuilding for them would throw away the one the trip in progress is being re-planned with.
+    private func timetable(for date: Date, near coordinates: [Coordinate], excluding excludedFeedIDs: Set<String> = [],
+                           acceptingMore: Bool = false) async -> (Timetable, Date, CacheKey)? {
+        let midnight = calendar.startOfDay(for: date)
+        let revision = await library.revision
+        let days = serviceDays(around: midnight)
+        let today = days[1]
         let feedIDs = await library.feedIDs(near: coordinates).filter { !excludedFeedIDs.contains($0) }
         let key = CacheKey(serviceDate: today.date, libraryRevision: revision, feedIDs: feedIDs)
         if let cache, cache.key == key {

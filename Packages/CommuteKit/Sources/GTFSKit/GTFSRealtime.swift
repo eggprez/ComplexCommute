@@ -47,7 +47,9 @@ public struct RealtimeFeed: Sendable {
     public var tripUpdates: [TripUpdate] = []
     public var alerts: [Alert] = []
 
-    public init(data: Data) throws {
+    /// - Parameter stopIDs: keep only the trips predicted to call at one of these, and no alerts. A citywide bus
+    ///   feed runs to thousands of vehicles; a departure board for the corner the rider is standing on wants a handful.
+    public init(data: Data, servingStops stopIDs: Set<String>? = nil) throws {
         var message = ProtobufReader(data)
         while let field = try message.nextField() {
             switch field.number {
@@ -57,21 +59,26 @@ public struct RealtimeFeed: Sendable {
                     if field.number == 3 { timestamp = field.int }
                 }
             case 2:
-                try decodeEntity(field.message())
+                try decodeEntity(field.message(), servingStops: stopIDs)
             default:
                 break
             }
         }
     }
 
-    private mutating func decodeEntity(_ reader: ProtobufReader) throws {
+    private mutating func decodeEntity(_ reader: ProtobufReader, servingStops stopIDs: Set<String>?) throws {
         var reader = reader
         var id = ""
         while let field = try reader.nextField() {
             switch field.number {
             case 1: id = field.string
-            case 3: tripUpdates.append(try Self.tripUpdate(field.message()))
-            case 5: alerts.append(try Self.alert(field.message(), id: id))
+            case 3:
+                let update = try Self.tripUpdate(field.message())
+                // A call identified only by its sequence could be at any stop, so it can't be ruled out.
+                if let stopIDs, !update.stopTimes.contains(where: { $0.stopID.map(stopIDs.contains) ?? true }) { continue }
+                tripUpdates.append(update)
+            case 5:
+                if stopIDs == nil { alerts.append(try Self.alert(field.message(), id: id)) }
             default: break
             }
         }

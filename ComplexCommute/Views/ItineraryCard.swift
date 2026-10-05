@@ -38,8 +38,8 @@ struct ItineraryCard: View {
                     .foregroundStyle(Color.primary)
                 Spacer()
                 Text("\(itinerary.hasEstimates ? "~" : "")\(itinerary.duration.shortDuration)")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(Color.primary)
+                    .font(.system(.title3, design: .rounded, weight: .bold))
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.primary)
             }
 
             HStack(spacing: 6) {
@@ -53,9 +53,7 @@ struct ItineraryCard: View {
                         .foregroundStyle(progress.standing.isBehind ? progress.standing.tint : Color.secondary)
                 }
                 if itinerary.hasRealtime {
-                    Label("Live", systemImage: "dot.radiowaves.left.and.right")
-                        .labelStyle(.iconOnly)
-                        .foregroundStyle(Color.goodText)
+                    Chip(text: "Live", systemImage: "dot.radiowaves.left.and.right", tint: .green, textColor: .goodText)
                 }
                 if !itinerary.alerts.isEmpty {
                     Label("Service alerts", systemImage: "exclamationmark.triangle.fill")
@@ -70,12 +68,7 @@ struct ItineraryCard: View {
             if !tags.isEmpty {
                 HStack(spacing: 6) {
                     ForEach(ItineraryTag.allCases.filter(tags.contains), id: \.self) { tag in
-                        Text(tag.label)
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(Color.goodText)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(Color.green.opacity(0.18), in: .capsule)
+                        Chip(text: tag.label, systemImage: tag.symbol)
                     }
                 }
             }
@@ -158,7 +151,7 @@ struct SegmentStrip: View {
                     }
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(mode == .walk ? Color.secondary : mode.tint)
-                    .padding(.horizontal, 7)
+                    .padding(.horizontal, 8)
                     .frame(height: 22)
                     .background((mode == .walk ? Color.secondary : mode.tint).opacity(0.14), in: .capsule)
                     .accessibilityLabel("\(mode.label) \(seconds.shortDuration)")
@@ -226,6 +219,16 @@ struct AlertRow: View {
                 }
             }
             .presentationDetents([.medium, .large])
+        }
+    }
+}
+
+extension ItineraryTag {
+    var symbol: String {
+        switch self {
+        case .fastest: "bolt.fill"
+        case .fewestTransfers: "arrow.triangle.swap"
+        case .leastWalking: "figure.walk"
         }
     }
 }

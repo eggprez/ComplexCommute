@@ -40,8 +40,14 @@ struct RootView: View {
                     .environment(services.notifier)
                     .environment(\.transitPlanner, transit)
             }
+            .onOpenURL { url in
+                if let link = AppLink(url) { router.open(link) }
+            }
             .task { location.start() }
-            .task { await transitData.load() }
+            .task {
+                await transitData.load()
+                await services.learnCommuteLooks()
+            }
             .task { await services.notifier.refresh() }
             .onAppear { services.scheduleBackgroundRefresh() }
             // Notifications can be turned off in iOS Settings while the app is away.

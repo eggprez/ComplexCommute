@@ -33,6 +33,10 @@ extension Timetable {
         /// Mean seconds between when the fixes put the rider somewhere and when this trip was there.
         let offset: Double
         let isConfident: Bool
+        /// The fit starts from the rider leaving the boarding station, not from somewhere along the line.
+        let leftStation: Bool
+        /// A different train that still fits as well, after long enough that it should have fallen away.
+        var rival: (run: Run, trip: Int)?
     }
 
     /// Off the platform by this much before a fix says anything about which train the rider is on: standing on it
@@ -44,6 +48,12 @@ extension Timetable {
     static let confidentFitSeconds = 75.0
     /// The next best train has to fit this much worse for the best to count as clear of it.
     static let rivalMarginSeconds = 60.0
+    /// Seen this close to the boarding platform, the rider was at the station.
+    static let atStationMeters = 300.0
+    /// Leaving the station's geofence lags the doors closing: the train has to pull clear of it first.
+    static let pullOutSeconds = 60.0
+    /// Riding this long (a stop or two) without the fixes telling two trains apart, they won't: time to ask.
+    static let undecidedSeconds = 150.0
 
     /// Every pattern that picks up at `board`'s station and goes on to let off at `alight`'s, whatever the line.
     func runs(from board: (feedID: String, stopID: String), to alight: (feedID: String, stopID: String)) -> [Run] {
@@ -72,36 +82,52 @@ extension Timetable {
     }
 
     /// The trip on `runs` whose timing the fixes keep pace with, if any does.
-    func fit(_ fixes: [LocationFix], to runs: [Run]) -> TripFit? {
+    ///
+    /// Only fixes taken faster than a run count: walking beside the tracks fits some passing train at every step.
+    /// When the rider left the boarding station (a geofence, or a last slow fix on the platform before the fast
+    /// ones) counts too, against when each train left it: usually enough to tell the train by the first stop.
+    func fit(_ fixes: [LocationFix], to runs: [Run], leftStation: Date? = nil) -> TripFit? {
         struct Sample {
             let time: Double
             let along: Double
             let offset: Double
         }
+        let moving = fixes.movingLikeAVehicle()
+        guard let firstMoving = moving.first else { return nil }
         var samples: [String: (run: Run, trip: Int, samples: [Sample])] = [:]
 
         for run in runs {
             let pattern = patterns[run.pattern]
             let points = (run.board...run.alight).map { stops[pattern.stops[$0]].coordinate }
             let boardPoint = points[0]
-            for fix in fixes where fix.accuracy <= 150 && fix.coordinate.distance(to: boardPoint) > Self.leftPlatformMeters {
-                guard let (segment, fraction, along) = Self.project(fix.coordinate, onto: points, accuracy: fix.accuracy),
-                      along > Self.leftPlatformMeters else { continue }
-                let time = fix.time.timeIntervalSince(midnight)
-                let from = run.board + segment
-                let length = points[segment].distance(to: points[segment + 1])
-                let nearStart = fraction * length < 120
-                let nearEnd = (1 - fraction) * length < 120
+            // Last seen at the station before moving off: when the train left, give or take.
+            let departed = leftStation.map { min($0, firstMoving.time) } ?? fixes
+                .filter { $0.time < firstMoving.time && $0.accuracy <= 150 && $0.coordinate.distance(to: boardPoint) <= Self.atStationMeters }
+                .map(\.time).max()
 
-                for trip in 0..<pattern.tripCount {
-                    let leaves = Double(pattern.departure(trip: trip, position: run.board))
-                    let arrives = Double(pattern.arrival(trip: trip, position: run.alight))
+            for trip in 0..<pattern.tripCount {
+                let leaves = Double(pattern.departure(trip: trip, position: run.board))
+                let arrives = Double(pattern.arrival(trip: trip, position: run.alight))
+                let key = "\(run.pattern)/\(trip)"
+                if let departed {
+                    let time = departed.timeIntervalSince(midnight)
+                    guard leaves - 600 <= time, time <= leaves + 600 else { continue }
+                    let window = (Double(pattern.arrival(trip: trip, position: run.board)), leaves + Self.pullOutSeconds)
+                    let offset = time < window.0 ? window.0 - time : time > window.1 ? time - window.1 : 0
+                    samples[key, default: (run, trip, [])].samples.append(Sample(time: time, along: 0, offset: offset))
+                }
+                for fix in moving where fix.accuracy <= 150 && fix.coordinate.distance(to: boardPoint) > Self.leftPlatformMeters {
+                    guard let (segment, fraction, along) = Self.project(fix.coordinate, onto: points, accuracy: fix.accuracy),
+                          along > Self.leftPlatformMeters else { continue }
+                    let time = fix.time.timeIntervalSince(midnight)
                     guard leaves - 600 <= time, time <= arrives + 600 else { continue }
+                    let from = run.board + segment
+                    let length = points[segment].distance(to: points[segment + 1])
                     // When this trip would have been where the fix is: any time in its dwell, at a station.
                     let window: (Double, Double)
-                    if nearStart {
+                    if fraction * length < 120 {
                         window = (Double(pattern.arrival(trip: trip, position: from)), Double(pattern.departure(trip: trip, position: from)))
-                    } else if nearEnd {
+                    } else if (1 - fraction) * length < 120 {
                         window = (Double(pattern.arrival(trip: trip, position: from + 1)), Double(pattern.departure(trip: trip, position: from + 1)))
                     } else {
                         let start = Double(pattern.departure(trip: trip, position: from))
@@ -110,16 +136,17 @@ extension Timetable {
                         window = (at, at)
                     }
                     let offset = time < window.0 ? window.0 - time : time > window.1 ? time - window.1 : 0
-                    let key = "\(run.pattern)/\(trip)"
                     samples[key, default: (run, trip, [])].samples.append(Sample(time: time, along: along, offset: offset))
                 }
             }
         }
 
-        let scored = samples.values.map { entry -> (run: Run, trip: Int, samples: [Sample], mean: Double) in
-            (entry.run, entry.trip, entry.samples, entry.samples.map(\.offset).reduce(0, +) / Double(entry.samples.count))
-        }
-        .sorted { $0.mean < $1.mean }
+        // Leaving the station says nothing without a fix along the line to show it was on a train.
+        let scored = samples.values.filter { $0.samples.contains { $0.along > 0 } }
+            .map { entry -> (run: Run, trip: Int, samples: [Sample], mean: Double) in
+                (entry.run, entry.trip, entry.samples, entry.samples.map(\.offset).reduce(0, +) / Double(entry.samples.count))
+            }
+            .sorted { $0.mean < $1.mean }
         guard let best = scored.first, best.mean <= Self.fitSeconds else { return nil }
 
         // The same vehicle can show up through two runs (a platform pair); only a different trip is a rival.
@@ -130,7 +157,10 @@ extension Timetable {
         let travelled = (ordered.last?.along ?? 0) - (ordered.first?.along ?? 0)
         let isConfident = ordered.count >= 2 && span >= 45 && travelled >= 300 && best.mean <= Self.confidentFitSeconds
             && rival.map { $0.mean >= best.mean + Self.rivalMarginSeconds } ?? true
-        return TripFit(run: best.run, trip: best.trip, offset: best.mean, isConfident: isConfident)
+        let isUndecided = !isConfident && span >= Self.undecidedSeconds && best.mean <= Self.confidentFitSeconds
+        return TripFit(run: best.run, trip: best.trip, offset: best.mean, isConfident: isConfident,
+                       leftStation: ordered.first?.along == 0,
+                       rival: isUndecided ? rival.flatMap { $0.mean <= Self.confidentFitSeconds ? ($0.run, $0.trip) : nil } : nil)
     }
 
     /// Where `coordinate` lies along the straight lines between `points`, if it is on them at all:

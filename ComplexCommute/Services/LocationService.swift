@@ -1,6 +1,5 @@
 import CommuteCore
 import CoreLocation
-import CoreMotion
 import Observation
 
 @Observable
@@ -22,7 +21,8 @@ final class LocationService {
     /// The latest fix with its time and accuracy, as the train matcher wants it.
     var fix: LocationFix? {
         guard let location, let coordinate, location.horizontalAccuracy >= 0 else { return nil }
-        return LocationFix(coordinate: coordinate, time: location.timestamp, accuracy: location.horizontalAccuracy)
+        return LocationFix(coordinate: coordinate, time: location.timestamp, accuracy: location.horizontalAccuracy,
+                           speed: location.speedAccuracy >= 0 && location.speed >= 0 ? location.speed : nil)
     }
 
     func start() {
@@ -62,52 +62,13 @@ final class LocationService {
     }
 }
 
-/// What the motion coprocessor says the rider is doing, while a trip is under way. Works underground and in a
-/// garage, where GPS doesn't: the step from driving to walking, and from standing on a platform to moving off.
-@Observable
-final class MotionService {
-    private(set) var motion: Motion?
-    @ObservationIgnored var onUpdate: ((Motion) -> Void)?
-
-    private let manager = CMMotionActivityManager()
-    private var isRunning = false
-
-    func start() {
-        guard !isRunning, CMMotionActivityManager.isActivityAvailable() else { return }
-        isRunning = true
-        manager.startActivityUpdates(to: .main) { activity in
-            guard let activity, activity.confidence != .low else { return }
-            let motion = Motion(activity)
-            MainActor.assumeIsolated {
-                guard self.motion != motion else { return }
-                self.motion = motion
-                self.onUpdate?(motion)
-            }
-        }
-    }
-
-    func stop() {
-        guard isRunning else { return }
-        manager.stopActivityUpdates()
-        isRunning = false
-        motion = nil
-    }
-}
-
-private extension Motion {
-    /// A train at speed reads as automotive; at a platform it can read as automotive and stationary at once.
-    nonisolated init(_ activity: CMMotionActivity) {
-        self = activity.automotive ? .automotive : activity.cycling ? .cycling : activity.running ? .running
-            : activity.walking ? .walking : activity.stationary ? .stationary : .unknown
-    }
-}
-
 /// Geofences around the station the next train leaves from and wherever the current leg ends. iOS watches
 /// them with the app suspended, or not running at all, and wakes it to say one was crossed.
 final class StationWatcher {
     var onCrossing: ((_ id: String, _ entered: Bool, _ date: Date) -> Void)?
 
-    private static let name = "trip-stations"
+    /// Letters and digits only: CoreLocation aborts the app on any other character in a monitor's name.
+    private static let name = "TripStations"
     private var monitor: CLMonitor?
     private var watched: [String: WatchedPlace] = [:]
     private var wanted: [WatchedPlace] = []

@@ -44,6 +44,35 @@ public actor RealtimeService {
         session = URLSession(configuration: configuration)
     }
 
+    /// Live data for just the trips calling at `stopIDs`, with no alerts: what a departure board somewhere short of
+    /// memory (a widget) can afford. Fetched afresh and not kept, since the next board will be about other stops.
+    public func snapshot(for feedIDs: [String], servingStops stopIDs: Set<String>) async -> RealtimeSnapshot {
+        let descriptors = feedIDs.compactMap(FeedCatalog.feed(id:)).filter { $0.realtime != nil }
+        var requests: [URL: URLRequest] = [:]
+        for descriptor in descriptors {
+            guard let source = descriptor.realtime else { continue }
+            let key = descriptor.requiredKey.flatMap(apiKey)
+            if descriptor.requiredKey != nil, key == nil { continue }
+            for url in source.tripUpdateURLs {
+                requests[url] = descriptor.request(for: url, apiKey: key)
+            }
+        }
+        // One at a time: each download is parsed and let go before the next is held.
+        var updates: [URL: [RealtimeFeed.TripUpdate]] = [:]
+        for (url, request) in requests {
+            guard let (data, response) = try? await session.data(for: request),
+                  (response as? HTTPURLResponse)?.statusCode == 200,
+                  let feed = try? RealtimeFeed(data: data, servingStops: stopIDs) else { continue }
+            updates[url] = feed.tripUpdates
+        }
+        var snapshot = RealtimeSnapshot()
+        for descriptor in descriptors {
+            guard let source = descriptor.realtime else { continue }
+            snapshot.feeds[descriptor.id] = FeedRealtime(source: source, tripUpdates: source.tripUpdateURLs.flatMap { updates[$0] ?? [] })
+        }
+        return snapshot
+    }
+
     public func snapshot(for feedIDs: [String]) async -> RealtimeSnapshot {
         let descriptors = feedIDs.compactMap(FeedCatalog.feed(id:)).filter { $0.realtime != nil }
 

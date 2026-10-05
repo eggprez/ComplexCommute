@@ -35,15 +35,18 @@ struct TripLiveActivity: Widget {
                     .padding(.trailing, 4)
                 }
                 DynamicIslandExpandedRegion(.bottom) {
+                    // The one place the manual buttons live: when they're up, the departures make way for them.
+                    let showsActions = !glance.actions.isEmpty && !glance.isFinished
                     VStack(alignment: .leading, spacing: 8) {
                         if let progress = glance.progress {
                             ArriveByTrack(progress: progress, height: 10, labels: .none)
                         }
-                        InstructionRow(instruction: glance.instruction, showsDetail: glance.connections == nil)
-                        if let board = glance.connections {
+                        InstructionRow(instruction: glance.instruction, showsDetail: glance.connections == nil || showsActions)
+                        if showsActions {
+                            TripActionsRow(glance: glance)
+                        } else if let board = glance.connections {
                             ConnectionBoardRow(board: board, badgeHeight: 16, showsStation: false)
                         }
-                        TripActionsRow(glance: glance)
                     }
                     .padding(.horizontal, 4)
                 }
@@ -95,9 +98,12 @@ private struct TripActivityView: View {
         }
     }
 
+    /// iOS gives a Lock Screen Live Activity 160 points and cuts off whatever doesn't fit, top and bottom
+    /// alike. Four rows fit: the standing, the bar, the step, and the departures as one line of times.
+    /// The buttons are the Dynamic Island's; there's no room for them here.
     private var lockScreen: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     StandingLabel(glance: glance)
                         .font(glance.progress == nil ? .system(.title3, design: .rounded, weight: .bold) : .headline)
@@ -118,19 +124,18 @@ private struct TripActivityView: View {
                     .lineLimit(1)
                 }
                 if let progress = glance.progress {
-                    ArriveByTrack(progress: progress, height: 14)
+                    ArriveByTrack(progress: progress, height: 10, labels: .none)
                 }
             }
-            // Room is tight on the Lock Screen: the departures stand in for the instruction's detail, which
-            // they say more usefully ("then Q" becomes when each Q goes).
+            // The departures stand in for the instruction's detail, which they say more usefully
+            // ("then Q" becomes when each Q goes).
             InstructionRow(instruction: glance.instruction, showsDetail: glance.connections == nil)
             if let board = glance.connections {
-                ConnectionBoardRow(board: board)
+                ConnectionBoardRow(board: board, showsHeading: false)
             }
-            TripActionsRow(glance: glance)
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 14)
+        .padding(.vertical, 12)
         .opacity(isStale && !glance.isFinished ? 0.6 : 1)
     }
 }
@@ -151,20 +156,14 @@ private struct StandingLabel: View {
     }
 }
 
-/// The manual backup to motion and geofences: say you're at the station or on the train, or answer the
-/// app's question about which train, straight from the Lock Screen.
+/// The manual backup to the geofences and the location: say you're at the station or on the train, or that
+/// it left without you, from the Dynamic Island.
 private struct TripActionsRow: View {
     let glance: TripGlance
 
     var body: some View {
         if !glance.actions.isEmpty, !glance.isFinished {
             HStack(spacing: 8) {
-                if let prompt = glance.prompt {
-                    Text(prompt)
-                        .font(.subheadline.weight(.semibold))
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
-                }
                 Spacer(minLength: 0)
                 ForEach(glance.actions, id: \.self) { action in
                     Button(intent: TripActionIntent(action)) {
@@ -174,7 +173,7 @@ private struct TripActionsRow: View {
                     }
                     .buttonStyle(.bordered)
                     .buttonBorderShape(.capsule)
-                    .tint(action == .missed || action == .rejectTrain ? .secondary : .accentColor)
+                    .tint(action == .missed ? .secondary : .accentColor)
                 }
             }
         }

@@ -44,7 +44,11 @@ final class TripPlannerModel {
     private(set) var lastUpdated: Date?
     /// The trip being travelled, once the rider taps Start.
     private(set) var active: ActiveTrip? {
-        didSet { onTripChange?() }
+        didSet {
+            // Answered, settled by the location, or the ride is over: however it went, the question is done with.
+            if oldValue?.trainQuestion != nil, active?.trainQuestion == nil { notifier.withdrawWhichTrain() }
+            onTripChange?()
+        }
     }
 
     let location: LocationService
@@ -132,7 +136,10 @@ final class TripPlannerModel {
         if let coordinate = location.coordinate {
             resolved.updateCurrentLocation(coordinate)
         }
-        active = ActiveTrip(template: resolved, itinerary: selected, arriveBy: departure.target)
+        var trip = ActiveTrip(template: resolved, itinerary: selected, arriveBy: departure.target)
+        // Leaving now with no time to be there by: the arrival this plan promises becomes the one to keep.
+        if case .now = departure { trip?.holdToPlannedArrival() }
+        active = trip
         beginFollowing()
         // The reminder has done its job, and from here the trip screen is the thing to watch.
         notifier.cancelLeaveNow()
@@ -152,7 +159,7 @@ final class TripPlannerModel {
     /// Picks a trip back up after the app was closed under it.
     func resume(_ trip: ActiveTrip) {
         template = trip.template
-        departure = trip.arriveBy.map(DepartureChoice.arriveBy) ?? .now
+        departure = trip.statedArriveBy.map(DepartureChoice.arriveBy) ?? .now
         active = trip
         beginFollowing()
     }
@@ -209,15 +216,7 @@ final class TripPlannerModel {
         active?.follow(itinerary)
     }
 
-    // MARK: Motion, geofences and the Lock Screen
-
-    /// The motion sensor changed its mind about what the rider is doing.
-    func motionDidChange(_ motion: Motion) {
-        guard active != nil else { return }
-        let movedOn = active?.update(motion: motion, location: location.coordinate, now: .now) == true
-        storeRecords()
-        if movedOn { Task { await refreshActiveTrip() } }
-    }
+    // MARK: Geofences and the Lock Screen
 
     /// A station geofence was crossed, possibly with the app woken just to hear it.
     func crossed(_ id: String, entered: Bool, at date: Date) {
@@ -234,10 +233,6 @@ final class TripPlannerModel {
         Task { await refreshActiveTrip() }
     }
 
-    func dismissTrainQuestion() {
-        active?.dismissTrainQuestion()
-    }
-
     /// A button on the Live Activity.
     func perform(_ action: TripAction) {
         switch action {
@@ -249,23 +244,16 @@ final class TripPlannerModel {
         case .missed:
             markMissed()
             Task { await refreshActiveTrip() }
-        case .confirmTrain:
-            if active?.suggestedTrain != nil { acceptSuggestedTrain() } else { markAboard() }
-        case .rejectTrain:
-            if active?.suggestedTrain != nil { rejectSuggestedTrain() } else { dismissTrainQuestion() }
         }
     }
 
     // MARK: Which train
 
-    /// The rider says yes to the train the location suggested.
-    func acceptSuggestedTrain() {
-        active?.acceptSuggestedTrain()
+    /// The rider answered which of two trains they're on, in the app or from the notification.
+    func answerTrainQuestion(_ option: Int) {
+        active?.answerTrainQuestion(option)
+        storeRecords()
         Task { await refreshActiveTrip() }
-    }
-
-    func rejectSuggestedTrain() {
-        active?.rejectSuggestedTrain()
     }
 
     /// The rider picked the train they're on themselves.
@@ -304,13 +292,17 @@ final class TripPlannerModel {
         recentFixes.removeAll { now.timeIntervalSince($0.time) > Self.fixMemory }
         guard !recentFixes.isEmpty else { return }
         lastTrainCheck = now
-        guard let match = await trains.matchTrain(for: watch.rides, fixes: recentFixes, at: now), !Task.isCancelled else { return }
-        let before = active?.suggestedTrain
+        guard let match = await trains.matchTrain(for: watch.rides, fixes: recentFixes, leftStation: active?.leftStationAt, at: now),
+              !Task.isCancelled else { return }
+        let before = active?.currentLeg?.option.rides
+        let asked = active?.trainQuestion
         active?.apply(match, segment: watch.segment, now: now)
         storeRecords()
-        if let suggestion = active?.suggestedTrain, suggestion != before {
-            notifier.askAboutTrain(suggestion.ride)
+        if let question = active?.trainQuestion, question != asked {
+            notifier.askWhichTrain(question.options)
         }
+        // Now on a different train than was shown: everything after it moves with it.
+        if active?.currentLeg?.option.rides != before { await refreshActiveTrip() }
     }
 
     /// Fresh times for the train the rider is on: the one thing that decides when everything after it happens.
@@ -348,7 +340,7 @@ final class TripPlannerModel {
             }
         }
         let wasMoving = active?.isMoving ?? false
-        let movedOn = active?.update(location: location.coordinate, now: .now) == true
+        let movedOn = active?.update(fix: location.fix, now: .now) == true
         // Setting out ahead of time changes when the rest of the trip happens, so it's worth a re-plan too.
         guard movedOn || active?.isMoving != wasMoving else { return }
         storeRecords()
@@ -356,7 +348,7 @@ final class TripPlannerModel {
     }
 
     func refreshActiveTrip() async {
-        active?.update(location: location.coordinate, now: .now)
+        active?.update(fix: location.fix, now: .now)
         storeRecords()
         if trainCheck == nil { await checkTrain() }
         await refreshBoardedRide()
@@ -402,6 +394,16 @@ final class TripPlannerModel {
         }
         let planned = try? await planner.plan(resolved, arrivingBy: target, notBefore: .now)
         return planned?.first { $0.arrival <= target } ?? planned?.first
+    }
+
+    /// Plans a commute as if leaving now, without disturbing the trip on screen: enough to know what it is travelled by.
+    func preview(_ template: TripTemplate) async -> Itinerary? {
+        var resolved = template
+        if resolved.usesCurrentLocation {
+            guard let coordinate = location.coordinate else { return nil }
+            resolved.updateCurrentLocation(coordinate)
+        }
+        return try? await planner.plan(resolved, departingAt: .now).first
     }
 
     /// Keeps the "time to leave" reminder on the trip being planned, so it fires with the phone away.

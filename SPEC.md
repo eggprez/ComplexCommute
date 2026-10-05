@@ -29,7 +29,7 @@ with Apple Maps for maps/driving/walking and agency GTFS feeds for transit.
 | Storage | SwiftData + CloudKit sync for commutes/places; API keys in Keychain (not synced via CloudKit) |
 | Project | XcodeGen (`project.yml`) + local Swift package for logic, unit-tested from CLI |
 | v1 extras | Service alerts, leave-by notifications and a Live Activity in v1; on Apple Watch, the Live Activity in the Smart Stack rather than a Watch app (decided 2026-09-21). Home Screen widgets: later |
-| Outside the app | Leg-level instructions only on the Lock Screen and the Watch (no turn-by-turn); a trip with no arrive-by shows its arrival time where the bar would be; kept current by background location, not push (decided 2026-09-20) |
+| Outside the app | Leg-level instructions only on the Lock Screen and the Watch (no turn-by-turn); a trip with no arrive-by is held to the arrival first planned (decided 2026-10-04), and one without even that shows its arrival time where the bar would be; kept current by background location, not push (decided 2026-09-20) |
 
 ## Key platform constraint
 
@@ -166,7 +166,10 @@ Static URLs verified 2026-09-19 and live in `FeedCatalog.swift`. Realtime detail
    - Arrive By bar: `ArriveByProgress` (CommuteCore) bands the projected arrival — light green more than
      5 min early, green within 5 min either side, orange 5–10 min late, red beyond — above the trip's
      summary bar, tappable to change or remove the target, and settling on the real arrival once done.
-     No target, no bar; one can be set mid-trip from the trip's controls.
+     A trip started to leave now with no target takes the arrival its plan promised as the target
+     (`ActiveTrip.holdToPlannedArrival`, decided 2026-10-04), so the bar shows how the trip is doing against its
+     own first estimate; it is never fed back into planning as an arrive-by. A trip planned for a set
+     departure time has no bar unless one is set mid-trip from the trip's controls.
    - Learned buffers: `ActiveTrip` records a `ConnectionRecord` for every connection it can time — reaching
      a station by road or on foot (the leg boundary), turning up on the platform for a trip that starts with
      a ride (GPS within 200 m), and, where realtime says what became of them, changes of vehicle inside a
