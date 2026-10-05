@@ -274,8 +274,9 @@ private struct VehicleMarkView: View {
     }
 
     private var accessibilityLabel: String {
-        let train = "\(vehicle.route.name) train\(vehicle.headsign.map { " to \($0)" } ?? "")"
+        let noun = VehicleKind(routeType: vehicle.route.type).noun
+        let train = "\(vehicle.route.name) \(noun)\(vehicle.headsign.map { " to \($0)" } ?? "")"
         let whereabouts = vehicle.isAtStop ? "at \(vehicle.lastStop)" : "next stop \(vehicle.nextStop) at \(vehicle.nextStopTime.clockTime)"
-        return "\(isMine ? "Your train, " : "")\(train), \(whereabouts)\(vehicle.isRealtime ? "" : ", scheduled position")"
+        return "\(isMine ? "Your \(noun), " : "")\(train), \(whereabouts)\(vehicle.isRealtime ? "" : ", scheduled position")"
     }
 }

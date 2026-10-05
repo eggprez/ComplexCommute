@@ -125,7 +125,19 @@ public struct ChainPlanner: Sendable {
         for candidate in unique where kept.count < limit && !kept.contains(where: { $0.id == candidate.id }) {
             kept.append(candidate)
         }
-        return Array(kept.sorted { $0.arrival < $1.arrival }.prefix(limit))
+        var result = Array(kept.sorted { $0.arrival < $1.arrival }.prefix(limit))
+        // A way that starts on another line is the other branch at the first boarding: it keeps a place even
+        // when faster runs of the same line would crowd it out.
+        func line(_ itinerary: Itinerary) -> String? {
+            itinerary.legs.lazy.compactMap { $0.option.rides.first?.routeName }.first
+        }
+        if let only = result.first.flatMap(line), result.allSatisfy({ line($0) == only }),
+           let other = unique.first(where: { line($0) != nil && line($0) != only }) {
+            if result.count >= limit { result.removeLast() }
+            result.append(other)
+            result.sort { $0.arrival < $1.arrival }
+        }
+        return result
     }
 
     /// Slides leading drive/walk legs forward so waiting happens before leaving, not on the platform.

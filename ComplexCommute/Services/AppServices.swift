@@ -23,7 +23,7 @@ final class AppServices {
     /// What was last written to disk, so the file is only rewritten when the trip really changed.
     private var stored: StoredTrip?
     /// What leaves the change the rider is coming up on, as last looked up, and for which change.
-    private var connections: (station: String, toward: String, board: ConnectionBoard, fetchedAt: Date)?
+    private var connections: (station: String, toward: String, departures: [ConnectionBoard.Departure], fetchedAt: Date)?
     private var connectionLookup: Task<Void, Never>?
 
     /// Also listed in `BGTaskSchedulerPermittedIdentifiers`; iOS refuses the task otherwise.
@@ -56,6 +56,7 @@ final class AppServices {
         location.onUpdate = { [planner] in planner.locationDidChange() }
         stations.onCrossing = { [planner] id, entered, date in planner.crossed(id, entered: entered, at: date) }
         TripActionRouter.handler = { [planner] in planner.perform($0) }
+        TripActionRouter.branchHandler = { [planner] in planner.choose($0) }
         notifier.onTrainAnswer = { [planner] in planner.answerTrainQuestion($0) }
         // Before the trip is picked back up: a geofence crossing may be why the app was launched at all.
         stations.start()
@@ -115,18 +116,19 @@ final class AppServices {
             connectionLookup = Task { [transit] in
                 let found = await transit.departures(from: change.station, toward: change.toward, after: change.catchableFrom,
                                                      within: 90 * 60, limit: 6)
-                let board = change.board(found.map { departure in
+                let departures = found.map { departure in
                     ConnectionBoard.Departure(route: RouteLabel(name: departure.route.name, colorHex: departure.route.colorHex,
                                                                 textColorHex: departure.route.textColorHex),
                                               time: departure.time, isRealtime: departure.isRealtime)
-                })
-                connections = (station, toward, board, .now)
+                }
+                connections = (station, toward, departures, .now)
                 connectionLookup = nil
                 tripDidChange()
             }
         }
-        guard isCurrent else { return nil }
-        return connections?.board.catchable(from: change.catchableFrom)
+        // Marked afresh each time: which of them is the planned one changes when the rider picks another way.
+        guard isCurrent, let departures = connections?.departures else { return nil }
+        return change.board(departures).catchable(from: change.catchableFrom)
     }
 
     /// The app came to the front or left it. Coming forward is the one moment iOS lets a Live Activity

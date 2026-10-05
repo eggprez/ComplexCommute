@@ -187,26 +187,90 @@ private func itinerary(train: TimeInterval = 900, route: String = "A", delay: Ti
         #expect(trip.notice == nil)
     }
 
-    @Test func offersAFasterOptionOnlyWhenItSavesRealTime() throws {
+    @Test func twoLinesAreOfferedSideBySideAndTheTripNeverFlipsBetweenThem() throws {
         var trip = try #require(ActiveTrip(template: template, itinerary: itinerary(train: 1500)))
         let request = try #require(trip.replanRequest(location: home.coordinate, now: t0))
 
-        // An express that arrives 3 minutes sooner isn't worth an interruption.
-        var marginal = itinerary(train: 1500, route: "X")
-        marginal.legs[1].option.arrival -= 180
-        marginal.legs[2].option.arrival -= 180
-        trip.apply([marginal, itinerary(train: 1500)], for: request)
+        // Another line gets there sooner: both are offered, and the trip stays on the one it was showing.
+        trip.apply([itinerary(train: 900, route: "B"), itinerary(train: 1500)], for: request)
+        #expect(trip.branches.map(\.id) == ["B", "A"])
+        #expect(trip.arrival == t0 + 3000)
         #expect(trip.notice == nil)
+        #expect(trip.glance(at: t0).decision?.options.map(\.arrival) == [t0 + 2400, t0 + 3000])
 
-        // The earlier train turning out to be catchable (10 minutes sooner) is.
-        trip.apply([itinerary(train: 900), itinerary(train: 1500)], for: request)
+        // Two runs of one line are one branch: the sooner of them.
+        trip.apply([itinerary(train: 900, route: "B"), itinerary(train: 1200, route: "B"), itinerary(train: 1500)], for: request)
+        #expect(trip.branches.map(\.ride.board) == [t0 + 900, t0 + 1500])
+
+        // However the plans come back, the trip stays put and each line keeps its place.
+        var slipping = itinerary(train: 900, route: "B")
+        slipping.legs[2].option.arrival += 900
+        trip.apply([itinerary(train: 1500), slipping], for: request)
+        #expect(trip.branches.map(\.id) == ["B", "A"])
+        #expect(trip.arrival == t0 + 3000)
+
+        // The A being shown is missed: its branch moves on to the next A, and the trip stays on that line.
+        trip.apply([itinerary(train: 900, route: "B"), itinerary(train: 2100)], for: request)
+        #expect(trip.branches.map(\.ride.board) == [t0 + 900, t0 + 2100])
+        #expect(trip.arrival == t0 + 3600)
+        #expect(trip.notice == nil)
+    }
+
+    @Test func onceAWayIsPickedAnotherOnlyComesIntoItBySavingRealTime() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary(train: 1500)))
+        let request = try #require(trip.replanRequest(location: home.coordinate, now: t0))
+        trip.apply([itinerary(train: 1380, route: "B"), itinerary(train: 1500)], for: request)
+        trip.choose(branch: "A", now: t0)
+        #expect(trip.branches.isEmpty)
+        #expect(trip.glance(at: t0).decision == nil)
+        #expect(trip.arrival == t0 + 3000)
+
+        // Two minutes sooner isn't worth an interruption.
+        trip.apply([itinerary(train: 1380, route: "B"), itinerary(train: 1500)], for: request)
+        #expect(trip.notice == nil)
+        #expect(trip.branches.isEmpty)
+
+        // Ten minutes sooner is worth asking about, and no more than asking.
+        trip.apply([itinerary(train: 900, route: "B"), itinerary(train: 1500)], for: request)
+        guard case .fasterOption(let faster) = trip.notice else {
+            Issue.record("expected a faster option")
+            return
+        }
+        #expect(faster.arrival == t0 + 2400)
+        #expect(trip.arrival == t0 + 3000)
+
+        // More than twenty, and the trip moves to it and says so.
+        trip.apply([itinerary(train: 240, route: "B"), itinerary(train: 1500)], for: request)
+        #expect(trip.notice == .switchedToFaster(previousArrival: t0 + 3000))
+        #expect(trip.arrival == t0 + 1740)
+
+        // That B has gone: the next B is the rider's, without their picking again.
+        trip.apply([itinerary(train: 1800), itinerary(train: 2100, route: "B")], for: request)
+        #expect(trip.branches.isEmpty)
+        #expect(trip.arrival == t0 + 3600)
+        #expect(trip.notice == .planChanged(previousArrival: t0 + 1740))
+
+        // The line they are on no longer gets there at all: it is theirs to pick again.
+        trip.apply([itinerary(train: 2100), itinerary(train: 2700, route: "C")], for: request)
+        #expect(trip.branches.map(\.id) == ["A", "C"])
+    }
+
+    @Test func takingTheFasterOptionOffered() throws {
+        var trip = try #require(ActiveTrip(template: template, itinerary: itinerary(train: 1500)))
+        let request = try #require(trip.replanRequest(location: home.coordinate, now: t0))
+        // The same train to board either way, so nothing to pick between there: a faster walk beyond it is offered.
+        var shortcut = itinerary(train: 1500)
+        shortcut.legs[2].option.mode = .drive
+        shortcut.legs[2].option.arrival -= 700
+        trip.apply([shortcut, itinerary(train: 1500)], for: request)
+        #expect(trip.branches.isEmpty)
         guard case .fasterOption(let faster) = trip.notice else {
             Issue.record("expected a faster option")
             return
         }
         trip.follow(faster)
         #expect(trip.notice == nil)
-        #expect(trip.arrival == t0 + 2400)
+        #expect(trip.arrival == t0 + 2300)
     }
 
     @Test func aMissedTrainReplansFromTheStationAndPartialPlansSliceIn() throws {
@@ -390,7 +454,11 @@ private func changingItinerary(delay: TimeInterval = 0, isRealtime: Bool = true,
         trip.update(location: home.coordinate, now: t0 + 300)
         trip.update(location: stationA.coordinate, now: t0 + 800)
         #expect(trip.drainRecords().isEmpty) // nothing to say until the train is caught
+        // Seen still standing on the platform, the rider isn't on anything, whatever the timetable says left.
         trip.update(location: stationA.coordinate, now: t0 + 940)
+        #expect(!trip.hasBoarded)
+        // Gone from view (underground, or pulling away): on it.
+        trip.update(location: nil, now: t0 + 945)
         #expect(trip.hasBoarded)
 
         let record = try #require(trip.drainRecords().first)
@@ -413,7 +481,7 @@ private func changingItinerary(delay: TimeInterval = 0, isRealtime: Bool = true,
         ])
         var trip = try #require(ActiveTrip(template: TripTemplate(waypoints: [home, stationB], modes: [.transit]), itinerary: walkThenRide))
         trip.update(location: stationA.coordinate, now: t0)      // already there when Go was tapped
-        trip.update(location: stationA.coordinate, now: t0 + 940)
+        trip.update(location: nil, now: t0 + 940)
         #expect(trip.hasBoarded)
         #expect(trip.drainRecords().isEmpty)
     }
@@ -493,6 +561,7 @@ extension ActiveTrip.Notice: Equatable {
         switch (lhs, rhs) {
         case (.planChanged(let a), .planChanged(let b)): a == b
         case (.fasterOption(let a), .fasterOption(let b)): a.id == b.id
+        case (.switchedToFaster(let a), .switchedToFaster(let b)): a == b
         default: false
         }
     }

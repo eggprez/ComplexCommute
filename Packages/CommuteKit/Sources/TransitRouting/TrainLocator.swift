@@ -37,6 +37,9 @@ extension Timetable {
         let leftStation: Bool
         /// A different train that still fits as well, after long enough that it should have fallen away.
         var rival: (run: Run, trip: Int)?
+        /// Seconds from midnight of the last fix that fitted, and how long the fixes that did span.
+        var lastSample = 0.0
+        var span = 0.0
     }
 
     /// Off the platform by this much before a fix says anything about which train the rider is on: standing on it
@@ -160,7 +163,8 @@ extension Timetable {
         let isUndecided = !isConfident && span >= Self.undecidedSeconds && best.mean <= Self.confidentFitSeconds
         return TripFit(run: best.run, trip: best.trip, offset: best.mean, isConfident: isConfident,
                        leftStation: ordered.first?.along == 0,
-                       rival: isUndecided ? rival.flatMap { $0.mean <= Self.confidentFitSeconds ? ($0.run, $0.trip) : nil } : nil)
+                       rival: isUndecided ? rival.flatMap { $0.mean <= Self.confidentFitSeconds ? ($0.run, $0.trip) : nil } : nil,
+                       lastSample: ordered.last?.time ?? 0, span: span)
     }
 
     /// Where `coordinate` lies along the straight lines between `points`, if it is on them at all:

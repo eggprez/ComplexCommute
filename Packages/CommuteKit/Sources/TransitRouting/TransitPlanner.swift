@@ -34,6 +34,9 @@ public actor TransitPlanner {
     static let departuresToTry = 3
     /// An option with an extra ride must save at least this much to be worth showing.
     static let worthwhileSavingPerRide: TimeInterval = 180
+    /// When every option starts on the same line, the best way that starts on another is offered too, as long as
+    /// it gets there no more than this much later: the other branch for the rider to pick between.
+    static let otherLineAllowance: TimeInterval = 30 * 60
 
     /// Predictions only reach an hour or two ahead; beyond that the schedule is all anyone knows.
     static let realtimeHorizon: TimeInterval = 2 * 3_600
@@ -67,12 +70,15 @@ public actor TransitPlanner {
         router.changeSeconds = max(Self.minimumChangeSeconds, bufferSeconds)
         var options: [LegOption] = []
         var seen = Set<String>()
-        var clock = Int(departure.timeIntervalSince(midnight))
+        let start = Int(departure.timeIntervalSince(midnight))
+        var clock = start
+        var firstLines = Set<Int>()
 
         for _ in 0..<Self.departuresToTry {
             let journeys = router.journeys(from: access, to: egress, departure: clock)
             var found: [LegOption] = []
             for journey in journeys {
+                if let first = journey.rides.first { firstLines.insert(timetable.patterns[first.pattern].route) }
                 found.append(await legOption(for: journey, in: timetable, midnight: midnight, from: origin, to: destination, snapshot: snapshot,
                                              accessBufferSeconds: accessBufferSeconds))
             }
@@ -82,7 +88,20 @@ public actor TransitPlanner {
             }
             clock = Int(soonest.timeIntervalSince(midnight)) + 60
         }
-        let useful = options.filter { option in !options.contains { Self.makesPointless(option, $0) } }
+        var useful = options.filter { option in !options.contains { Self.makesPointless(option, $0) } }
+        // Every way found boards the same line first: look once more without it, so there is a second branch to
+        // offer (the M60 beside the Q70) even when it wouldn't have made the list on its merits.
+        if firstLines.count == 1, let soonest = useful.map(\.arrival).min() {
+            router.bannedRoutes = firstLines
+            var others: [LegOption] = []
+            for journey in router.journeys(from: access, to: egress, departure: start) {
+                others.append(await legOption(for: journey, in: timetable, midnight: midnight, from: origin, to: destination, snapshot: snapshot,
+                                              accessBufferSeconds: accessBufferSeconds))
+            }
+            if let other = others.min(by: { $0.arrival < $1.arrival }), other.arrival.timeIntervalSince(soonest) <= Self.otherLineAllowance {
+                useful.append(other)
+            }
+        }
         return useful.sorted { $0.arrival < $1.arrival }
     }
 
@@ -187,27 +206,47 @@ public actor TransitPlanner {
                                walkBefore: ride.walkBefore, freeTransfer: ride.freeTransfer)
     }
 
-    /// The train the rider's recent location fixes keep pace with, among everything going the way of any of `rides`.
+    /// The vehicle the rider's recent location fixes keep pace with, among everything going the way of any of `rides`.
     public func matchTrain(for rides: [WatchedRide], fixes: [LocationFix], leftStation: Date? = nil, at date: Date = .now) async -> TrainMatch? {
-        var best: (match: Timetable.TripFit, watched: WatchedRide, timetable: Timetable, midnight: Date)?
+        var fits: [(match: Timetable.TripFit, watched: WatchedRide, timetable: Timetable, midnight: Date)] = []
         for watched in rides {
             guard let (timetable, midnight, runs) = await runs(for: watched.ride, at: date),
-                  // The geofence is round the platform the first of them leaves from; later changes have none.
-                  let fit = timetable.fit(fixes, to: runs, leftStation: watched == rides.first ? leftStation : nil) else { continue }
-            if best.map({ fit.offset < $0.match.offset }) ?? true { best = (fit, watched, timetable, midnight) }
+                  // The geofence is round the place the first of them leaves from; later changes have none.
+                  let fit = timetable.fit(fixes, to: runs, leftStation: watched.index == rides.first?.index ? leftStation : nil) else { continue }
+            fits.append((fit, watched, timetable, midnight))
         }
-        guard let best else { return nil }
-        let ride = await self.ride(pattern: best.match.run.pattern, trip: best.match.trip, board: best.match.run.board,
-                                   alight: best.match.run.alight, in: best.timetable, midnight: best.midnight,
-                                   walkBefore: best.watched.ride.walkBefore, freeTransfer: best.watched.ride.freeTransfer)
+        // A line the rider has since turned off keeps the good fit it had while they were on it: only what
+        // still fits the latest fixes counts. On a tie, the plan's own ride comes before the other way to go.
+        let latest = fits.map(\.match.lastSample).max() ?? 0
+        fits = fits.filter { $0.match.lastSample >= latest - Timetable.fitSeconds }
+            .sorted { ($0.match.offset, $0.watched.isAlternative ? 1 : 0) < ($1.match.offset, $1.watched.isAlternative ? 1 : 0) }
+        guard let best = fits.first else { return nil }
+        func trip(_ fit: (match: Timetable.TripFit, watched: WatchedRide, timetable: Timetable, midnight: Date)) -> TripRef {
+            fit.timetable.patterns[fit.match.run.pattern].trips[fit.match.trip]
+        }
+        func ride(_ fit: (match: Timetable.TripFit, watched: WatchedRide, timetable: Timetable, midnight: Date), run: Timetable.Run, trip: Int) async -> Ride {
+            await self.ride(pattern: run.pattern, trip: trip, board: run.board, alight: run.alight, in: fit.timetable, midnight: fit.midnight,
+                            walkBefore: fit.watched.ride.walkBefore, freeTransfer: fit.watched.ride.freeTransfer)
+        }
+        // Two lines that share the road out fit alike until they part: neither is clear of the other yet.
+        let bestTrip = trip(best)
+        let other = fits.dropFirst().first {
+            $0.watched.isAlternative != best.watched.isAlternative && trip($0) != bestTrip
+                && $0.match.offset <= Timetable.confidentFitSeconds && $0.match.offset < best.match.offset + Timetable.rivalMarginSeconds
+        }
+
         var rival: Ride?
-        if let other = best.match.rival {
-            rival = await self.ride(pattern: other.run.pattern, trip: other.trip, board: other.run.board, alight: other.run.alight,
-                                    in: best.timetable, midnight: best.midnight,
-                                    walkBefore: best.watched.ride.walkBefore, freeTransfer: best.watched.ride.freeTransfer)
+        var rivalIsAlternative = best.watched.isAlternative
+        if let same = best.match.rival {
+            rival = await ride(best, run: same.run, trip: same.trip)
+        } else if let other, best.match.span >= Timetable.undecidedSeconds, best.match.offset <= Timetable.confidentFitSeconds {
+            rival = await ride(other, run: other.match.run, trip: other.match.trip)
+            rivalIsAlternative = other.watched.isAlternative
         }
-        return TrainMatch(ride: ride, rideIndex: best.watched.index, offset: best.match.offset, isConfident: best.match.isConfident,
-                          leftStation: best.match.leftStation, rival: rival)
+        return TrainMatch(ride: await ride(best, run: best.match.run, trip: best.match.trip), rideIndex: best.watched.index,
+                          offset: best.match.offset, isConfident: best.match.isConfident && other == nil,
+                          leftStation: best.match.leftStation, rival: rival,
+                          isAlternative: best.watched.isAlternative, rivalIsAlternative: rivalIsAlternative)
     }
 
     /// Trains going `ride`'s way that leave its boarding station around now, for the rider to say which one they're on.

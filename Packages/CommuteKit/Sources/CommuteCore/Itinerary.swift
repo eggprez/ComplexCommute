@@ -84,6 +84,42 @@ public struct Ride: Codable, Hashable, Sendable {
     }
 }
 
+/// What a ride is on, as the rider would say it: "I'm on the bus".
+public enum VehicleKind: String, Codable, Hashable, Sendable {
+    case train
+    case bus
+    case tram
+    case ferry
+
+    /// From a GTFS route_type, basic or extended.
+    public init(routeType: Int) {
+        switch routeType {
+        case 3, 11, 200...299, 700...899: self = .bus
+        case 0, 5, 900...999: self = .tram
+        case 4, 1000...1299: self = .ferry
+        default: self = .train
+        }
+    }
+
+    /// "train", "bus": lowercase, for the middle of a sentence.
+    public var noun: String { rawValue }
+    /// "Train", "Bus": for a button.
+    public var title: String { rawValue.capitalized }
+
+    public var symbol: String {
+        switch self {
+        case .train: "tram.fill"
+        case .bus: "bus.fill"
+        case .tram: "lightrail.fill"
+        case .ferry: "ferry.fill"
+        }
+    }
+}
+
+extension Ride {
+    public var vehicle: VehicleKind { VehicleKind(routeType: routeType) }
+}
+
 /// A disruption notice from an agency that touches a ride in the leg.
 public struct ServiceAlert: Codable, Hashable, Identifiable, Sendable {
     public var id: String

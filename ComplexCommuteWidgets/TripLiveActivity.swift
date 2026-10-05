@@ -35,17 +35,24 @@ struct TripLiveActivity: Widget {
                     .padding(.trailing, 4)
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    // The one place the manual buttons live: when they're up, the departures make way for them.
-                    let showsActions = !glance.actions.isEmpty && !glance.isFinished
+                    // A choice of ways onward comes first; otherwise the manual buttons, and when they're up, the
+                    // departures make way for them.
+                    let decision = glance.isFinished ? nil : glance.decision
+                    let showsActions = decision == nil && !glance.actions.isEmpty && !glance.isFinished
                     VStack(alignment: .leading, spacing: 8) {
                         if let progress = glance.progress {
-                            ArriveByTrack(progress: progress, height: 10, labels: .none)
+                            ArriveByTrack(progress: progress, height: decision == nil ? 10 : 6, labels: .none)
                         }
-                        InstructionRow(instruction: glance.instruction, showsDetail: glance.connections == nil || showsActions)
-                        if showsActions {
-                            TripActionsRow(glance: glance)
-                        } else if let board = glance.connections {
-                            ConnectionBoardRow(board: board, badgeHeight: 16, showsStation: false)
+                        if let decision {
+                            if decision.isAssumed { AssumedRow() } else { CompactInstructionRow(instruction: glance.instruction) }
+                            BranchButtons(decision: decision)
+                        } else {
+                            InstructionRow(instruction: glance.instruction, showsDetail: glance.connections == nil || showsActions)
+                            if showsActions {
+                                TripActionsRow(glance: glance)
+                            } else if let board = glance.connections {
+                                ConnectionBoardRow(board: board, badgeHeight: 16, showsStation: false)
+                            }
                         }
                     }
                     .padding(.horizontal, 4)
@@ -100,9 +107,12 @@ private struct TripActivityView: View {
 
     /// iOS gives a Lock Screen Live Activity 160 points and cuts off whatever doesn't fit, top and bottom
     /// alike. Four rows fit: the standing, the bar, the step, and the departures as one line of times.
-    /// The buttons are the Dynamic Island's; there's no room for them here.
+    /// With a choice of ways onward, the two of them are buttons here: the bar slims down, the step goes onto
+    /// one line and the departures (which the buttons say better) make way, so it all still fits.
+    /// The other manual buttons are the Dynamic Island's; there's no room for them here.
     private var lockScreen: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let decision = glance.isFinished ? nil : glance.decision
+        return VStack(alignment: .leading, spacing: decision == nil ? 8 : 6) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     StandingLabel(glance: glance)
@@ -124,18 +134,23 @@ private struct TripActivityView: View {
                     .lineLimit(1)
                 }
                 if let progress = glance.progress {
-                    ArriveByTrack(progress: progress, height: 10, labels: .none)
+                    ArriveByTrack(progress: progress, height: decision == nil ? 10 : 6, labels: .none)
                 }
             }
-            // The departures stand in for the instruction's detail, which they say more usefully
-            // ("then Q" becomes when each Q goes).
-            InstructionRow(instruction: glance.instruction, showsDetail: glance.connections == nil)
-            if let board = glance.connections {
-                ConnectionBoardRow(board: board, showsHeading: false)
+            if let decision {
+                if decision.isAssumed { AssumedRow() } else { CompactInstructionRow(instruction: glance.instruction) }
+                BranchButtons(decision: decision)
+            } else {
+                // The departures stand in for the instruction's detail, which they say more usefully
+                // ("then Q" becomes when each Q goes).
+                InstructionRow(instruction: glance.instruction, showsDetail: glance.connections == nil)
+                if let board = glance.connections {
+                    ConnectionBoardRow(board: board, showsHeading: false)
+                }
             }
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.vertical, decision == nil ? 12 : 10)
         .opacity(isStale && !glance.isFinished ? 0.6 : 1)
     }
 }
@@ -156,7 +171,7 @@ private struct StandingLabel: View {
     }
 }
 
-/// The manual backup to the geofences and the location: say you're at the station or on the train, or that
+/// The manual backup to the geofences and the location: say you're at the station or aboard, or that
 /// it left without you, from the Dynamic Island.
 private struct TripActionsRow: View {
     let glance: TripGlance
@@ -167,7 +182,7 @@ private struct TripActionsRow: View {
                 Spacer(minLength: 0)
                 ForEach(glance.actions, id: \.self) { action in
                     Button(intent: TripActionIntent(action)) {
-                        Label(action.title, systemImage: action.symbol)
+                        Label(action.title(for: glance.vehicle), systemImage: action.symbol(for: glance.vehicle))
                             .font(.footnote.weight(.semibold))
                             .lineLimit(1)
                     }
@@ -219,9 +234,97 @@ private struct InstructionRow: View {
     }
 }
 
+/// Shown aboard by the clock alone: say so where the step would be, so the buttons under it read as the question they are.
+private struct AssumedRow: View {
+    var body: some View {
+        Label("Going by the clock. Which are you on?", systemImage: "clock.badge.questionmark")
+            .font(.subheadline.weight(.semibold))
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
+    }
+}
+
+/// The step on one line, where the ways onward need the room under it.
+private struct CompactInstructionRow: View {
+    let instruction: TripInstruction
+
+    var body: some View {
+        HStack(spacing: 6) {
+            InstructionIcon(instruction: instruction, size: 18)
+            Text(instruction.title)
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .accessibilityLabel(instruction.spokenTitle)
+            Spacer(minLength: 4)
+            if let deadline = instruction.deadline {
+                Text(deadline.clockTime)
+                    .font(.footnote.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(instruction.deadlineLabel.map { "\($0) \(deadline.clockTime)" } ?? deadline.clockTime)
+            }
+        }
+    }
+}
+
+/// The two best ways on from the next boarding, each a button: the lines it rides, when the first leaves and
+/// when it gets there. Tapping one takes it, without opening the app.
+private struct BranchButtons: View {
+    let decision: DecisionGlance
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(decision.options) { option in
+                Button(intent: ChooseBranchIntent(option.id)) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 3) {
+                            ForEach(Array(option.routes.enumerated()), id: \.offset) { index, route in
+                                if index > 0 {
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 8, weight: .bold))
+                                        .foregroundStyle(.secondary)
+                                }
+                                RouteLabelBadge(route: route, height: 17)
+                            }
+                        }
+                        // No green for a live time here: the card behind is tinted green as often as not.
+                        Text(!decision.isAssumed ? "\(option.departs.clockTime) → \(option.arrival.clockTime)"
+                             : option.id == decision.options.first?.id ? "Yes, on this" : "On this instead")
+                            .font(.caption.weight(.semibold))
+                            .monospacedDigit()
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Color.primary.opacity(0.12), in: .rect(cornerRadius: 10))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(decision.isAssumed
+                    ? "I'm on the \(option.routes.first?.name ?? "") from \(decision.station)"
+                    : "Take \(option.routes.map(\.name).joined(separator: ", then ")) from \(decision.station). Leaves \(option.departs.clockTime), arrives \(option.arrival.clockTime).")
+            }
+        }
+    }
+}
+
 #Preview("Lock Screen", as: .content, using: TripActivityAttributes(destination: "Office")) {
     TripLiveActivity()
 } contentStates: {
+    TripGlance(destination: "205 Third Ave",
+               instruction: TripInstruction(kind: .travel, mode: .walk, title: "Walk to LaGuardia Terminal B", deadline: .now + 240),
+               arrival: .now + 3_000, arriveBy: .now + 3_000,
+               decision: DecisionGlance(station: "LaGuardia Terminal B", options: [
+                   BranchGlance(id: "q70", routes: [RouteLabel(name: "Q70-SBS", colorHex: "00AEEF", textColorHex: "FFFFFF"),
+                                                    RouteLabel(name: "E", colorHex: "0039A6", textColorHex: "FFFFFF"),
+                                                    RouteLabel(name: "6", colorHex: "00933C", textColorHex: "FFFFFF")],
+                                departs: .now + 300, arrival: .now + 3_000, isRealtime: true),
+                   BranchGlance(id: "m60", routes: [RouteLabel(name: "M60-SBS", colorHex: "00AEEF", textColorHex: "FFFFFF"),
+                                                    RouteLabel(name: "N", colorHex: "FCCC0A", textColorHex: "000000")],
+                                departs: .now + 420, arrival: .now + 3_240),
+               ]))
     TripGlance(destination: "Office",
                instruction: TripInstruction(kind: .board, mode: .transit, title: "Board at Canal St", detail: "toward 96 St · on time",
                                             route: RouteLabel(name: "Q", colorHex: "FCCC0A", textColorHex: "000000"), deadline: .now + 190),

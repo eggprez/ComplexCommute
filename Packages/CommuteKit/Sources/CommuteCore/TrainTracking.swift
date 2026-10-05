@@ -92,23 +92,27 @@ public struct WatchedPlace: Hashable, Sendable {
 public enum TripAction: String, Codable, CaseIterable, Sendable {
     /// At the end of the current drive or walk.
     case arrived
-    /// On the train (the planned one, unless location says which).
+    /// On the vehicle (the planned one, unless location says which).
     case aboard
-    /// The train left without them.
+    /// It left without them.
     case missed
 
-    public var title: String {
+    public var title: String { title(for: nil) }
+    public var symbol: String { symbol(for: nil) }
+
+    /// Named for what is being caught: nobody is "on the train" at a bus stop.
+    public func title(for vehicle: VehicleKind?) -> String {
         switch self {
-        case .arrived: "At Station"
-        case .aboard: "On Train"
+        case .arrived: vehicle == .bus ? "At Stop" : "At Station"
+        case .aboard: "On \((vehicle ?? .train).title)"
         case .missed: "Missed It"
         }
     }
 
-    public var symbol: String {
+    public func symbol(for vehicle: VehicleKind?) -> String {
         switch self {
         case .arrived: "mappin.and.ellipse"
-        case .aboard: "tram.fill"
+        case .aboard: (vehicle ?? .train).symbol
         case .missed: "figure.wave"
         }
     }
@@ -118,10 +122,13 @@ public enum TripAction: String, Codable, CaseIterable, Sendable {
 public struct WatchedRide: Hashable, Sendable {
     public var index: Int
     public var ride: Ride
+    /// Not the ride the plan is on, but the other way the rider could go from the same place.
+    public var isAlternative: Bool
 
-    public init(index: Int, ride: Ride) {
+    public init(index: Int, ride: Ride, isAlternative: Bool = false) {
         self.index = index
         self.ride = ride
+        self.isAlternative = isAlternative
     }
 }
 
@@ -139,15 +146,22 @@ public struct TrainMatch: Hashable, Sendable {
     public var leftStation: Bool
     /// Another train that has fitted just as well for long enough that the fixes won't tell them apart:
     /// back to back, or a local and an express that haven't split yet.
+    /// Or two lines that share the road out (the Q70 and the M60 leaving LaGuardia) and haven't parted yet.
     public var rival: Ride?
+    /// The match is on the other way the rider could have gone, not the one the plan is on.
+    public var isAlternative: Bool
+    public var rivalIsAlternative: Bool
 
-    public init(ride: Ride, rideIndex: Int, offset: TimeInterval, isConfident: Bool, leftStation: Bool = false, rival: Ride? = nil) {
+    public init(ride: Ride, rideIndex: Int, offset: TimeInterval, isConfident: Bool, leftStation: Bool = false, rival: Ride? = nil,
+                isAlternative: Bool = false, rivalIsAlternative: Bool = false) {
         self.ride = ride
         self.rideIndex = rideIndex
         self.offset = offset
         self.isConfident = isConfident
         self.leftStation = leftStation
         self.rival = rival
+        self.isAlternative = isAlternative
+        self.rivalIsAlternative = rivalIsAlternative
     }
 }
 
@@ -157,11 +171,15 @@ public struct TrainQuestion: Codable, Hashable, Sendable {
     public var options: [Ride]
     public var segment: Int
     public var rideIndex: Int
+    /// For each option, whether taking it leaves the plan the trip is on. Optional so a trip saved by an
+    /// earlier version still loads.
+    public var alternatives: [Bool]?
 
-    public init(options: [Ride], segment: Int, rideIndex: Int) {
+    public init(options: [Ride], segment: Int, rideIndex: Int, alternatives: [Bool]? = nil) {
         self.options = options
         self.segment = segment
         self.rideIndex = rideIndex
+        self.alternatives = alternatives
     }
 }
 
